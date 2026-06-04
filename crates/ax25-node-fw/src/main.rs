@@ -41,20 +41,37 @@ mod session;
 #[cfg(target_os = "none")]
 mod transports;
 
+// The global allocator. `ax25-node-core` uses `alloc` (the session queues, the
+// streaming codecs), so the firmware must install one. `embedded-alloc`'s
+// `LlffHeap` (linked-list first-fit) is a small, mature heap; its backing store is
+// a static byte arena initialised once at boot (in `main`, before any allocation).
+// Sized conservatively for a handful of sessions with a small window (research §6).
+#[cfg(target_os = "none")]
+#[global_allocator]
+static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
+
+/// Heap arena size in bytes. A node serving a few links with a small (k≤8) window
+/// needs little; this leaves the bulk of the 264 KB SRAM for stacks + statics.
+#[cfg(target_os = "none")]
+const HEAP_SIZE: usize = 16 * 1024;
+
 #[cfg(target_os = "none")]
 mod firmware {
     use defmt_rtt as _; // global defmt logger over RTT
     use panic_probe as _; // panic => defmt message + halt, seen over RTT
 
+    use core::mem::MaybeUninit;
+
     use embassy_executor::Spawner;
     use embassy_rp::bind_interrupts;
-    use embassy_rp::peripherals::{DMA_CH0, PIO0};
+    use embassy_rp::peripherals::PIO0;
     use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 
     use crate::config;
     use crate::net as netmod;
     use crate::session;
     use crate::transports;
+    use crate::{HEAP, HEAP_SIZE};
 
     bind_interrupts!(struct Irqs {
         PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -63,6 +80,16 @@ mod firmware {
     #[embassy_executor::main]
     async fn main(spawner: Spawner) {
         defmt::info!("pico-node {} starting", ax25_node_core::VERSION);
+
+        // Initialise the global heap arena ONCE, before anything allocates. SAFETY:
+        // called exactly once, at the very top of main, on a single static arena.
+        {
+            static mut ARENA: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+            #[allow(static_mut_refs)]
+            unsafe {
+                HEAP.init(ARENA.as_ptr() as usize, HEAP_SIZE)
+            }
+        }
 
         let p = embassy_rp::init(Default::default());
         let cfg = config::load();

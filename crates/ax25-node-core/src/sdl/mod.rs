@@ -42,6 +42,7 @@ pub mod dispatch;
 pub mod event;
 pub mod guard;
 pub mod loop_exec;
+pub mod manager;
 pub mod quirks;
 pub mod session;
 pub mod signal;
@@ -50,6 +51,7 @@ pub mod timer;
 pub mod tx;
 
 pub use bridge::{classify_incoming, WireSink};
+pub use manager::{SessionManager, Slot};
 pub use context::{Payload, SessionContext};
 pub use event::{Event, FrameInfo};
 pub use loop_exec::{run_loop, MAX_ITERATIONS};

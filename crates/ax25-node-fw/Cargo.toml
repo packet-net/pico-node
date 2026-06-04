@@ -38,18 +38,29 @@ bench = false
 ax25-node-core = { path = "../ax25-node-core", default-features = false, features = ["alloc"] }
 
 # --- Embassy core + RP2040 HAL ---
-embassy-executor = { version = "0.6", default-features = false, features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "integrated-timers"] }
-embassy-rp       = { version = "0.2", default-features = false, features = ["rp2040", "time-driver", "critical-section-impl", "defmt"] }
-embassy-time     = { version = "0.3", default-features = false, features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-sync     = { version = "0.6", default-features = false, features = ["defmt"] }
+#
+# Versions REFRESHED 2026-06-04 to the current coherent crates.io set (the prior
+# planning pins — embassy-rp 0.2 etc. — were stale guesses; e.g. embassy-rp 0.2 has
+# no `rp2040` feature, the chip-select features landed later). These match the
+# research note §2.3 (cyw43 0.7.x / cyw43-pio 0.10.x / embassy-net 0.9.x). The
+# exact feature names should be re-confirmed against the resolved manifest at first
+# build (embassy crates move together; a `cargo update` within these minors is
+# expected). NOT fetched/built here — gated on Tom approving the embassy network
+# build (docs/PLAN.md §8.C) + the hardware tier (the cyw43 bring-up has no emulator).
+# NB embassy-executor 0.10 renamed the arch feature `arch-cortex-m` →
+# `platform-cortex-m` (confirmed against the resolved manifest 2026-06-04).
+embassy-executor = { version = "0.10", default-features = false, features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-rp       = { version = "0.10", default-features = false, features = ["rp2040", "time-driver", "critical-section-impl", "defmt"] }
+embassy-time     = { version = "0.5", default-features = false, features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync     = { version = "0.8", default-features = false, features = ["defmt"] }
 embassy-futures  = { version = "0.1", default-features = false }
 
 # --- WiFi (CYW43439) over PIO-SPI ---
-cyw43     = { version = "0.2", default-features = false, features = ["defmt", "firmware-logs"] }
-cyw43-pio = { version = "0.2", default-features = false, features = ["defmt"] }
+cyw43     = { version = "0.7", default-features = false, features = ["defmt", "firmware-logs"] }
+cyw43-pio = { version = "0.10", default-features = false, features = ["defmt"] }
 
 # --- no-alloc async TCP/IP stack (UDP for AXUDP, TCP for KISS + telnet) ---
-embassy-net = { version = "0.5", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
+embassy-net = { version = "0.9", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
 
 # --- Cortex-M runtime + logging/diagnostics ---
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
@@ -59,10 +70,22 @@ defmt-rtt   = { version = "0.4" }
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 static_cell = { version = "2" }
 
+# The RP2040's Cortex-M0+ has NO native atomic compare-exchange. Crates that use
+# `AtomicBool::compare_exchange` (static_cell, embassy internals) reach for it via
+# `portable-atomic`; enabling its `critical-section` feature here provides a CAS
+# implementation built on critical sections (embassy-rp's `critical-section-impl`
+# supplies the critical-section backend). Standard RP2040 embedded-Rust config —
+# without it the firmware fails to build for thumbv6m (E0277 "requires atomic CAS").
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+
 # An embedded global allocator for ax25-node-core's `alloc` buffers. Tiny bump/
 # linked-list allocator; declared here (planning) — swap for heapless if the
 # follow-up to remove alloc from the core lands first. (Not fetched yet.)
-embedded-alloc = "0.6"
+embedded-alloc = "0.7"
+
+# Fixed-capacity collections for the firmware's own bookkeeping (e.g. the expired-
+# timer set in session.rs). no_std, no alloc.
+heapless = "0.8"
 
 [dev-dependencies]
 # On-target test harness (current; defmt-test/probe-run are deprecated). Runs the

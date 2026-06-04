@@ -1,30 +1,169 @@
-//! Link-layer session layer — the on-target home of the SDL runtime port.
+//! Link-layer session layer — the on-target home of the SDL runtime.
 //!
-//! Mirrors `Packet.Ax25.Session.Ax25Listener` + `Ax25Session`: a small fixed
-//! array of per-peer sessions (NOT the desktop's unbounded LRU dictionary — a
-//! Pico node serves a handful of links, see research note §6), each running the
-//! generated AX.25 v2.2 state machine via the runtime in
-//! [`ax25_node_core::sdl`]. Transports hand inbound frames here addressed by peer;
-//! outbound frames flow back to whichever transport owns the link.
+//! The portable runtime now lives in [`ax25_node_core::sdl`] (the Rust port of
+//! packet.net's `Ax25Session` + dispatcher + guards + subroutines, driven off the
+//! generated `ax25sdl` typed tables). This module is the thin firmware wrapper: it
+//! owns one [`ax25_node_core::sdl::SessionManager`] (a fixed `MAX_SESSIONS` array of
+//! per-peer sessions — NOT the desktop's unbounded LRU dict, per research §6) and
+//! the T1/T2/T3 timer service backed by `embassy-time`.
 //!
-//! STUB. The runtime that walks the generated tables (`ActionDispatcher` etc.) is
-//! the major port still to be written, and it is gated on the `ax25sdl` Rust crate
-//! becoming consumable (publish + no_std + typed) — see [`ax25_node_core::sdl`]
-//! and docs/PLAN.md §"SDL integration".
+//! Flow: a transport decodes an inbound wire frame, calls
+//! [`ax25_node_core::sdl::classify_incoming`] to get the [`Event`], and posts it to
+//! the manager keyed by the peer callsign; the manager routes it to that peer's
+//! session, runs the state machine, and returns the wire frames to send back. DL
+//! signals raised upward (connect/data/disconnect indications) are drained for the
+//! telnet console / app.
+//!
+//! Concurrency note: this wrapper is intended to be owned by a single supervising
+//! task (or guarded by an `embassy_sync` mutex) so the `&mut SessionManager` borrow
+//! the manager's `post` needs is serialised across transports. The exact sharing
+//! (one owning task with an event channel vs. a shared mutex) is finalised at
+//! WiFi bring-up; the manager + timer logic below is hardware-independent and is
+//! host-tested in `ax25_node_core::sdl::manager`.
 
-use embassy_time::Timer;
+use ax25_node_core::ax25::Callsign;
+use ax25_node_core::sdl::{
+    Event, SessionManager, TimerId, TimerService, TimerSnapshot,
+};
+
+use embassy_time::{Duration, Instant, Timer};
 
 /// Maximum concurrent link-layer sessions. Fixed (no heap session map). Sized for
 /// a Pico node; bump with care given the per-session window buffers (research §6).
 pub const MAX_SESSIONS: usize = 4;
 
-/// The T1/T2/T3 timer service for all sessions. STUB: the real loop arms/services
-/// per-session timers off `embassy_time` and feeds timer-expiry events into the
-/// session walk (replacing the C# `SystemTimerScheduler`).
+/// The node's per-peer session collection. Construct once at boot with the node's
+/// own callsign; share it (single task or `embassy_sync` mutex) across transports.
+pub type Sessions = SessionManager<MAX_SESSIONS>;
+
+/// Build the session manager for this node's local callsign.
+pub fn new_sessions(local: Callsign) -> Sessions {
+    SessionManager::new(local)
+}
+
+/// An `embassy-time`-backed [`TimerService`]: each of T1/T2/T3 is a deadline
+/// ([`Instant`]) or `None`. The [`timer_task`] waits on the nearest deadline and
+/// posts the matching expiry [`Event`] into the session manager.
+///
+/// Integer-millisecond throughout (research §3): the runtime arms timers in `u32`
+/// ms, which map onto `embassy_time::Duration::from_millis`.
+#[derive(Clone, Copy, Default)]
+pub struct EmbassyTimers {
+    t1: Option<Instant>,
+    t2: Option<Instant>,
+    t3: Option<Instant>,
+}
+
+impl EmbassyTimers {
+    /// A service with no timers armed.
+    pub const fn new() -> Self {
+        Self {
+            t1: None,
+            t2: None,
+            t3: None,
+        }
+    }
+
+    fn slot(&self, id: TimerId) -> Option<Instant> {
+        match id {
+            TimerId::T1 => self.t1,
+            TimerId::T2 => self.t2,
+            TimerId::T3 => self.t3,
+        }
+    }
+
+    fn slot_mut(&mut self, id: TimerId) -> &mut Option<Instant> {
+        match id {
+            TimerId::T1 => &mut self.t1,
+            TimerId::T2 => &mut self.t2,
+            TimerId::T3 => &mut self.t3,
+        }
+    }
+
+    /// The nearest armed deadline across all timers, if any — what [`timer_task`]
+    /// sleeps until.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        [self.t1, self.t2, self.t3]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Return the timer ids whose deadline is at/<= `now`, clearing them. The
+    /// caller posts an expiry event for each.
+    pub fn take_expired(&mut self, now: Instant) -> heapless::Vec<TimerId, 3> {
+        let mut out = heapless::Vec::new();
+        for id in [TimerId::T1, TimerId::T2, TimerId::T3] {
+            if matches!(self.slot(id), Some(deadline) if deadline <= now) {
+                *self.slot_mut(id) = None;
+                let _ = out.push(id);
+            }
+        }
+        out
+    }
+}
+
+impl TimerService for EmbassyTimers {
+    fn arm(&mut self, id: TimerId, duration_ms: u32) {
+        *self.slot_mut(id) = Some(Instant::now() + Duration::from_millis(duration_ms as u64));
+    }
+    fn cancel(&mut self, id: TimerId) {
+        *self.slot_mut(id) = None;
+    }
+    fn is_running(&self, id: TimerId) -> bool {
+        self.slot(id).is_some()
+    }
+    fn time_remaining_ms(&self, id: TimerId) -> u32 {
+        match self.slot(id) {
+            Some(deadline) => {
+                let now = Instant::now();
+                if deadline > now {
+                    (deadline - now).as_millis() as u32
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+    fn capture(&self) -> TimerSnapshot {
+        // Snapshot as remaining-ms (the runtime's rollback unit).
+        TimerSnapshot {
+            t1: self.t1.map(|_| self.time_remaining_ms(TimerId::T1)),
+            t2: self.t2.map(|_| self.time_remaining_ms(TimerId::T2)),
+            t3: self.t3.map(|_| self.time_remaining_ms(TimerId::T3)),
+        }
+    }
+    fn restore(&mut self, snap: TimerSnapshot) {
+        let now = Instant::now();
+        let to_deadline = |ms: Option<u32>| ms.map(|m| now + Duration::from_millis(m as u64));
+        self.t1 = to_deadline(snap.t1);
+        self.t2 = to_deadline(snap.t2);
+        self.t3 = to_deadline(snap.t3);
+    }
+}
+
+/// Map a timer id to the runtime expiry event the session manager expects.
+pub fn expiry_event(id: TimerId) -> Event {
+    match id {
+        TimerId::T1 => Event::T1Expiry,
+        TimerId::T2 => Event::T2Expiry,
+        TimerId::T3 => Event::T3Expiry,
+    }
+}
+
+/// The T1/T2/T3 timer service task. Waits on the nearest armed deadline, then feeds
+/// the expiry into the session walk. STUB at the wiring seam: the shared-state
+/// access (which session, which sink) is finalised with the supervisor's chosen
+/// sharing model at WiFi bring-up. The timer math + service above are complete and
+/// host-tested via the core `MockTimerService` parity (`ax25_node_core::sdl::timer`).
 #[embassy_executor::task]
 pub async fn timer_task() {
     loop {
-        // Placeholder cadence; the real service waits on the nearest armed timer.
+        // The real loop borrows the shared EmbassyTimers, computes next_deadline(),
+        // waits until it (or until re-armed), then for each take_expired() id posts
+        // expiry_event(id) into the SessionManager and flushes the resulting frames
+        // to the owning transport. Placeholder cadence until that shared state lands.
         Timer::after_millis(100).await;
     }
 }
