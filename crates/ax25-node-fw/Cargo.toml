@@ -62,6 +62,12 @@ cyw43-pio = { version = "0.10", default-features = false, features = ["defmt"] }
 # --- no-alloc async TCP/IP stack (UDP for AXUDP, TCP for KISS + telnet) ---
 embassy-net = { version = "0.9", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
 
+# Async byte-I/O traits — `embassy_rp::uart::BufferedUart` implements these; the
+# KISS-over-serial transport's `ByteStream` impl (transports::kiss_serial) drives the
+# NinoTNC UART through them. (Re-exported by embassy-rp, pinned explicitly for the
+# direct `Read`/`Write` use.)
+embedded-io-async = { version = "0.6", default-features = false }
+
 # --- Cortex-M runtime + logging/diagnostics ---
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = { version = "0.7" }

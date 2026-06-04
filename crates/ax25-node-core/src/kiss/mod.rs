@@ -13,11 +13,29 @@
 //! The codec is transport-agnostic: the firmware's TCP and UART tasks both push
 //! received bytes into a [`Decoder`] and frame outbound AX.25 bytes with
 //! [`encode`]. All logic here is pure and host-tested.
+//!
+//! Beyond the base codec this module also carries the rest of `Packet.Kiss`'s
+//! behaviour:
+//! - [`ackmode`] — the G8BPQ ACKMODE extension (`Packet.Kiss.KissAckMode`).
+//! - [`params`] — the KISS parameter-command builders (TXDELAY/P/SLOTTIME/…).
+//! - [`classify`] — modem-agnostic inbound-frame classification
+//!   (`Packet.Kiss.KissFrameClassifier`).
+//! - [`serial`] — the serial-KISS transport seam over an async byte stream
+//!   (`Packet.Kiss.Serial.KissSerialModem` + the `IKissModem` seam), host-testable.
+//! - [`ninotnc`] — the NinoTNC-specific extensions (`Packet.Kiss.NinoTnc`): the mode
+//!   catalog, SETHW mode byte, the TX-Test frames, and the NinoTNC-aware classifier.
 
+pub mod ackmode;
+pub mod classify;
 pub mod decoder;
 pub mod encoder;
 pub mod frame;
+pub mod ninotnc;
+pub mod params;
+pub mod serial;
 
+pub use classify::{classify, InboundEvent};
 pub use decoder::Decoder;
 pub use encoder::{encode, encode_into, max_encoded_len};
 pub use frame::{Command, Frame, EXIT_KISS_MODE, FEND, FESC, TFEND, TFESC};
+pub use serial::{ByteStream, ModemError, SerialKissModem};
