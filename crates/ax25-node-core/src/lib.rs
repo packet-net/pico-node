@@ -15,16 +15,12 @@
 //!
 //! ## What lives here (host-testable today, zero external deps)
 //!
-//! - [`crc`]      — CRC-16/X.25 (the AX.25 FCS), ported from `Packet.Core.Crc16Ccitt`.
-//! - [`kiss`]     — KISS SLIP framing: encoder + streaming decoder (`Packet.Kiss`).
-//! - [`axudp`]    — AXUDP framing helpers (the UDP payload *is* the AX.25 body)
-//!                  with optional CRC FCS, ported from `Packet.Axudp.AxudpSocket`.
-//! - [`ax25`]     — AX.25 address + frame codec essentials (`Packet.Ax25.Ax25Frame`,
-//!                  `Packet.Core.Ax25Address`, `Packet.Core.Callsign`).
-//! - [`console`]  — the node command-prompt layer: line assembler, command parser,
-//!                  and the transport-agnostic prompt loop (`Packet.Node.Core.Console`).
-//! - [`sdl`]      — the (scaffolded) glue that will consume the generated AX.25 SDL
-//!                  state tables from `m0lte/ax25sdl` and run the link-layer runtime.
+//! - [`crc`] — CRC-16/X.25 (the AX.25 FCS), ported from `Packet.Core.Crc16Ccitt`.
+//! - [`kiss`] — KISS SLIP framing: encoder + streaming decoder (`Packet.Kiss`).
+//! - [`axudp`] — AXUDP framing helpers (the UDP payload *is* the AX.25 body) with optional CRC FCS, ported from `Packet.Axudp.AxudpSocket`.
+//! - [`ax25`] — AX.25 address + frame codec essentials (`Packet.Ax25.Ax25Frame`, `Packet.Core.Ax25Address`, `Packet.Core.Callsign`).
+//! - [`console`] — the node command-prompt layer: line assembler, command parser, and the transport-agnostic prompt loop (`Packet.Node.Core.Console`).
+//! - [`sdl`] — the connected-mode AX.25 link-layer runtime: the SDL state machine driven off the generated `m0lte/ax25sdl` typed tables (the Rust port of packet.net's `Ax25Session`).
 //!
 //! The I/O-bound parts (sockets, the WiFi radio, the UART) live in the firmware
 //! crate `ax25-node-fw`; this crate is pure logic over bytes so it can be tested

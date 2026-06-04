@@ -1,16 +1,20 @@
 # ax25-node-core — the portable, host-testable heart of the Pico node.
 #
-# Design rule: ZERO external dependencies. Everything here is plain `core`/`alloc`
-# (and `std` only behind the default `std` feature, used for host tests + the
-# host simulator). That is what lets `cargo test` run fully offline today, with
-# no network fetch and no embedded toolchain — exactly the hands-free,
+# Design rule: exactly ONE external dependency — the generated AX.25 SDL tables
+# (`ax25sdl`, m0lte/ax25sdl spec/rust), consumed as a LOCAL path dependency with
+# `default-features = false` so it stays `no_std`. Everything else is plain
+# `core`/`alloc` (and `std` only behind the default `std` feature, used for host
+# tests + the host simulator). `cargo test` still runs fully offline — ax25sdl is
+# a local sibling checkout, not a crates.io fetch — exactly the hands-free,
 # zero-hardware loop the research note (§3.1, §4.1) identifies as where ~all
 # correctness lives.
 #
-# To consume the *real* generated AX.25 SDL tables, this crate will depend on the
-# `ax25sdl` Rust crate (m0lte/ax25sdl, spec/rust). That is NOT wired yet — see
-# the `sdl` module and docs/PLAN.md §"SDL integration" for why (the generated
-# crate is not no_std and not published; tracked as a blocker).
+# The `ax25sdl` Rust crate is now `no_std`-capable (default-on `std` feature) and
+# carries SP-010's typed closed sets (`Ax25Event` / `Ax25Guard` / `Ax25ActionVerb`
+# + `GuardTerm` / `ActionStep` / `TransitionSpec`), so the `sdl` module drives the
+# connected-mode runtime off a clean typed `match` over those enums — the way
+# packet.net's `Ax25Session` consumes `Packet.Ax25.Sdl`. The PLAN.md §6 blockers
+# (not-no_std, stringly-typed) are RESOLVED upstream as of ax25sdl 0.8.0.
 
 [package]
 name = "ax25-node-core"
@@ -22,19 +26,27 @@ description = "Portable, no_std-able AX.25 packet-node logic (KISS, AXUDP, frame
 
 [features]
 # `std` (default) links the standard library: used by host unit tests and the
-# host-side simulator. Turn it OFF for the on-target build:
-#   cargo build -p ax25-node-core --no-default-features
-# which makes the crate `#![no_std]` and `alloc`-only.
+# host-side simulator. It also turns ON ax25sdl's own `std` feature (purely so the
+# sibling crate's host build/test path matches; its data/type core is no_std
+# either way). Turn it OFF for the on-target build:
+#   cargo build -p ax25-node-core --no-default-features --features alloc
+# which makes both this crate and ax25sdl `#![no_std]`.
 default = ["std"]
-std = ["alloc"]
+std = ["alloc", "ax25sdl/std"]
 # `alloc` pulls in the `alloc` crate for the few growable buffers (the streaming
-# KISS/line decoders). The embedded firmware provides a global allocator (or, as
-# a follow-up, these can be swapped for heapless fixed-capacity buffers — see the
-# module docs). Kept as a separate feature so the heap dependency is explicit.
+# KISS/line decoders + the session queues). The embedded firmware provides a
+# global allocator (or, as a follow-up, these can be swapped for heapless
+# fixed-capacity buffers — see the module docs). Kept as a separate feature so the
+# heap dependency is explicit.
 alloc = []
 
 [dependencies]
-# (intentionally empty — see the header comment)
+# The generated AX.25 v2.2 SDL state-machine tables + typed closed sets, consumed
+# as a LOCAL path dependency (Tom wants ax25sdl kept local — no crates.io pin).
+# `default-features = false` keeps it `#![no_std]`; the host `std` feature above
+# re-enables ax25sdl's `std` for the test harness. The path points at the sibling
+# m0lte/ax25sdl checkout's Rust backend crate.
+ax25sdl = { path = "../../../ax25sdl/spec/rust", default-features = false }
 
 [dev-dependencies]
-# (intentionally empty — host tests use only std)
+# (intentionally empty — host tests use only std + the ax25sdl dep above)

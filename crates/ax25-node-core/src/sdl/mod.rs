@@ -1,50 +1,64 @@
-//! SDL link-layer runtime — glue between the generated AX.25 state tables and
-//! this node.
+//! SDL link-layer runtime — the connected-mode AX.25 state machine, driven off the
+//! generated [`ax25sdl`] typed tables.
 //!
-//! ## Status: scaffolded, NOT yet wired to the real tables. See the blocker.
+//! ## What this is
 //!
-//! The headline differentiator of this whole project (per
+//! The headline differentiator of this project (per
 //! `docs/research/pico-packet-node.md`) is running the *same* generated AX.25 v2.2
 //! SDL state machine that the C# (`packet.net`) and TypeScript (`ax25-ts`) stacks
-//! run — from one spec source, proving link-layer parity across hardware classes.
+//! run — from one spec source — proving link-layer parity across hardware classes.
+//! `m0lte/ax25sdl` (`spec/rust`, the `ax25sdl` crate, 0.8.0) emits the ~243 v2.2
+//! transitions + the figc4.7 subroutines as `&'static` [`ax25sdl::StatePage`] /
+//! [`ax25sdl::SubroutinesPage`] data, plus SP-010's typed closed sets
+//! ([`ax25sdl::Ax25Event`] / [`ax25sdl::Ax25Guard`] / [`ax25sdl::Ax25ActionVerb`]).
+//! This module is the **runtime that walks them** — the Rust port of the C#
+//! `Ax25Session` + `ActionDispatcher` + `GuardEvaluator` + `SubroutineRegistry` +
+//! `SdlLoopExecutor`, consuming those tables via a clean exhaustive `match` (no
+//! string dispatch).
 //!
-//! `m0lte/ax25sdl` already emits a **Rust** backend (`spec/rust`): the ~243 v2.2
-//! transitions + figc4.7 subroutines as `pub static … : StatePage` tables of
-//! `&'static` data (`TransitionSpec`, `ActionStep`, `SubroutinePath`, `LoopRange`).
-//! Those tables are inert data — ideal for embedding (const, ROM-able, no heap).
+//! ## Layout (mirrors the C# `Packet.Ax25.Session` module boundaries)
 //!
-//! **The work — and what is NOT done here — is the *runtime that walks them*.**
-//! In the C# stack that's ~6 k LOC (`ActionDispatcher`, `Ax25Session`,
-//! `GuardEvaluator`, `SubroutineRegistry`, `SdlLoopExecutor`, the frame codec,
-//! `Segmenter`, timers). This module is the place that port lands. The
-//! [`loop_exec`] sub-module is the first piece (the `LoopRange` expander —
-//! `SdlLoopExecutor`), ported and host-tested standalone because it depends only
-//! on the table *shape*, not the table *data*.
+//! - [`context`] — [`SessionContext`]: sequence vars, flags, queues, params.
+//! - [`event`] — the runtime [`Event`] vocabulary + the typed mapping onto [`ax25sdl::Ax25Event`].
+//! - [`signal`] — the outbound [`signal::FrameSpec`] / [`signal::DataLinkSignal`] + the [`signal::SessionSink`] the embedding implements.
+//! - [`timer`] — the [`timer::TimerService`] contract + the integerised SRT/T1V math (research §3: no FPU on the M0+).
+//! - [`guard`] — typed-`match` guard evaluation over [`ax25sdl::Ax25Guard`].
+//! - [`dispatch`] — typed-`match` action dispatch over [`ax25sdl::Ax25ActionVerb`].
+//! - [`subroutine`] — the figc4.7 subroutine walker.
+//! - [`loop_exec`] — the `loop_while` expander ([`ax25sdl::LoopRange`]).
+//! - [`quirks`] — the named figc4.x spec-defect fixes (default-on, as in packet.net's `Ax25SessionQuirks`).
+//! - [`session`] — the [`session::Session`] driver tying it together.
 //!
-//! ## Blockers consuming the real `ax25sdl` Rust crate (tracked in docs/PLAN.md)
+//! ## Status
 //!
-//! 1. **Not published.** `spec/rust/Cargo.toml` is `publish = false`; the crate
-//!    is a CI build/test target, not a crates.io artifact. To depend on it this
-//!    workspace would use a path/git dependency, or ax25sdl would publish it.
-//! 2. **Not `no_std`.** `spec/rust/src/lib.rs` / `types.rs` carry no `#![no_std]`.
-//!    The *content* is `&'static str` / `&'static [...]` with no `Vec`/`String`/
-//!    `Box` — so it is no_std-*compatible* — but the attribute + a `default-std`
-//!    feature have to be added upstream (ax25sdl Phase-0 task in the research
-//!    note) before it builds for `thumbv6m-none-eabi`.
-//! 3. **Still stringly-typed (verbs AND guards/events).** The Rust emitter writes
-//!    `verb: "V(s) := V(s) + 1"`, `guard: "peer_busy == false"`, `on: "..."` as
-//!    raw `&'static str`. SP-010's typed closed sets (`Ax25ActionVerb`,
-//!    `Ax25Guard`, `Ax25Event`) have shipped only in the **C# and TS** backends
-//!    (ax25sdl ADR-0002, 2026-06-03); the **Rust backend has not been migrated**.
-//!    Until it is, the Rust runtime must either ship a string-expression parser +
-//!    string-keyed dispatch on the M0+ (works — it's what C#/TS do — but wasteful
-//!    in flash and cycles) or hand-maintain an enum mapping that drifts from the
-//!    codegen. The clean fix is upstream: extend the Rust emitter to emit the
-//!    same typed enums, so this module's dispatcher is an exhaustive `match`.
-//!
-//! These are dependency/sequencing items, not blockers on *this* crate's
-//! host-testable work — hence the scaffold here and the explicit plan entries.
+//! The PLAN.md §6 blockers — "ax25sdl Rust crate not `no_std` / not typed" — are
+//! **RESOLVED** upstream (ax25sdl 0.8.0: `#![no_std]` default-off-`std`, ADR-0003
+//! typed closed sets). This crate consumes it as a local path dependency; the
+//! runtime is host-tested with `cargo test` and is `no_std`-clean for the M0+.
 
+pub mod context;
+pub mod dispatch;
+pub mod event;
+pub mod guard;
 pub mod loop_exec;
+pub mod quirks;
+pub mod session;
+pub mod signal;
+pub mod subroutine;
+pub mod timer;
+pub mod tx;
 
-pub use loop_exec::{run_loop, LoopRange, MAX_ITERATIONS};
+pub use context::{Payload, SessionContext};
+pub use event::{Event, FrameInfo};
+pub use loop_exec::{run_loop, MAX_ITERATIONS};
+pub use quirks::Quirks;
+pub use session::{Session, State};
+pub use signal::{
+    DataLinkSignal, FrameSpec, InternalSignal, LinkMultiplexerSignal, NullSink, SessionSink,
+    SupervisoryKind, UnnumberedKind,
+};
+pub use timer::{MockTimerService, TimerId, TimerService, TimerSnapshot};
+pub use tx::{PendingFrame, Tx};
+
+#[cfg(test)]
+mod tests;
