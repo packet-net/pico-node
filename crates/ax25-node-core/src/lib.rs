@@ -21,6 +21,7 @@
 //! - [`ax25`] — AX.25 address + frame codec essentials (`Packet.Ax25.Ax25Frame`, `Packet.Core.Ax25Address`, `Packet.Core.Callsign`).
 //! - [`console`] — the node command-prompt layer: line assembler, command parser, and the transport-agnostic prompt loop (`Packet.Node.Core.Console`).
 //! - [`sdl`] — the connected-mode AX.25 link-layer runtime: the SDL state machine driven off the generated `m0lte/ax25sdl` typed tables (the Rust port of packet.net's `Ax25Session`).
+//! - [`netrom`] — the read-only "NET/ROM aware" slice: parse NODES broadcasts, build a routing table, surface it (the Rust port of `Packet.NetRom` + `Packet.Node.Core.NetRom.NetRomService`). Hears NODES, originates nothing.
 //!
 //! The I/O-bound parts (sockets, the WiFi radio, the UART) live in the firmware
 //! crate `ax25-node-fw`; this crate is pure logic over bytes so it can be tested
@@ -38,6 +39,7 @@ pub mod axudp;
 pub mod console;
 pub mod crc;
 pub mod kiss;
+pub mod netrom;
 pub mod sdl;
 
 /// The node software version, surfaced by the `Info` console command (mirrors

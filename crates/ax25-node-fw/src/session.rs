@@ -21,7 +21,8 @@
 //! WiFi bring-up; the manager + timer logic below is hardware-independent and is
 //! host-tested in `ax25_node_core::sdl::manager`.
 
-use ax25_node_core::ax25::Callsign;
+use ax25_node_core::ax25::{Callsign, Frame};
+use ax25_node_core::netrom::{NetRomService, ObserveOutcome, PortId};
 use ax25_node_core::sdl::{
     Event, SessionManager, TimerId, TimerService, TimerSnapshot,
 };
@@ -39,6 +40,44 @@ pub type Sessions = SessionManager<MAX_SESSIONS>;
 /// Build the session manager for this node's local callsign.
 pub fn new_sessions(local: Callsign) -> Sessions {
     SessionManager::new(local)
+}
+
+/// The node's read-only NET/ROM observer (the Rust port of the C# `NetRomService`).
+/// Construct once at boot; share it (single task or `embassy_sync` mutex) across
+/// transports exactly like [`Sessions`]. It is *only* fed the read-only tap below —
+/// it owns no socket and emits nothing on the air.
+pub type NetRom = NetRomService;
+
+/// Build the NET/ROM service (enabled, canonical defaults). Disable per config by
+/// constructing with [`NetRomService::with_options`].
+pub fn new_netrom() -> NetRom {
+    NetRomService::new()
+}
+
+/// **The read-only NET/ROM tap — the inbound-frame hook.**
+///
+/// Call this for **every decoded inbound frame, BEFORE address filtering / before
+/// routing it to a session** — exactly where the C# `Ax25Listener.InboundPumpAsync`
+/// raises `FrameTraced` (which fires before `DispatchInbound` drops not-addressed-to-
+/// us frames). NODES broadcasts are addressed to the literal callsign `NODES`, not to
+/// the node, so they would never reach a session; the tap is how the node *hears*
+/// them. This is observation-only: it never alters the frame, emits nothing, and
+/// cannot touch a session — so a NODES storm mid-QSO leaves the link untouched
+/// (proven in `ax25_node_core::netrom`'s read-only-guarantee test).
+///
+/// After this returns, the caller proceeds with its normal address filter: if the
+/// frame is addressed to us, classify it and post it to the [`Sessions`] manager;
+/// otherwise drop it (the tap has already extracted any NET/ROM value).
+pub fn observe_inbound(
+    netrom: &mut NetRom,
+    frame: &Frame,
+    my_call: Callsign,
+    port_id: PortId,
+) -> ObserveOutcome {
+    // Monotonic millisecond tick for the neighbour's last-heard stamp (the core has
+    // no wall-clock — research §2.7 / §3: time is injected).
+    let now = Instant::now().as_millis();
+    netrom.observe_frame(frame, my_call, port_id, now)
 }
 
 /// An `embassy-time`-backed [`TimerService`]: each of T1/T2/T3 is a deadline

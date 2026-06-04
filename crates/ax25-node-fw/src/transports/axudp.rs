@@ -21,7 +21,14 @@ pub async fn task(_stack: Stack<'static>, cfg: AxudpConfig) {
     // 2. loop:
     //      let (n, ep) = socket.recv_from(&mut buf).await?;
     //      let rx = axudp::decode_datagram(&buf[..n], cfg.include_fcs);
-    //      if let Some(frame) = rx.frame { session::deliver(ep, frame).await; }
+    //      if let Some(frame) = rx.frame {
+    //          // READ-ONLY NET/ROM TAP — fires for EVERY frame, BEFORE the address
+    //          // filter, so NODES broadcasts (dest "NODES", not us) are heard. It
+    //          // touches nothing else; observation only.
+    //          session::observe_inbound(&mut netrom, &frame, my_call, PortId::from_str_lossy("axudp"));
+    //          // ...then the normal address-filtered routing to a session:
+    //          session::deliver(ep, frame).await;
+    //      }
     // 3. Outbound: session hands (ep, frame) → axudp::encode_datagram(&frame,
     //    cfg.include_fcs) → socket.send_to(&dgram, ep).await?;
     let _ = axudp::encode_datagram; // keep the import wired until the body lands

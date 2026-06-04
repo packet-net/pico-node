@@ -24,6 +24,11 @@ pub async fn task(_stack: Stack<'static>, cfg: KissTcpConfig) {
     //     for frame in _decoder.push(&buf[..n]) {
     //       if frame.command == kiss::Command::Data {
     //         if let Ok(ax) = ax25_node_core::ax25::Frame::decode(&frame.payload) {
+    //           // READ-ONLY NET/ROM TAP — every frame, BEFORE the address filter,
+    //           // so NODES broadcasts (dest "NODES", not us) are heard. Observation
+    //           // only; cannot disturb a session.
+    //           session::observe_inbound(&mut netrom, &ax, my_call, PortId::from_str_lossy("kiss-tcp"));
+    //           // ...then the normal address-filtered routing:
     //           session::deliver_kiss(ax).await;
     //   } } } }
     //   // outbound: kiss::encode_into(&mut out, 0, Command::Data, &ax.encode()) → write
