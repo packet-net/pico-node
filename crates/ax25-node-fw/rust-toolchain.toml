@@ -1,0 +1,15 @@
+# Pin the toolchain + the embedded target for the firmware crate, so a clean
+# checkout on a machine with rustup just works: `rustup` reads this and installs
+# the stable channel plus the thumbv6m-none-eabi target component.
+#
+# NOTE: this is only honoured by rustup. The current planning environment has a
+# system (Debian-packaged) rustc with no rustup and no thumbv6m core, so it is
+# inert here — it takes effect once a rustup toolchain is installed (see
+# docs/PLAN.md §"Package approval list").
+#
+# Embassy targets stable Rust (no nightly needed for the RP2040 path).
+
+[toolchain]
+channel = "stable"
+components = ["rust-src", "llvm-tools"]
+targets = ["thumbv6m-none-eabi"]

@@ -1,0 +1,40 @@
+# ax25-node-core — the portable, host-testable heart of the Pico node.
+#
+# Design rule: ZERO external dependencies. Everything here is plain `core`/`alloc`
+# (and `std` only behind the default `std` feature, used for host tests + the
+# host simulator). That is what lets `cargo test` run fully offline today, with
+# no network fetch and no embedded toolchain — exactly the hands-free,
+# zero-hardware loop the research note (§3.1, §4.1) identifies as where ~all
+# correctness lives.
+#
+# To consume the *real* generated AX.25 SDL tables, this crate will depend on the
+# `ax25sdl` Rust crate (m0lte/ax25sdl, spec/rust). That is NOT wired yet — see
+# the `sdl` module and docs/PLAN.md §"SDL integration" for why (the generated
+# crate is not no_std and not published; tracked as a blocker).
+
+[package]
+name = "ax25-node-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable, no_std-able AX.25 packet-node logic (KISS, AXUDP, frame codec, console) for the RP2040 Pico W node and host tests."
+
+[features]
+# `std` (default) links the standard library: used by host unit tests and the
+# host-side simulator. Turn it OFF for the on-target build:
+#   cargo build -p ax25-node-core --no-default-features
+# which makes the crate `#![no_std]` and `alloc`-only.
+default = ["std"]
+std = ["alloc"]
+# `alloc` pulls in the `alloc` crate for the few growable buffers (the streaming
+# KISS/line decoders). The embedded firmware provides a global allocator (or, as
+# a follow-up, these can be swapped for heapless fixed-capacity buffers — see the
+# module docs). Kept as a separate feature so the heap dependency is explicit.
+alloc = []
+
+[dependencies]
+# (intentionally empty — see the header comment)
+
+[dev-dependencies]
+# (intentionally empty — host tests use only std)

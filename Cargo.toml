@@ -1,0 +1,42 @@
+# Pico-node — Rust workspace for an RP2040 / Pico W AX.25 packet node.
+#
+# Two crates, deliberately split (see docs/PLAN.md §"Workspace layout"):
+#
+#   crates/ax25-node-core  portable, no_std-able protocol + node logic. ZERO
+#                          external dependencies — builds & `cargo test`s on the
+#                          host today (with the default `std` feature). This is
+#                          where ~all correctness lives and is tested BEFORE any
+#                          hardware exists. It is the ONLY workspace member, so a
+#                          bare `cargo test` here is fully offline + host-only.
+#
+#   crates/ax25-node-fw    the thin RP2040 / Embassy binary that wires the core to
+#                          the CYW43 WiFi radio, embassy-net, and the UART. It is a
+#                          STANDALONE crate, EXCLUDED from this workspace (see the
+#                          `exclude` note below). Its embassy/cyw43/defmt/probe-rs
+#                          deps are declared in its own Cargo.toml (planning) but
+#                          are NOT built here (no thumbv6m core, no rustup — see
+#                          docs/PLAN.md §"Blockers" / §"Package approval list").
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/ax25-node-core",
+]
+# ax25-node-fw is EXCLUDED, not merely omitted from default-members. Cargo
+# resolves the dependency graph of every workspace *member* up front — so
+# including the firmware crate would force resolution (and, offline, failure) of
+# the whole embassy/cyw43/defmt tree before the host crate could build. Excluding
+# it keeps `cargo build` / `cargo test` here host-only and offline. The firmware
+# crate keeps its full dependency declarations (the planning artifact) and is
+# built on its own once the thumbv6m toolchain + crates are approved:
+#     cargo build --manifest-path crates/ax25-node-fw/Cargo.toml --release
+exclude = [
+    "crates/ax25-node-fw",
+]
+
+# Shared package metadata inherited by the workspace member(s) via
+# `edition.workspace = true` etc.
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/m0lte/pico-node"

@@ -1,0 +1,6 @@
+/target
+**/target
+Cargo.lock
+# cyw43 WiFi firmware/CLM blobs are vendored into the fw crate at bring-up time;
+# do not commit them without checking their licence (see docs/PLAN.md).
+/crates/ax25-node-fw/cyw43-firmware/
