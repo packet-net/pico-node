@@ -36,6 +36,7 @@
 //! typed closed sets). This crate consumes it as a local path dependency; the
 //! runtime is host-tested with `cargo test` and is `no_std`-clean for the M0+.
 
+pub mod bridge;
 pub mod context;
 pub mod dispatch;
 pub mod event;
@@ -48,6 +49,7 @@ pub mod subroutine;
 pub mod timer;
 pub mod tx;
 
+pub use bridge::{classify_incoming, WireSink};
 pub use context::{Payload, SessionContext};
 pub use event::{Event, FrameInfo};
 pub use loop_exec::{run_loop, MAX_ITERATIONS};
@@ -60,5 +62,7 @@ pub use signal::{
 pub use timer::{MockTimerService, TimerId, TimerService, TimerSnapshot};
 pub use tx::{PendingFrame, Tx};
 
+#[cfg(test)]
+mod harness_tests;
 #[cfg(test)]
 mod tests;
