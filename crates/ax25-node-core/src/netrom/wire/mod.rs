@@ -1,24 +1,50 @@
-//! NET/ROM wire formats — the byte-level NODES-broadcast codec.
+//! NET/ROM wire formats — the byte-level codecs.
 //!
-//! Mirrors the C# `Packet.NetRom.Wire` namespace: the named-divergence parse
-//! options ([`NetRomParseOptions`]), the two NET/ROM callsign/alias field decoders
-//! ([`callsign`]), the 21-byte destination entry ([`NodesRoutingEntry`]), and the
-//! NODES routing broadcast ([`NodesBroadcast`]).
+//! Mirrors the C# `Packet.NetRom.Wire` namespace. The read-only (ingest) half:
+//! the named-divergence parse options ([`NetRomParseOptions`]), the two NET/ROM
+//! callsign/alias field decoders ([`callsign`]), the 21-byte destination entry
+//! ([`NodesRoutingEntry`]), and the NODES routing broadcast parser
+//! ([`NodesBroadcast`]). The origination + L4 half (added for the full L3+L4
+//! parity slice): the callsign field encoders ([`write_shifted`]/[`write_alias`]),
+//! the L4 transport header ([`NetRomTransportHeader`]), the Connect Request info
+//! field ([`ConnectRequestInfo`]), the NODES origination builder
+//! ([`write_nodes_frame`]), and the L3 network header + datagram
+//! ([`NetRomNetworkHeader`] / [`NetRomPacket`]).
 //!
-//! Everything here is **read-only** (parse-only) and `no_std`/allocation-free —
-//! the production node hears third-party NODES broadcasts and never originates
-//! one. Tests bring their own byte builder (`test_support`, compiled only under
-//! `cfg(test)`) to exercise the parser with realistic, spec-shaped input.
+//! Everything is `no_std`/allocation-free: parsers borrow the source slice and the
+//! builders write into a caller-provided buffer (no heap byte arrays). The
+//! outbound path is strict/canonical even though the parser tolerates real-world
+//! divergences inbound.
 
 pub mod broadcast;
 pub mod callsign;
+pub mod connect_request_info;
 pub mod entry;
+pub mod network_header;
+pub mod nodes_broadcast_builder;
 pub mod options;
+pub mod packet;
+pub mod transport_header;
 
 pub use broadcast::NodesBroadcast;
-pub use callsign::{read_alias, try_read_shifted, Alias, ALIAS_LENGTH, SHIFTED_LENGTH};
+pub use callsign::{
+    read_alias, try_read_shifted, write_alias, write_shifted, Alias, ALIAS_LENGTH, SHIFTED_LENGTH,
+};
+pub use connect_request_info::{ConnectRequestInfo, CONNECT_REQUEST_INFO_LEN};
 pub use entry::NodesRoutingEntry;
+pub use network_header::{NetRomNetworkHeader, DEFAULT_TIME_TO_LIVE, NETWORK_HEADER_LEN};
+pub use nodes_broadcast_builder::{
+    write_nodes_frame, NodesAdvertisementEntry, MAX_NODES_FRAME_LEN,
+};
 pub use options::NetRomParseOptions;
+pub use packet::{NetRomPacket, MAX_PAYLOAD, PACKET_HEADER_LEN};
+pub use transport_header::{
+    NetRomOpcode, NetRomTransportHeader, FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK, FLAGS_MASK,
+    OPCODE_MASK, TRANSPORT_HEADER_LEN,
+};
+
+#[cfg(test)]
+mod codec_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support {

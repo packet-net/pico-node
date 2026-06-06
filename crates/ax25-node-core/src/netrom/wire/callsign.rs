@@ -55,6 +55,11 @@ impl Alias {
         while len > 0 && buf[len - 1] == b' ' {
             len -= 1;
         }
+        // Canonicalise the unused tail (see `read_alias`) so equal aliases compare
+        // equal regardless of construction path.
+        for slot in &mut buf[len..] {
+            *slot = 0;
+        }
         Self {
             buf,
             len: len as u8,
@@ -120,8 +125,47 @@ pub fn read_alias(source: &[u8]) -> Alias {
     while len > 0 && buf[len - 1] == b' ' {
         len -= 1;
     }
+    // Zero the unused tail so the fixed buffer is canonical: an alias decoded from
+    // a space-padded wire field must compare equal (under the derived `PartialEq`)
+    // to the same alias built by `from_str_lossy` — they otherwise differ only in
+    // the don't-care bytes past `len`.
+    for slot in &mut buf[len..] {
+        *slot = 0;
+    }
     Alias {
         buf,
         len: len as u8,
     }
+}
+
+/// Encode a [`Callsign`] into a 7-octet AX.25 shifted callsign field — the inverse
+/// of [`try_read_shifted`]. The command/response and end-of-address bits are
+/// cleared: inside a NODES entry or a NET/ROM header these fields are *payload*,
+/// not an AX.25 address-chain link. Delegates to [`Address::encode`] so the
+/// shift/SSID encoding has one source of truth with the frame layer, matching C#
+/// `NetRomCallsign.WriteShifted` (`CrhBit`/`ExtensionBit` false) byte-for-byte.
+/// Returns `None` only if `dst` has fewer than [`SHIFTED_LENGTH`] octets.
+pub fn write_shifted(callsign: &Callsign, dst: &mut [u8]) -> Option<()> {
+    Address {
+        callsign: *callsign,
+        crh: false,
+        extension: false,
+    }
+    .encode(dst)
+}
+
+/// Encode a NET/ROM alias / mnemonic into a 6-octet field — the inverse of
+/// [`read_alias`]: plain ASCII, right-padded with spaces, no shift and no SSID.
+/// (An [`Alias`] only ever holds printable, trailing-trimmed ASCII, so the field
+/// is canonical by construction; mirrors C# `NetRomCallsign.WriteAlias`.) Returns
+/// `None` only if `dst` has fewer than [`ALIAS_LENGTH`] octets.
+pub fn write_alias(alias: &Alias, dst: &mut [u8]) -> Option<()> {
+    if dst.len() < ALIAS_LENGTH {
+        return None;
+    }
+    let bytes = alias.as_str().as_bytes();
+    for (i, slot) in dst[..ALIAS_LENGTH].iter_mut().enumerate() {
+        *slot = if i < bytes.len() { bytes[i] } else { b' ' };
+    }
+    Some(())
 }
