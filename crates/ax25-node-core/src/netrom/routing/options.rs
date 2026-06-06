@@ -8,8 +8,10 @@
 //! interop pain. We keep the canonical defaults and expose every divergence as a
 //! named knob, rather than baking any one node's choices in.
 //!
-//! All are read-only-ingest concerns: a higher floor simply means we *learn* fewer
-//! routes; nothing here transmits.
+//! Most are read-only-ingest concerns: a higher floor simply means we *learn*
+//! fewer routes. The one exception is [`NetRomRoutingOptions::obsolete_minimum`]
+//! (OBSMIN), consulted only on the origination (TX) side by
+//! [`super::NetRomRoutingTable::build_advertisement`] — ingest never reads it.
 //!
 //! `no_std`, allocation-free: a plain `Copy` record. The *capacity* caps
 //! (per-destination route count, destination-list size, neighbour-list size) are
@@ -45,15 +47,24 @@ pub struct NetRomRoutingOptions {
     /// decrementing every route's count; at 0 the route is purged. Canonical
     /// default **6**.
     pub obsolete_initial: u8,
+
+    /// The advertise-gate (OBSMIN): a learned route whose obsolescence has decayed
+    /// below this is kept + usable but no longer re-advertised in our own NODES
+    /// broadcasts — so a fading route stops being advertised before it is finally
+    /// purged at 0. Canonical / BPQ default **4**; a value ≤ 1 advertises every
+    /// kept route. **Consulted only on the origination (TX) side** by
+    /// [`super::NetRomRoutingTable::build_advertisement`]; ingest never reads it.
+    pub obsolete_minimum: u8,
 }
 
 impl NetRomRoutingOptions {
     /// The canonical defaults: default-neighbour quality 192, MINQUAL 0 (keep all
-    /// above zero), OBSINIT 6.
+    /// above zero), OBSINIT 6, OBSMIN 4.
     pub const DEFAULT: Self = Self {
         default_neighbour_quality: 192,
         min_quality: 0,
         obsolete_initial: 6,
+        obsolete_minimum: 4,
     };
 }
 

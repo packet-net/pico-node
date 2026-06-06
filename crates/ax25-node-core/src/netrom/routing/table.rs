@@ -43,7 +43,8 @@ use crate::ax25::Callsign;
 use super::model::{NetRomDestination, NetRomNeighbour, NetRomRoute};
 use super::options::NetRomRoutingOptions;
 use super::quality;
-use crate::netrom::wire::{Alias, NodesBroadcast};
+use crate::netrom::wire::{Alias, NodesAdvertisementEntry, NodesBroadcast};
+use alloc::vec::Vec;
 use crate::netrom::PortId;
 
 /// One kept route inside a destination's route set.
@@ -353,6 +354,71 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
                 obsolescence: rt.obsolescence,
             });
         }
+    }
+
+    /// Build the destination entries for *our own* outgoing NODES broadcast: one
+    /// per known destination whose best route still clears the OBSMIN advertise
+    /// gate, sorted best-quality-first (ties broken by destination callsign for a
+    /// deterministic frame layout). The TX counterpart of [`ingest`](Self::ingest);
+    /// the [`super::super::NetRomOriginator`] frames these.
+    ///
+    /// `obsolete_minimum` overrides the configured OBSMIN
+    /// ([`NetRomRoutingOptions::obsolete_minimum`]) when `Some`; pass `0` to
+    /// re-advertise every kept route. A destination is dropped when its best route
+    /// is quality-0 (never advertise a loop-guarded route) or has decayed below the
+    /// gate. Mirrors `NetRomRoutingTable.buildAdvertisement`.
+    ///
+    /// Note the "best" here is *advertise-best* — highest quality, then highest
+    /// obsolescence (freshest) — deliberately distinct from the *routing-best*
+    /// (quality, then neighbour callsign) the table uses for forwarding: the
+    /// freshest route is what keys the OBSMIN decision, so advertisement tie-breaks
+    /// on obsolescence, not neighbour.
+    pub fn build_advertisement(&self, obsolete_minimum: Option<u8>) -> Vec<NodesAdvertisementEntry> {
+        let obsmin = obsolete_minimum.unwrap_or(self.options.obsolete_minimum);
+        let mut entries: Vec<NodesAdvertisementEntry> = Vec::new();
+
+        // Snapshot (destination, alias) first so the per-destination route scan
+        // below isn't a closure nested inside for_each_destination's borrow.
+        let mut dests: Vec<(Callsign, Alias)> = Vec::new();
+        self.for_each_destination(|d| dests.push((d.destination, d.alias)));
+
+        for (destination, destination_alias) in dests {
+            let mut best: Option<NetRomRoute> = None;
+            self.for_each_route(&destination, |route| {
+                let better = match best {
+                    None => true,
+                    Some(b) => {
+                        route.quality > b.quality
+                            || (route.quality == b.quality && route.obsolescence > b.obsolescence)
+                    }
+                };
+                if better {
+                    best = Some(route);
+                }
+            });
+
+            let Some(best) = best else { continue };
+            if best.quality == quality::MIN {
+                continue; // never advertise a quality-0 / loop-guarded route (MIN == 0)
+            }
+            if best.obsolescence < obsmin {
+                continue; // OBSMIN: decayed below the advertise threshold
+            }
+            entries.push(NodesAdvertisementEntry {
+                destination,
+                destination_alias,
+                best_neighbour: best.neighbour,
+                quality: best.quality,
+            });
+        }
+
+        entries.sort_by(|a, b| {
+            b.quality
+                .cmp(&a.quality)
+                .then_with(|| a.destination.base().cmp(b.destination.base()))
+                .then_with(|| a.destination.ssid().cmp(&b.destination.ssid()))
+        });
+        entries
     }
 
     // ─── Internals ───────────────────────────────────────────────────────
