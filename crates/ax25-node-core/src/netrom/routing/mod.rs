@@ -33,6 +33,10 @@ pub trait NetRomRoutingView {
     fn destination_for(&self, call: &Callsign) -> Option<NetRomDestination>;
     /// The directly-heard neighbour for a callsign, if any.
     fn neighbour_for(&self, call: &Callsign) -> Option<NetRomNeighbour>;
+    /// The best next-hop neighbour to reach `dest`, excluding `exclude` (the neighbour
+    /// a transit datagram arrived from, so it is not bounced straight back). `None` if
+    /// no usable route remains. Used by [`crate::netrom::forwarding::decide_forward`].
+    fn best_route_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign>;
 }
 
 impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> NetRomRoutingView
@@ -46,6 +50,9 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> Net
     }
     fn neighbour_for(&self, call: &Callsign) -> Option<NetRomNeighbour> {
         self.neighbour(call)
+    }
+    fn best_route_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
+        NetRomRoutingTable::best_route_excluding(self, dest, exclude)
     }
 }
 

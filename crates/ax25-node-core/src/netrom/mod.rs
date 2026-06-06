@@ -40,6 +40,7 @@
 //! [`MAX_ROUTES_PER_DEST`] / [`MAX_NEIGHBOURS`]).
 
 pub mod connector;
+pub mod forwarding;
 pub mod originator;
 pub mod routing;
 pub mod transport;
@@ -50,6 +51,7 @@ use crate::ax25::{Callsign, Frame, PID_NETROM};
 pub use connector::{
     InterlinkSend, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomNoRoute,
 };
+pub use forwarding::{decide_forward, ForwardDecision, ForwardOutcome};
 pub use originator::{NetRomOriginator, NetRomOriginatorOptions};
 pub use routing::{
     NetRomDestination, NetRomNeighbour, NetRomRoute, NetRomRoutingOptions, NetRomRoutingTable,
