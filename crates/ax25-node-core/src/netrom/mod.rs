@@ -49,8 +49,8 @@ pub use routing::{
     NetRomDestination, NetRomNeighbour, NetRomRoute, NetRomRoutingOptions, NetRomRoutingTable,
 };
 pub use transport::{
-    CircuitEvent, NetRomCircuit, NetRomCircuitCloseReason, NetRomCircuitOptions, NetRomCircuitState,
-    OutboundPacket,
+    CircuitEvent, CircuitKey, CircuitManager, IncomingCircuit, NetRomCircuit,
+    NetRomCircuitCloseReason, NetRomCircuitOptions, NetRomCircuitState, OutboundPacket,
 };
 pub use wire::{NetRomParseOptions, NodesBroadcast, NodesRoutingEntry};
 

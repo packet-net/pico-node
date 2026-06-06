@@ -2,9 +2,9 @@
 //!
 //! A textbook connection FSM: Disconnected → (Connecting | accepting) → Connected
 //! → Disconnecting → Disconnected. Hand-written (NET/ROM has no SDL figures, and
-//! BPQ is the de-facto reference). Mirrors `Packet.NetRom.Transport.NetRomCircuitState`
-//! + `NetRomCircuitCloseReason`. Rust gets real enums (the TS port uses an
-//! `as const` value-union for the same compile-time-typed closed set).
+//! BPQ is the de-facto reference). Mirrors the C# `NetRomCircuitState` and
+//! `NetRomCircuitCloseReason`. Rust gets real enums (the TS port uses an `as const`
+//! value-union for the same compile-time-typed closed set).
 
 /// The four lifecycle states of a circuit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

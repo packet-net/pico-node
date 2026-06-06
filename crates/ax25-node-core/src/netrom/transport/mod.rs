@@ -7,9 +7,11 @@
 //! (the firmware provides a heap sized for a few links with a small window).
 
 pub mod circuit;
+pub mod circuit_manager;
 pub mod circuit_options;
 pub mod circuit_state;
 
 pub use circuit::{CircuitEvent, NetRomCircuit, OutboundPacket};
+pub use circuit_manager::{CircuitKey, CircuitManager, IncomingCircuit};
 pub use circuit_options::NetRomCircuitOptions;
 pub use circuit_state::{NetRomCircuitCloseReason, NetRomCircuitState};
