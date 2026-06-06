@@ -779,4 +779,178 @@ mod tests {
         h.write_a(&conn, b"after dispose");
         assert_eq!(h.a.circuit_count(), 0);
     }
+
+    // ─── 3-node transit: integration-level forwarding (mirrors the C# test) ──
+
+    fn c_node() -> Callsign {
+        call("GB7CCC")
+    }
+
+    /// Seed `table` so it learns `originator` as a directly-heard neighbour (and a
+    /// destination via the assumed direct route) — a header-only NODES broadcast.
+    fn seed_neighbour(table: &mut Table, originator: Callsign, my_call: Callsign) {
+        let mut buf = [0u8; MAX_NODES_FRAME_LEN];
+        let n = write_nodes_frame(&Alias::from_str_lossy("N"), &[], &mut buf).unwrap();
+        let broadcast = NodesBroadcast::try_parse(&buf[..n]).unwrap();
+        table.ingest(originator, my_call, PortId::from_str_lossy("p1"), &broadcast, NOW);
+    }
+
+    /// Drive the in-process interlinks between three connectors (A, B, C) until
+    /// quiescent, routing each [`InterlinkSend`] by its next-hop neighbour. C is the
+    /// endpoint (echo console: banner on accept, `ack:<line>` per datagram); B is a
+    /// pure transit node; A records what it receives.
+    #[allow(clippy::too_many_arguments)]
+    fn pump3(
+        a: &mut NetRomConnector,
+        table_a: &Table,
+        b: &mut NetRomConnector,
+        table_b: &Table,
+        c: &mut NetRomConnector,
+        table_c: &Table,
+        c_conns: &mut Vec<NetRomConnection>,
+        a_received: &mut Vec<Vec<u8>>,
+        banner: &[u8],
+    ) {
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 100_000, "transit livelock");
+
+            // Collect every pending interlink datagram: (sender, next-hop, bytes).
+            let mut queue: Vec<(Callsign, Callsign, Vec<u8>)> = Vec::new();
+            for s in a.take_interlink_sends() {
+                queue.push((a_node(), s.neighbour, s.datagram));
+            }
+            for s in b.take_interlink_sends() {
+                queue.push((b_node(), s.neighbour, s.datagram));
+            }
+            for s in c.take_interlink_sends() {
+                queue.push((c_node(), s.neighbour, s.datagram));
+            }
+
+            let mut progressed = !queue.is_empty();
+
+            // C echoes (the endpoint console).
+            for conn in c.take_incoming_connections() {
+                c_conns.push(conn);
+                c.write(table_c, &conn, banner, NOW);
+                progressed = true;
+            }
+            for (key, ev) in c.take_events() {
+                if let CircuitEvent::DataReceived(data) = &ev {
+                    if let Some(conn) = c_conns.iter().find(|x| x.key == key).copied() {
+                        let mut ack = b"ack:".to_vec();
+                        ack.extend_from_slice(data);
+                        c.write(table_c, &conn, &ack, NOW);
+                    }
+                }
+                progressed = true;
+            }
+            // A records its inbound data; B is pure transit (drain, no console).
+            for (_key, ev) in a.take_events() {
+                if let CircuitEvent::DataReceived(data) = ev {
+                    a_received.push(data);
+                }
+                progressed = true;
+            }
+            for _ in b.take_incoming_connections() {
+                progressed = true;
+            }
+            if !b.take_events().is_empty() {
+                progressed = true;
+            }
+
+            if queue.is_empty() && !progressed {
+                break;
+            }
+
+            for (from, to, datagram) in queue {
+                if to == a_node() {
+                    a.on_interlink_data(table_a, from, &datagram, NOW);
+                } else if to == b_node() {
+                    b.on_interlink_data(table_b, from, &datagram, NOW);
+                } else if to == c_node() {
+                    c.on_interlink_data(table_c, from, &datagram, NOW);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forwards_an_l4_circuit_through_a_transit_node_without_terminating_it() {
+        // A reaches C only via B; C reaches A only via B; B knows both directly. A
+        // dials C by alias — the circuit's datagrams must transit B both ways.
+        let opts = NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut a = NetRomConnector::new(a_node(), opts);
+        let mut b = NetRomConnector::new(b_node(), opts);
+        let mut c = NetRomConnector::new(c_node(), opts);
+
+        let mut table_a: Table = NetRomRoutingTable::new(NetRomRoutingOptions::default());
+        seed(
+            &mut table_a,
+            b_node(),
+            a_node(),
+            NodesAdvertisementEntry {
+                destination: c_node(),
+                destination_alias: Alias::from_str_lossy("CCC"),
+                best_neighbour: c_node(),
+                quality: 200,
+            },
+        );
+        let mut table_c: Table = NetRomRoutingTable::new(NetRomRoutingOptions::default());
+        seed(
+            &mut table_c,
+            b_node(),
+            c_node(),
+            NodesAdvertisementEntry {
+                destination: a_node(),
+                destination_alias: Alias::from_str_lossy("AAA"),
+                best_neighbour: a_node(),
+                quality: 200,
+            },
+        );
+        let mut table_b: Table = NetRomRoutingTable::new(NetRomRoutingOptions::default());
+        seed_neighbour(&mut table_b, a_node(), b_node());
+        seed_neighbour(&mut table_b, c_node(), b_node());
+
+        let conn = a.connect(&table_a, "CCC", a_node(), NOW).expect("A routes to C via B");
+
+        let mut c_conns: Vec<NetRomConnection> = Vec::new();
+        let mut a_received: Vec<Vec<u8>> = Vec::new();
+        let banner = b"c-prompt";
+        pump3(&mut a, &table_a, &mut b, &table_b, &mut c, &table_c, &mut c_conns, &mut a_received, banner);
+
+        // The circuit established end-to-end, transiting B.
+        assert_eq!(a.circuit_state(conn.key), Some(NetRomCircuitState::Connected));
+        assert_eq!(conn.peer, c_node());
+        assert_eq!(c.circuit_count(), 1, "C terminated the circuit");
+        assert_eq!(c_conns.len(), 1);
+        assert_eq!(c_conns[0].peer, a_node(), "C's inbound circuit is from the dialler A");
+        assert_eq!(
+            b.circuit_count(),
+            0,
+            "B forwarded the circuit's datagrams between its neighbours — it never terminated one"
+        );
+
+        // C's banner reached A through B (the C→B→A data-forwarding path).
+        let a_text: Vec<u8> = a_received.iter().flatten().copied().collect();
+        assert!(
+            a_text.windows(banner.len()).any(|w| w == banner),
+            "C's banner reached A via the transit node B"
+        );
+
+        // A→C→A round-trip: A sends a line, C echoes `ack:`, it returns through B.
+        a.write(&table_a, &conn, b"hi-transit", NOW);
+        pump3(&mut a, &table_a, &mut b, &table_b, &mut c, &table_c, &mut c_conns, &mut a_received, banner);
+        let a_text: Vec<u8> = a_received.iter().flatten().copied().collect();
+        let want = b"ack:hi-transit";
+        assert!(
+            a_text.windows(want.len()).any(|w| w == want),
+            "the line A sent transited to C and the ack relayed back through B"
+        );
+        assert_eq!(b.circuit_count(), 0, "B is still pure transit after the data exchange");
+    }
 }
