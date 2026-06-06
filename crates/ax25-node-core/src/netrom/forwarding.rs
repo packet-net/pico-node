@@ -14,7 +14,22 @@
 
 use crate::ax25::Callsign;
 use crate::netrom::routing::NetRomRoutingView;
-use crate::netrom::wire::NetRomPacket;
+use crate::netrom::wire::{write_shifted, NetRomPacket, SHIFTED_LENGTH};
+
+/// The route-selection policy a forwarding node uses when a destination has more than
+/// one kept route. Mirrors the C# `NetRomForwardMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForwardMode {
+    /// Always the single best route (bounce-back excluded). Deterministic — every
+    /// transit datagram for a destination takes the same path.
+    BestRoute,
+    /// Per-flow quality-weighted spread: every datagram of one L4 circuit hashes to
+    /// the same route (so its ordering is preserved), while distinct circuits
+    /// distribute across the kept routes in proportion to quality. Stateless. The
+    /// default.
+    #[default]
+    PerFlow,
+}
 
 /// What [`decide_forward`] determined should happen to a datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +72,7 @@ pub fn decide_forward(
     node_call: &Callsign,
     routing: &dyn NetRomRoutingView,
     max_time_to_live: u8,
+    mode: ForwardMode,
 ) -> ForwardDecision {
     // 1. Decrement the hop limit; a datagram that arrives at TTL 1 (or 0) is at the
     //    end of its life and must not be forwarded.
@@ -75,9 +91,14 @@ pub fn decide_forward(
         return drop(ForwardOutcome::DropLooped);
     }
 
-    // 4. Next hop: the destination's best route whose neighbour is not the one it
-    //    arrived from.
-    match routing.best_route_excluding(&packet.network.destination, received_from) {
+    // 4. Next hop, under the active mode, among the kept routes (excluding the way it
+    //    came): the single best route, or a per-flow quality-weighted pick.
+    let dest = &packet.network.destination;
+    let next_hop = match mode {
+        ForwardMode::BestRoute => routing.best_route_excluding(dest, received_from),
+        ForwardMode::PerFlow => routing.select_route_excluding(dest, received_from, flow_hash(packet)),
+    };
+    match next_hop {
         Some(next_hop) => ForwardDecision {
             outcome: ForwardOutcome::ForwardTo,
             next_hop: Some(next_hop),
@@ -85,6 +106,24 @@ pub fn decide_forward(
         },
         None => drop(ForwardOutcome::DropNoRoute),
     }
+}
+
+/// FNV-1a (32-bit) over the flow key — the L3 origin (AX.25-shifted, 7 octets) + the
+/// L4 circuit index + id — so every datagram of a circuit hashes identically across
+/// its lifetime. Defined byte-for-byte (mod-2^32 wrapping mul) to match the C#/TS
+/// ports.
+fn flow_hash(packet: &NetRomPacket) -> u32 {
+    let mut key = [0u8; SHIFTED_LENGTH + 2];
+    let _ = write_shifted(&packet.network.origin, &mut key);
+    key[SHIFTED_LENGTH] = packet.transport.circuit_index;
+    key[SHIFTED_LENGTH + 1] = packet.transport.circuit_id;
+
+    let mut hash = 0x811c_9dc5u32; // FNV-1a offset basis
+    for &b in &key {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193); // FNV-1a prime, mod 2^32
+    }
+    hash
 }
 
 fn drop(outcome: ForwardOutcome) -> ForwardDecision {
@@ -99,7 +138,7 @@ fn drop(outcome: ForwardOutcome) -> ForwardDecision {
 mod tests {
     //! The forwarding-decision matrix, mirrored 1:1 from the C# `NetRomForwardingTests`
     //! / the TS `forwarding.test.ts`. Driven through a minimal [`NetRomRoutingView`]
-    //! mock (only `best_route_excluding` is consulted).
+    //! mock (best_route_excluding / select_route_excluding).
 
     use super::*;
     use crate::netrom::routing::{NetRomDestination, NetRomNeighbour};
@@ -110,10 +149,11 @@ mod tests {
         Callsign::new(text.as_bytes(), 0).unwrap()
     }
 
-    /// A routing view that knows the best-first routes to one destination.
+    /// A routing view that knows the best-first routes (neighbour, quality) to one
+    /// destination.
     struct MockRouting {
         dest: Callsign,
-        routes: Vec<Callsign>,
+        routes: Vec<(Callsign, u8)>,
     }
 
     impl NetRomRoutingView for MockRouting {
@@ -130,7 +170,33 @@ mod tests {
             if *dest != self.dest {
                 return None;
             }
-            self.routes.iter().copied().find(|n| n != exclude)
+            self.routes.iter().find(|(n, _)| n != exclude).map(|(n, _)| *n)
+        }
+        fn select_route_excluding(&self, dest: &Callsign, exclude: &Callsign, flow_hash: u32) -> Option<Callsign> {
+            if *dest != self.dest {
+                return None;
+            }
+            let total: u32 = self
+                .routes
+                .iter()
+                .filter(|(n, q)| n != exclude && *q > 0)
+                .map(|(_, q)| *q as u32)
+                .sum();
+            if total == 0 {
+                return None;
+            }
+            let mut target = flow_hash % total;
+            for (n, q) in &self.routes {
+                if n == exclude || *q == 0 {
+                    continue;
+                }
+                let weight = *q as u32;
+                if target < weight {
+                    return Some(*n);
+                }
+                target -= weight;
+            }
+            None
         }
     }
 
@@ -156,7 +222,31 @@ mod tests {
     fn routes_to(dest: Callsign, routes: &[Callsign]) -> MockRouting {
         MockRouting {
             dest,
+            routes: routes.iter().map(|n| (*n, 200u8)).collect(),
+        }
+    }
+
+    fn routes_to_weighted(dest: Callsign, routes: &[(Callsign, u8)]) -> MockRouting {
+        MockRouting {
+            dest,
             routes: routes.to_vec(),
+        }
+    }
+
+    /// A datagram with a chosen flow key (FlowHash keys on the L3 origin + L4 circuit
+    /// index/id; vary the index to make distinct flows).
+    fn flow<'a>(origin: Callsign, dest: Callsign, ttl: u8, circuit_index: u8, payload: &'a [u8]) -> NetRomPacket<'a> {
+        NetRomPacket {
+            network: NetRomNetworkHeader { origin, destination: dest, time_to_live: ttl },
+            transport: NetRomTransportHeader {
+                circuit_index,
+                circuit_id: 0,
+                tx_sequence: 0,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::Information.as_u8(),
+                flags: 0,
+            },
+            payload,
         }
     }
 
@@ -166,7 +256,7 @@ mod tests {
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 10, &payload);
         let routing = routes_to(call("GB7CCC"), &[call("GB7CCC")]);
 
-        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routing, 25);
+        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::BestRoute);
 
         assert_eq!(d.outcome, ForwardOutcome::ForwardTo);
         assert_eq!(d.next_hop, Some(call("GB7CCC")));
@@ -177,7 +267,7 @@ mod tests {
     fn drops_when_the_ttl_reaches_zero() {
         let payload = [1, 2, 3];
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 1, &payload);
-        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25);
+        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::DropTtlExpired);
     }
 
@@ -185,7 +275,7 @@ mod tests {
     fn caps_the_ttl_at_the_configured_maximum() {
         let payload = [1];
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 200, &payload);
-        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25);
+        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::ForwardTo);
         assert_eq!(d.time_to_live, 25);
     }
@@ -194,7 +284,7 @@ mod tests {
     fn drops_a_datagram_that_looped_back_to_its_origin() {
         let payload = [1];
         let packet = datagram(call("GB7BBB"), call("GB7CCC"), 10, &payload);
-        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25);
+        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7CCC"), &[call("GB7CCC")]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::DropLooped);
     }
 
@@ -202,7 +292,7 @@ mod tests {
     fn drops_when_there_is_no_route_to_the_destination() {
         let payload = [1];
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 10, &payload);
-        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7ZZZ"), &[call("GB7ZZZ")]), 25);
+        let d = decide_forward(&packet, &call("GB7AAA"), &call("GB7BBB"), &routes_to(call("GB7ZZZ"), &[call("GB7ZZZ")]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::DropNoRoute);
     }
 
@@ -212,7 +302,7 @@ mod tests {
         let payload = [1];
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 10, &payload);
         let from = call("GB7AAA");
-        let d = decide_forward(&packet, &from, &call("GB7BBB"), &routes_to(call("GB7CCC"), &[from]), 25);
+        let d = decide_forward(&packet, &from, &call("GB7BBB"), &routes_to(call("GB7CCC"), &[from]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::DropNoRoute);
     }
 
@@ -222,9 +312,63 @@ mod tests {
         let packet = datagram(call("GB7AAA"), call("GB7CCC"), 10, &payload);
         let from = call("GB7AAA");
         // best route is back the way it came (from); a lower-quality alternate is used
-        let d = decide_forward(&packet, &from, &call("GB7BBB"), &routes_to(call("GB7CCC"), &[from, call("GB7DDD")]), 25);
+        let d = decide_forward(&packet, &from, &call("GB7BBB"), &routes_to(call("GB7CCC"), &[from, call("GB7DDD")]), 25, ForwardMode::BestRoute);
         assert_eq!(d.outcome, ForwardOutcome::ForwardTo);
         assert_eq!(d.next_hop, Some(call("GB7DDD")));
     }
-}
 
+    // ─── multi-route load-balancing (per-flow, quality-weighted) ────────
+
+    #[test]
+    fn per_flow_pins_a_circuit_to_one_route_regardless_of_ttl() {
+        // Two equal routes; the same flow (same origin + circuit index/id) takes the
+        // same route across datagrams (so the circuit's L4 ordering is preserved).
+        let payload = [1u8];
+        let routing = routes_to(call("GB7CCC"), &[call("GB7CCC"), call("GB7DDD")]);
+        let a = decide_forward(&flow(call("GB7AAA"), call("GB7CCC"), 20, 5, &payload), &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::PerFlow);
+        let b = decide_forward(&flow(call("GB7AAA"), call("GB7CCC"), 9, 5, &payload), &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::PerFlow);
+        assert_eq!(a.outcome, ForwardOutcome::ForwardTo);
+        assert_eq!(a.next_hop, b.next_hop, "every datagram of one circuit hashes to the same route");
+    }
+
+    #[test]
+    fn per_flow_spreads_distinct_circuits_across_the_kept_routes() {
+        let payload = [1u8];
+        let routing = routes_to(call("GB7CCC"), &[call("GB7CCC"), call("GB7DDD")]);
+        let (mut seen_c, mut seen_d) = (false, false);
+        for i in 0..60u8 {
+            let d = decide_forward(&flow(call("GB7AAA"), call("GB7CCC"), 20, i, &payload), &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::PerFlow);
+            seen_c |= d.next_hop == Some(call("GB7CCC"));
+            seen_d |= d.next_hop == Some(call("GB7DDD"));
+        }
+        assert!(seen_c && seen_d, "distinct circuits should use both routes");
+    }
+
+    #[test]
+    fn per_flow_weights_the_spread_by_route_quality() {
+        // 2:1 quality -> the higher-quality route carries meaningfully more flows.
+        let payload = [1u8];
+        let routing = routes_to_weighted(call("GB7CCC"), &[(call("GB7CCC"), 200), (call("GB7DDD"), 100)]);
+        let (mut c, mut d) = (0u32, 0u32);
+        for i in 0..255u8 {
+            let dec = decide_forward(&flow(call("GB7AAA"), call("GB7CCC"), 20, i, &payload), &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::PerFlow);
+            if dec.next_hop == Some(call("GB7CCC")) {
+                c += 1;
+            } else if dec.next_hop == Some(call("GB7DDD")) {
+                d += 1;
+            }
+        }
+        assert!(c > 0 && d > 0);
+        assert!(c > d, "the higher-quality route carries proportionally more flows");
+    }
+
+    #[test]
+    fn best_route_mode_ignores_the_flow_and_always_takes_the_best() {
+        let payload = [1u8];
+        let routing = routes_to_weighted(call("GB7CCC"), &[(call("GB7CCC"), 200), (call("GB7DDD"), 100)]);
+        for i in 0..20u8 {
+            let d = decide_forward(&flow(call("GB7AAA"), call("GB7CCC"), 20, i, &payload), &call("GB7AAA"), &call("GB7BBB"), &routing, 25, ForwardMode::BestRoute);
+            assert_eq!(d.next_hop, Some(call("GB7CCC")), "BestRoute always uses the best route");
+        }
+    }
+}

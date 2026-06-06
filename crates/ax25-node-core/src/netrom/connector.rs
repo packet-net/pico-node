@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::ax25::Callsign;
-use crate::netrom::forwarding::decide_forward;
+use crate::netrom::forwarding::{decide_forward, ForwardMode};
 use crate::netrom::routing::NetRomRoutingView;
 use crate::netrom::transport::{
     CircuitEvent, CircuitKey, CircuitManager, NetRomCircuitOptions, NetRomCircuitState,
@@ -108,6 +108,11 @@ pub struct NetRomConnectorOptions {
     /// interlink machinery). So an endpoint node never relays; a connect-enabled node
     /// forwards by default; set `false` for an originate-only node.
     pub forward: bool,
+    /// How a forwarding node picks among multiple kept routes to a destination
+    /// ([`ForwardMode`]). Default [`ForwardMode::PerFlow`] — spread distinct L4
+    /// circuits across the kept routes, quality-weighted, each circuit pinned to one
+    /// path. Mirrors the C# `netRom.ForwardMode`.
+    pub forward_mode: ForwardMode,
     /// The L4 circuit tunables handed to the owned circuit manager.
     pub circuit: NetRomCircuitOptions,
 }
@@ -117,6 +122,7 @@ impl Default for NetRomConnectorOptions {
         Self {
             enabled: false,
             forward: true,
+            forward_mode: ForwardMode::PerFlow,
             circuit: NetRomCircuitOptions::default(),
         }
     }
@@ -126,6 +132,7 @@ impl Default for NetRomConnectorOptions {
 pub struct NetRomConnector {
     enabled: bool,
     forward_enabled: bool,
+    forward_mode: ForwardMode,
     max_ttl: u8,
     node_call: Callsign,
     manager: CircuitManager,
@@ -143,6 +150,7 @@ impl NetRomConnector {
         Self {
             enabled: options.enabled,
             forward_enabled: options.enabled && options.forward,
+            forward_mode: options.forward_mode,
             max_ttl: options.circuit.time_to_live,
             node_call,
             manager: CircuitManager::new(node_call, options.circuit),
@@ -304,7 +312,7 @@ impl NetRomConnector {
         packet: &NetRomPacket,
         received_from: Callsign,
     ) {
-        let decision = decide_forward(packet, &received_from, &self.node_call, routing, self.max_ttl);
+        let decision = decide_forward(packet, &received_from, &self.node_call, routing, self.max_ttl, self.forward_mode);
         let Some(neighbour) = decision.next_hop else {
             return; // dropped — TTL expired, looped back, or no onward route
         };

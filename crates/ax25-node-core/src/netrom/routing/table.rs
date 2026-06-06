@@ -465,6 +465,38 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
         found
     }
 
+    /// A per-flow, quality-weighted next-hop among the eligible routes to `dest`
+    /// (neighbour ≠ `exclude`, quality &gt; 0): the routes form weighted buckets sized
+    /// by quality, and `flow_hash` picks one. A circuit's datagrams (constant flow
+    /// hash) pin to one route while distinct circuits spread ∝ quality. `None` if no
+    /// route is usable. The transit-forwarding load-balancing selector.
+    pub fn select_route_excluding(&self, dest: &Callsign, exclude: &Callsign, flow_hash: u32) -> Option<Callsign> {
+        let mut total: u32 = 0;
+        self.for_each_route(dest, |route| {
+            if route.neighbour != *exclude && route.quality > 0 {
+                total += route.quality as u32;
+            }
+        });
+        if total == 0 {
+            return None;
+        }
+
+        let mut target = flow_hash % total;
+        let mut chosen: Option<Callsign> = None;
+        self.for_each_route(dest, |route| {
+            if chosen.is_some() || route.neighbour == *exclude || route.quality == 0 {
+                return;
+            }
+            let weight = route.quality as u32;
+            if target < weight {
+                chosen = Some(route.neighbour);
+            } else {
+                target -= weight;
+            }
+        });
+        chosen
+    }
+
     /// The directly-heard neighbour entry for `call`, if any (mirrors the TS
     /// `neighbourFor`). A connector uses this to decide whether a destination can be
     /// reached as its own neighbour.
