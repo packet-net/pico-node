@@ -451,6 +451,20 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
         alias_hit.or(call_hit)
     }
 
+    /// The best next-hop neighbour to reach `dest`, excluding `exclude` — the
+    /// transit-forwarding next hop that never bounces a datagram back the way it came.
+    /// Routes are scanned best-first, so the first whose neighbour is not `exclude` is
+    /// the best usable onward route; `None` if none remains.
+    pub fn best_route_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
+        let mut found: Option<Callsign> = None;
+        self.for_each_route(dest, |route| {
+            if found.is_none() && route.neighbour != *exclude {
+                found = Some(route.neighbour);
+            }
+        });
+        found
+    }
+
     /// The directly-heard neighbour entry for `call`, if any (mirrors the TS
     /// `neighbourFor`). A connector uses this to decide whether a destination can be
     /// reached as its own neighbour.

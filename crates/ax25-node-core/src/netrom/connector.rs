@@ -33,11 +33,13 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::ax25::Callsign;
+use crate::netrom::forwarding::decide_forward;
 use crate::netrom::routing::NetRomRoutingView;
 use crate::netrom::transport::{
     CircuitEvent, CircuitKey, CircuitManager, NetRomCircuitOptions, NetRomCircuitState,
+    OutboundPacket,
 };
-use crate::netrom::wire::{NetRomPacket, MAX_PAYLOAD, PACKET_HEADER_LEN};
+use crate::netrom::wire::{NetRomNetworkHeader, NetRomPacket, MAX_PAYLOAD, PACKET_HEADER_LEN};
 
 /// Returned by [`NetRomConnector::connect`] when connect-routing is enabled but the
 /// routing table has no route to the target — the signal for the host to fall back
@@ -93,19 +95,38 @@ pub struct NetRomConnection {
 }
 
 /// Construction options for [`NetRomConnector`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetRomConnectorOptions {
     /// Whether NET/ROM L4 connect-routing is enabled (the C# `netRom.connect`
     /// opt-in). Default `false` — [`connect`](NetRomConnector::connect) then resolves
     /// no route, so the host falls straight to a direct AX.25 dial.
     pub enabled: bool,
+    /// Whether this node **forwards transit datagrams** — relays a datagram whose
+    /// destination node is not us onward toward its destination (the network-layer
+    /// routing role; mirrors the C# `netRom.forward`). Default `true`, but effective
+    /// only when [`enabled`](Self::enabled) is on (forwarding needs the connect-routing
+    /// interlink machinery). So an endpoint node never relays; a connect-enabled node
+    /// forwards by default; set `false` for an originate-only node.
+    pub forward: bool,
     /// The L4 circuit tunables handed to the owned circuit manager.
     pub circuit: NetRomCircuitOptions,
+}
+
+impl Default for NetRomConnectorOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            forward: true,
+            circuit: NetRomCircuitOptions::default(),
+        }
+    }
 }
 
 /// The NET/ROM L4 connector over a routing view.
 pub struct NetRomConnector {
     enabled: bool,
+    forward_enabled: bool,
+    max_ttl: u8,
     node_call: Callsign,
     manager: CircuitManager,
     interlinks: Vec<Callsign>,
@@ -121,6 +142,8 @@ impl NetRomConnector {
     pub fn new(node_call: Callsign, options: NetRomConnectorOptions) -> Self {
         Self {
             enabled: options.enabled,
+            forward_enabled: options.enabled && options.forward,
+            max_ttl: options.circuit.time_to_live,
             node_call,
             manager: CircuitManager::new(node_call, options.circuit),
             interlinks: Vec::new(),
@@ -133,6 +156,13 @@ impl NetRomConnector {
     /// True if connect-routing is enabled (the C# `ConnectEnabled`).
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// True if this node forwards transit datagrams (the network-layer routing role).
+    /// Rides on [`enabled`](Self::enabled) + the `forward` option. The C#
+    /// `ForwardEnabled`.
+    pub fn forward_enabled(&self) -> bool {
+        self.forward_enabled
     }
 
     /// The local node callsign.
@@ -249,9 +279,53 @@ impl NetRomConnector {
     ) {
         self.ensure_interlink(from);
         if let Some(packet) = NetRomPacket::decode(info) {
-            self.manager.on_packet(&packet, now_ms);
+            // L3 dispatch (mirrors the C# `NetRomService.OnInterlinkData`): a datagram
+            // addressed to this node terminates here (up to the L4 circuit layer); one
+            // addressed elsewhere is forwarded toward its destination (the
+            // network-layer routing role); an endpoint-only node drops it.
+            if packet.network.destination == self.node_call {
+                self.manager.on_packet(&packet, now_ms);
+            } else if self.forward_enabled {
+                self.forward_datagram(routing, &packet, from);
+            }
         }
         self.after_manager(routing);
+    }
+
+    /// Forward a transit datagram (one whose destination node is not us) one hop
+    /// toward its destination. The decision (TTL decrement/cap, loop guard,
+    /// no-bounce-back next-hop) is the pure [`decide_forward`]; this emits the
+    /// rewritten datagram as an [`InterlinkSend`] to the next hop (the host ships it
+    /// over that neighbour's AX.25 session). Mirrors the C#
+    /// `NetRomService.ForwardDatagram`.
+    fn forward_datagram(
+        &mut self,
+        routing: &dyn NetRomRoutingView,
+        packet: &NetRomPacket,
+        received_from: Callsign,
+    ) {
+        let decision = decide_forward(packet, &received_from, &self.node_call, routing, self.max_ttl);
+        let Some(neighbour) = decision.next_hop else {
+            return; // dropped — TTL expired, looped back, or no onward route
+        };
+
+        self.ensure_interlink(neighbour);
+        let forwarded = OutboundPacket {
+            network: NetRomNetworkHeader {
+                origin: packet.network.origin,
+                destination: packet.network.destination,
+                time_to_live: decision.time_to_live,
+            },
+            transport: packet.transport,
+            payload: packet.payload.to_vec(),
+        };
+        let mut buf = [0u8; PACKET_HEADER_LEN + MAX_PAYLOAD];
+        if let Some(n) = forwarded.encode(&mut buf) {
+            self.outbound.push(InterlinkSend {
+                neighbour,
+                datagram: buf[..n].to_vec(),
+            });
+        }
     }
 
     /// Advance every circuit's retransmit timers by one tick (the host drives this
@@ -380,8 +454,15 @@ mod tests {
     fn b_node() -> Callsign {
         call("GB7BBB")
     }
+    // The node `connect <alias>` reaches over the interlink IS node B (the real
+    // interlink peer). Before L3 forwarding the harness used a fictional distinct END
+    // node that B terminated on behalf of — which only worked because a node
+    // terminated EVERY inbound circuit regardless of L3 destination. With forwarding a
+    // node terminates only circuits addressed to itself, so the endpoint here is B;
+    // genuine multi-hop transit is covered by the `decide_forward` tests + the C#
+    // 3-node transit integration test.
     fn end_node() -> Callsign {
-        call("GB7END")
+        b_node()
     }
 
     /// Seed a table the way real ingest would: `originator` advertised `entry`.
@@ -624,7 +705,7 @@ mod tests {
         let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
         h.echo_console_on_b();
 
-        let conn = h.connect_a("GB7END", a_node()).expect("route to END by callsign");
+        let conn = h.connect_a("GB7BBB", a_node()).expect("route to the endpoint by callsign");
         assert_eq!(h.a.circuit_state(conn.key), Some(NetRomCircuitState::Connected));
         assert_eq!(conn.peer, end_node());
     }
