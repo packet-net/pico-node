@@ -40,12 +40,17 @@
 //! [`MAX_ROUTES_PER_DEST`] / [`MAX_NEIGHBOURS`]).
 
 pub mod routing;
+pub mod transport;
 pub mod wire;
 
 use crate::ax25::{Callsign, Frame, PID_NETROM};
 
 pub use routing::{
     NetRomDestination, NetRomNeighbour, NetRomRoute, NetRomRoutingOptions, NetRomRoutingTable,
+};
+pub use transport::{
+    CircuitEvent, NetRomCircuit, NetRomCircuitCloseReason, NetRomCircuitOptions, NetRomCircuitState,
+    OutboundPacket,
 };
 pub use wire::{NetRomParseOptions, NodesBroadcast, NodesRoutingEntry};
 
