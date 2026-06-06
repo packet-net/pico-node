@@ -30,6 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ax25-node-core consumes the SDL state machine (m0lte/ax25sdl, the
+      # spec/rust crate) as a LOCAL PATH dependency — `../../../ax25sdl/spec/rust`,
+      # a sibling checkout (kept a path dep deliberately, co-developed, no crates.io
+      # pin). Provide that sibling: it resolves to $GITHUB_WORKSPACE/../ax25sdl
+      # (a level up from this repo's checkout). ax25sdl is public, so this needs no
+      # token. Tracks ax25sdl main, matching local dev.
+      - name: Check out the ax25sdl sibling (path dependency)
+        run: git clone --depth 1 https://github.com/m0lte/ax25sdl.git "${GITHUB_WORKSPACE}/../ax25sdl"
+
       - name: Install Rust 1.93.1 (+ clippy)
         uses: dtolnay/rust-toolchain@1.93.1
         with:
