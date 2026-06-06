@@ -1,0 +1,47 @@
+name: ci
+
+# Host-crate CI for ax25-node-core (the no_std library + its host test suite).
+#
+# The firmware crate (crates/ax25-node-fw) is intentionally excluded from the
+# Cargo workspace (it pulls the embassy/cyw43/defmt thumbv6m tree, which can't be
+# resolved host-side offline) and pins its own toolchain, so it is NOT built here
+# — it is cross-compiled on its own once its toolchain is set up. Every `cargo`
+# invocation below therefore operates on the host crate only.
+#
+# Pinned to the toolchain the suite was last green on (rustc 1.93.1) for
+# reproducible runs; bump deliberately.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy · test · no_std
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.93.1 (+ clippy)
+        uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy -p ax25-node-core --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p ax25-node-core
+
+      - name: no_std build (firmware crate's library shape — default features off, alloc on)
+        run: cargo build -p ax25-node-core --no-default-features --features alloc
