@@ -421,6 +421,51 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
         entries
     }
 
+    /// Resolve a `connect <target>` string — an **alias** (e.g. `SOT`) or a
+    /// **callsign** (e.g. `GB7SOT`, with or without SSID) — to a known destination.
+    /// Case-insensitive; an exact alias match is preferred over a callsign match
+    /// (mirrors the TS `resolveDestination`). Returns `None` for an empty/whitespace
+    /// target or a miss.
+    pub fn resolve_destination(&self, target: &str) -> Option<NetRomDestination> {
+        let needle = target.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        let mut alias_hit = None;
+        let mut call_hit = None;
+        self.for_each_destination(|d| {
+            if alias_hit.is_none() && !d.alias.is_empty() && eq_ascii_ci(d.alias.as_str(), needle) {
+                alias_hit = Some(d);
+            }
+            if call_hit.is_none() {
+                let mut buf = [0u8; 16];
+                if let Some(n) = d.destination.write_display(&mut buf) {
+                    if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+                        if eq_ascii_ci(text, needle) {
+                            call_hit = Some(d);
+                        }
+                    }
+                }
+            }
+        });
+        alias_hit.or(call_hit)
+    }
+
+    /// The directly-heard neighbour entry for `call`, if any (mirrors the TS
+    /// `neighbourFor`). A connector uses this to decide whether a destination can be
+    /// reached as its own neighbour.
+    pub fn neighbour(&self, call: &Callsign) -> Option<NetRomNeighbour> {
+        let i = self.neighbour_index(call)?;
+        let nb = self.neighbours[i].as_ref().unwrap();
+        Some(NetRomNeighbour {
+            neighbour: nb.neighbour,
+            alias: nb.alias,
+            port_id: nb.port_id,
+            path_quality: nb.path_quality,
+            last_heard: nb.last_heard,
+        })
+    }
+
     // ─── Internals ───────────────────────────────────────────────────────
 
     fn neighbour_index(&self, call: &Callsign) -> Option<usize> {
@@ -602,6 +647,15 @@ fn cmp_ascii_ci(a: &([u8; 8], usize), b: &([u8; 8], usize)) -> core::cmp::Orderi
 // Ordinal callsign comparison: base bytes then SSID. Matches the C# snapshot's
 // `StringComparer.Ordinal` over `callsign.ToString()` for the alphanumeric base +
 // SSID forms NET/ROM uses.
+/// ASCII case-insensitive equality of two strings (no_std; callsign/alias text is
+/// ASCII). Used by [`NetRomRoutingTable::resolve_destination`].
+fn eq_ascii_ci(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+}
+
 fn callsign_lt(a: &Callsign, b: &Callsign) -> bool {
     match a.base().cmp(b.base()) {
         core::cmp::Ordering::Less => true,

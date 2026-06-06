@@ -17,6 +17,38 @@ pub use model::{NetRomDestination, NetRomNeighbour, NetRomRoute};
 pub use options::NetRomRoutingOptions;
 pub use table::NetRomRoutingTable;
 
+use crate::ax25::Callsign;
+
+/// The read-only routing view a connector resolves `connect <target>` and outbound
+/// next-hops against — the alias/callsign lookup, the by-callsign destination, and
+/// the directly-heard-neighbour check. Implemented by [`NetRomRoutingTable`]; taken
+/// as `&dyn` so the connector needn't carry the table's capacity const generics.
+/// The TS analogue is the `RoutingSnapshotSource` + the free `resolveDestination` /
+/// `neighbourFor` functions.
+pub trait NetRomRoutingView {
+    /// Resolve a `connect <target>` alias or callsign to a destination (see
+    /// [`NetRomRoutingTable::resolve_destination`]).
+    fn resolve_destination(&self, target: &str) -> Option<NetRomDestination>;
+    /// The destination known for a callsign, if any.
+    fn destination_for(&self, call: &Callsign) -> Option<NetRomDestination>;
+    /// The directly-heard neighbour for a callsign, if any.
+    fn neighbour_for(&self, call: &Callsign) -> Option<NetRomNeighbour>;
+}
+
+impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> NetRomRoutingView
+    for NetRomRoutingTable<MAX_DESTS, MAX_ROUTES, MAX_NBRS>
+{
+    fn resolve_destination(&self, target: &str) -> Option<NetRomDestination> {
+        NetRomRoutingTable::resolve_destination(self, target)
+    }
+    fn destination_for(&self, call: &Callsign) -> Option<NetRomDestination> {
+        self.destination(call)
+    }
+    fn neighbour_for(&self, call: &Callsign) -> Option<NetRomNeighbour> {
+        self.neighbour(call)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
