@@ -51,7 +51,7 @@ use crate::ax25::{Callsign, Frame, PID_NETROM};
 pub use connector::{
     InterlinkSend, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomNoRoute,
 };
-pub use forwarding::{decide_forward, ForwardDecision, ForwardOutcome};
+pub use forwarding::{decide_forward, ForwardDecision, ForwardMode, ForwardOutcome};
 pub use originator::{NetRomOriginator, NetRomOriginatorOptions};
 pub use routing::{
     NetRomDestination, NetRomNeighbour, NetRomRoute, NetRomRoutingOptions, NetRomRoutingTable,
