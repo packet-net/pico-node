@@ -87,7 +87,8 @@ async fn serve(socket: &mut TcpSocket<'_>, my_call: Callsign) {
             Either::First(()) => {
                 let beacon = ui_frame(
                     my_call,
-                    "IDENT",
+                    ax25_node_core::ax25::Callsign::parse("IDENT").expect("static"),
+                    ax25_node_core::ax25::PID_NO_LAYER3,
                     b"pico-node KISS-TCP beacon (HW-BRINGUP Gate 5)",
                 );
                 let Some(kiss_bytes) =

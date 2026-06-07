@@ -28,6 +28,7 @@ pub struct NodeConfig {
     pub kiss_tcp: KissTcpConfig,
     pub kiss_serial: KissSerialConfig,
     pub telnet: TelnetConfig,
+    pub netrom: NetRomConfig,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,17 @@ pub struct TelnetConfig {
     pub port: u16,
 }
 
+/// NET/ROM behaviour. The tap (hearing NODES) is always on; origination
+/// (broadcasting our own NODES) is the node opt-in, per the library default.
+#[derive(Clone)]
+pub struct NetRomConfig {
+    /// Originate NODES broadcasts (the C# `netRom.broadcast` opt-in).
+    pub originate: bool,
+    /// Seconds between NODES broadcasts. BPQ convention is minutes; the lab
+    /// runs short. Overridable at build time via `NODES_INTERVAL_SECS`.
+    pub nodes_interval_secs: u32,
+}
+
 /// Load the node config. STUB: returns a compiled-in default. A real loader
 /// (flash sector / network) is the follow-up.
 pub fn load() -> NodeConfig {
@@ -100,5 +112,17 @@ pub fn load() -> NodeConfig {
         },
         kiss_serial: KissSerialConfig { baud: 57600 },
         telnet: TelnetConfig { port: 8023 },
+        netrom: NetRomConfig {
+            originate: true,
+            nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
+        },
+    }
+}
+
+/// Parse an optional build-env decimal, falling back on absence or garbage.
+fn parse_u32(s: Option<&str>, default: u32) -> u32 {
+    match s {
+        Some(v) => v.parse().unwrap_or(default),
+        None => default,
     }
 }
