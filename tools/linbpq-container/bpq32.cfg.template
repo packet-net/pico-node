@@ -6,6 +6,10 @@ NODECALL=M0LTE-9
 NODEALIAS=BPQ
 LOCATOR=NONE
 
+INFOMSG:
+pico-node interop test node
+***
+
 IDMSG:
 pico-node interop test container (LinBPQ)
 ***
