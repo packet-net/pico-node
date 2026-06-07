@@ -13,21 +13,26 @@
 //! socket I/O wrapped around them. One connection at a time (a packet node's
 //! console is not a web server); further dial-ins queue at the TCP backlog.
 //!
-//! Gate 4 scope: `Connect` answers its "Connecting to …" line and then explains
-//! the session layer isn't wired yet — the outbound connect + relay is the
-//! session-supervisor seam (HW-BRINGUP Gate 3 stretch+).
+//! `Connect` is real: `C <call>` hands the target to the AXUDP session owner
+//! over the [`super::relay`] statics, then this task parks its prompt loop and
+//! relays raw bytes both ways (translating the AX.25 CR line convention to the
+//! telnet CRLF one) until either side disconnects — the
+//! `ConsoleRelay.PipeAsync` analogue. One relay at a time, per `relay`.
 
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
 use ax25_node_core::console::{DispatchOutcome, LineAssembler, TransportKind};
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
+use embassy_futures::select::{select3, Either3};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_time::Duration;
 
 use crate::config::TelnetConfig;
+use crate::transports::relay::{self, RelayStatus};
 use crate::transports::tcp_write_all as write_all;
 
 /// Idle timeout for a console connection; a dead peer frees the slot.
@@ -90,20 +95,94 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
             match resp.outcome {
                 DispatchOutcome::Continue => {}
                 DispatchOutcome::Disconnect => return,
-                DispatchOutcome::ConnectThenRelay(_call) => {
-                    // The outbound AX.25 connect + byte relay is the session-
-                    // supervisor seam (Gate 3 stretch+). Be honest meanwhile.
-                    let msg = ax25_node_core::console::service::render_line(
-                        "...connected-mode sessions aren't wired to the console yet (bring-up)",
-                        KIND,
-                    );
-                    if !write_all(socket, &msg).await {
-                        return;
+                DispatchOutcome::ConnectThenRelay(call) => {
+                    match relay::begin(call) {
+                        Ok(()) => {
+                            if !relay_loop(socket).await {
+                                return; // user side went away mid-relay
+                            }
+                            // Link over — fall through to a fresh prompt.
+                        }
+                        Err(()) => {
+                            let msg = ax25_node_core::console::service::render_line(
+                                "Busy: another connect relay is already in progress",
+                                KIND,
+                            );
+                            if !write_all(socket, &msg).await {
+                                return;
+                            }
+                        }
                     }
                 }
             }
             if !write_all(socket, prompt.as_bytes()).await {
                 return;
+            }
+        }
+    }
+}
+
+/// Pipe bytes between the telnet socket and the active AX.25 relay until the
+/// link ends. Returns `false` if the *telnet user* went away (caller drops the
+/// connection); `true` when the AX.25 side ended and the prompt loop resumes.
+async fn relay_loop(socket: &mut TcpSocket<'_>) -> bool {
+    let mut sock_buf = [0u8; 256];
+    let mut ax_buf = [0u8; 256];
+    loop {
+        match select3(
+            relay::STATUS.wait(),
+            relay::AX_TO_USER.read(&mut ax_buf),
+            socket.read(&mut sock_buf),
+        )
+        .await
+        {
+            Either3::First(RelayStatus::Connected) => {
+                // The peer's own banner follows over the relay; nothing to add.
+                defmt::info!("telnet: relay connected");
+            }
+            Either3::First(RelayStatus::Failed(reason)) => {
+                let mut msg = Vec::from(b"Failure: ".as_slice());
+                msg.extend_from_slice(reason.as_bytes());
+                msg.extend_from_slice(b"\r\n");
+                return write_all(socket, &msg).await;
+            }
+            Either3::First(RelayStatus::Disconnected) => {
+                return write_all(socket, b"*** Disconnected\r\n").await;
+            }
+            Either3::Second(n) => {
+                // AX.25 → telnet: bare CR becomes CRLF.
+                let mut out = Vec::with_capacity(n + 16);
+                for &b in &ax_buf[..n] {
+                    if b == b'\r' {
+                        out.extend_from_slice(b"\r\n");
+                    } else if b != b'\n' {
+                        out.push(b);
+                    }
+                }
+                if !write_all(socket, &out).await {
+                    relay::USER_HANGUP.signal(());
+                    return false;
+                }
+            }
+            Either3::Third(Ok(0)) | Either3::Third(Err(_)) => {
+                relay::USER_HANGUP.signal(());
+                return false;
+            }
+            Either3::Third(Ok(n)) => {
+                // Telnet → AX.25: CRLF (and bare LF) become the AX.25 bare CR.
+                let mut out = Vec::with_capacity(n);
+                for &b in &sock_buf[..n] {
+                    if b == b'\n' {
+                        if out.last() != Some(&b'\r') {
+                            out.push(b'\r');
+                        }
+                    } else {
+                        out.push(b);
+                    }
+                }
+                if !out.is_empty() {
+                    relay::USER_TO_AX.write_all(&out).await;
+                }
             }
         }
     }

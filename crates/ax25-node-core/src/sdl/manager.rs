@@ -116,6 +116,22 @@ impl<const N: usize> SessionManager<N> {
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
         slot.session.post_event(event, timers, &mut slot.sink);
+
+        // Grant LM-SEIZE immediately: the node's wire transports (AXUDP,
+        // KISS-TCP) are full-duplex, so the channel is always free. The
+        // confirm drives the figc4 `AckPending` path that emits the delayed
+        // RR acknowledgement — without it, received I-frames with no reply
+        // data are never acked and the peer eventually declares link failure
+        // (found live against LinBPQ through the console relay). Bounded:
+        // the confirm path releases, it never re-seizes.
+        let mut grants = 0;
+        while slot.sink.seize_pending && grants < 4 {
+            slot.sink.seize_pending = false;
+            slot.session
+                .post_event(Event::LmSeizeConfirm, timers, &mut slot.sink);
+            grants += 1;
+        }
+
         core::mem::take(&mut slot.sink.sent)
 
         // NB: a slot whose session has returned to Disconnected is NOT freed
@@ -243,5 +259,44 @@ mod tests {
         mgr.post(call("G7AAA"), sabm(), &mut t);
         assert!(!mgr.reap(&call("G7AAA")));
         assert_eq!(mgr.active(), 1);
+    }
+
+    /// The relay regression: an I-frame received while we have nothing to send
+    /// back must still be acknowledged (RR) — via the immediate LM-SEIZE grant
+    /// driving the figc4 AckPending path. Found live against LinBPQ: without
+    /// the grant the ack never goes out and the peer declares link failure.
+    #[test]
+    fn idle_received_i_frame_is_still_acknowledged() {
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("M0LTE-9");
+
+        // Bring the session up (inbound SABM ⇒ UA out).
+        let out = mgr.post(peer, sabm(), &mut t);
+        assert_eq!(out.len(), 1);
+
+        // Peer sends an I-frame (N(S)=0, no P); we have no reply data queued.
+        let i_frame = Event::IReceived(FrameInfo {
+            ns: 0,
+            nr: 0,
+            pid: Some(crate::ax25::PID_NO_LAYER3),
+            info: alloc::vec![0x42],
+            is_command: true,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, i_frame, &mut t);
+
+        // Among the emitted frames there must be an RR acknowledging N(R)=1.
+        let acked = out.iter().any(|bytes| {
+            let frame = Frame::decode(bytes).expect("emitted frame decodes");
+            matches!(
+                classify_incoming(&frame),
+                Some(Event::RrReceived(f)) if f.nr == 1
+            )
+        });
+        assert!(acked, "received I-frame was not acknowledged: {out:02x?}");
     }
 }
