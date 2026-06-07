@@ -75,9 +75,12 @@ pub fn load() -> NodeConfig {
             alias: "PICO",
             grid: "IO91wm",
         },
+        // §5 secrets policy (HW-BRINGUP.md): WiFi credentials are read from the
+        // BUILD environment, never committed. Missing creds still build (CI has
+        // no secrets) — net::join fails loudly at boot instead.
         wifi: WifiConfig {
-            ssid: "set-me",
-            password: "set-me",
+            ssid: option_env!("WIFI_SSID").unwrap_or(""),
+            password: option_env!("WIFI_PASSWORD").unwrap_or(""),
         },
         axudp: AxudpConfig {
             listen_port: 10093,

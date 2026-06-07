@@ -34,12 +34,11 @@
 // `target_os = "none"` (thumbv6m-none-eabi).
 #[cfg(target_os = "none")]
 mod config;
-// GATE 2+ (HW-BRINGUP.md §4): the CYW43/net bring-up and the four transport socket
-// stubs don't compile against the real cyw43/embassy-net APIs yet — they were
-// deliberately not written blind (no CYW43 emulator). They return module by module
-// as Gates 2–6 land; Gate 1 is the minimal link + flash + defmt-heartbeat binary.
-// #[cfg(target_os = "none")]
-// mod net;
+#[cfg(target_os = "none")]
+mod net;
+// GATE 3+ (HW-BRINGUP.md §4): the four transport socket stubs don't compile
+// against the real embassy-net APIs yet — they were deliberately not written
+// blind. They return module by module as Gates 3–6 land.
 // #[cfg(target_os = "none")]
 // mod session;
 // #[cfg(target_os = "none")]
@@ -70,10 +69,11 @@ mod firmware {
     use embassy_time::{Duration, Instant, Ticker};
 
     use crate::config;
+    use crate::net;
     use crate::{HEAP, HEAP_SIZE};
 
     #[embassy_executor::main]
-    async fn main(_spawner: Spawner) {
+    async fn main(spawner: Spawner) {
         defmt::info!("pico-node {} starting", ax25_node_core::VERSION);
 
         // Initialise the global heap arena ONCE, before anything allocates. SAFETY:
@@ -86,15 +86,10 @@ mod firmware {
             }
         }
 
-        let _p = embassy_rp::init(Default::default());
+        let p = embassy_rp::init(Default::default());
         let cfg = config::load();
 
-        // GATE 1 (HW-BRINGUP.md §4): minimal first-silicon binary — boot, init
-        // embassy-rp, and heartbeat over defmt/RTT. Proves the whole hands-free
-        // loop: memory.x + flip-link + probe-rs flash + reset + RTT streaming.
-        // The CYW43/net/transport/session spawns return at Gates 2–6.
-        //
-        // The config load + callsign log below is deliberate, not decoration: it
+        // The config load + callsign log is deliberate, not decoration: it
         // exercises ax25-node-core (Callsign::parse + write_display) on the real M0+.
         let mut call_buf = [0u8; 16];
         let call_len = cfg
@@ -109,9 +104,30 @@ mod firmware {
             cfg.identity.grid,
         );
 
-        // NOTE (HW-BRINGUP.md §4 Gate 1): no LED blinky here — the Pico W LED hangs
-        // off the CYW43, which isn't up until Gate 2. defmt IS the heartbeat.
-        let mut ticker = Ticker::every(Duration::from_secs(1));
+        // --- GATE 2 (HW-BRINGUP.md §4): CYW43 + WiFi + DHCP ---
+        // Pin map is the Pico W board wiring: 23=WL_ON, 24=DIO, 25=CS, 29=CLK.
+        let (net_device, mut control) = net::init_wifi(
+            &spawner, p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0,
+        )
+        .await;
+        let stack = net::start_stack(net_device, &spawner).await;
+
+        net::join(&mut control, &cfg.wifi).await;
+
+        defmt::info!("waiting for link + DHCPv4 lease...");
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+        if let Some(v4) = stack.config_v4() {
+            defmt::info!("IP address: {}", v4.address);
+        }
+
+        // The Pico W LED hangs off the CYW43 (GPIO 0), not an RP2040 pin — turning
+        // it on here is the visible "radio alive" check (HW-BRINGUP.md §4 Gate 2).
+        control.gpio_set(0, true).await;
+
+        // GATE 3+ returns the transports + session spawns here.
+
+        let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {
             ticker.next().await;
             defmt::info!("heartbeat: uptime {=u64} s", Instant::now().as_secs());
