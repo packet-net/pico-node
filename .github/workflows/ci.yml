@@ -1,12 +1,15 @@
 name: ci
 
-# Host-crate CI for ax25-node-core (the no_std library + its host test suite).
-#
-# The firmware crate (crates/ax25-node-fw) is intentionally excluded from the
-# Cargo workspace (it pulls the embassy/cyw43/defmt thumbv6m tree, which can't be
-# resolved host-side offline) and pins its own toolchain, so it is NOT built here
-# — it is cross-compiled on its own once its toolchain is set up. Every `cargo`
-# invocation below therefore operates on the host crate only.
+# CI for both crates:
+#  - check: ax25-node-core (clippy + host tests + the no_std build shape).
+#  - fw-build: ax25-node-fw cross-compiled for thumbv6m-none-eabi — gates that
+#    the firmware binary AND the embedded-test ELF still link (no hardware
+#    needed; flashing/running them is the bring-up rig's job, not CI's). The fw
+#    crate is workspace-excluded, so it builds from its own directory, which
+#    also activates its .cargo/config.toml (default target, flip-link, defmt
+#    linker scripts). WiFi creds are deliberately absent in CI: option_env!
+#    builds clean without them and the binary fails loudly at boot instead
+#    (HW-BRINGUP §5).
 #
 # Pinned to the toolchain the suite was last green on (rustc 1.93.1) for
 # reproducible runs; bump deliberately.
@@ -58,3 +61,37 @@ jobs:
 
       - name: no_std build (firmware crate's library shape — default features off, alloc on)
         run: cargo build -p ax25-node-core --no-default-features --features alloc
+
+  fw-build:
+    name: firmware · thumbv6m link
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same sibling-clone dance as the check job (fw → core → ax25sdl).
+      - name: Check out the ax25sdl sibling (path dependency)
+        run: |
+          rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
+          git clone --depth 1 https://github.com/m0lte/ax25sdl.git "${GITHUB_WORKSPACE}/../ax25sdl"
+
+      - name: Install Rust 1.93.1 (+ thumbv6m target)
+        uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: thumbv6m-none-eabi
+
+      # flip-link is the linker the fw .cargo/config.toml names; install once
+      # per runner (no-op when already present in the persistent ~/.cargo/bin).
+      - name: Ensure flip-link
+        run: command -v flip-link >/dev/null || cargo install flip-link --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ax25-node-fw
+
+      - name: Build the firmware binary (release, locked)
+        working-directory: crates/ax25-node-fw
+        run: cargo build --release --locked
+
+      - name: Build the on-target test ELF (embedded-test; link only, no probe)
+        working-directory: crates/ax25-node-fw
+        run: cargo test --release --locked --no-run

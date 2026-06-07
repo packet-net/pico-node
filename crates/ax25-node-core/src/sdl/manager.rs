@@ -82,7 +82,7 @@ impl<const N: usize> SessionManager<N> {
     /// manager is full and `peer` has no existing slot (the caller drops the frame /
     /// replies DM — a node at capacity refuses new links). Creates the slot's
     /// [`WireSink`] addressed for the `local ↔ peer` link.
-    fn ensure_slot(&mut self, peer: Callsign) -> Option<usize> {
+    fn ensure_slot(&mut self, peer: Callsign, local: Callsign) -> Option<usize> {
         if let Some(i) = self.index_of(&peer) {
             return Some(i);
         }
@@ -90,7 +90,7 @@ impl<const N: usize> SessionManager<N> {
         self.slots[free] = Some(Slot {
             peer,
             session: Session::new(),
-            sink: WireSink::new(self.local, peer, Vec::new()),
+            sink: WireSink::new(local, peer, Vec::new()),
         });
         Some(free)
     }
@@ -108,7 +108,24 @@ impl<const N: usize> SessionManager<N> {
         event: Event,
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
-        let Some(i) = self.ensure_slot(peer) else {
+        self.post_with_local(self.local, peer, event, timers)
+    }
+
+    /// [`Self::post`], but a slot created by this call uses `local` as its own
+    /// station callsign instead of the manager default. The node convention for
+    /// outgoing connects made on a console user's behalf: the *user's* callsign
+    /// with complemented SSID (so the far node never sees its own downlink call
+    /// coming back — two simultaneous links keyed on one callsign collide in
+    /// real node stacks; observed live against LinBPQ). An existing slot keeps
+    /// the local it was created with.
+    pub fn post_with_local(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        event: Event,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        let Some(i) = self.ensure_slot(peer, local) else {
             return Vec::new();
         };
         let slot = self.slots[i]

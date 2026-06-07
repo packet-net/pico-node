@@ -6,8 +6,8 @@
 //! [`crate::session`] layer.
 
 pub mod axudp;
-pub mod relay;
 pub mod kiss_tcp;
+pub mod relay;
 pub mod telnet;
 // GATE 6 (HW-BRINGUP.md §4): kiss_serial returns if/when a NinoTNC is present at
 // this machine (its UART generics also don't compile against embassy-rp 0.10 yet).
