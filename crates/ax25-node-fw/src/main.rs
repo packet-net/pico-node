@@ -255,8 +255,9 @@ mod firmware {
                 cfg.axudp.listen_port
             )],
         };
+        // Prompt suffix "> " (the {call}> form), aligned with pdn's node prompt.
         let mut prompt = String::from(call_text);
-        prompt.push_str("} ");
+        prompt.push_str("> ");
 
         // --- GATE 3 (HW-BRINGUP.md §4): AXUDP over WiFi (capability 1), now with
         // the connected-mode session layer + AX.25 console attached. ---

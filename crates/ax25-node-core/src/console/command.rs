@@ -34,9 +34,14 @@ pub enum Command {
     Help,
     /// An empty line — re-prompt without comment (not an error).
     Empty,
-    /// A recognised `CONNECT` the parser could not complete (missing/bad call).
-    /// Carries the offending raw input.
-    MalformedConnect,
+    /// A recognised `CONNECT` the parser could not complete. `target` is `None`
+    /// when no callsign was given, or `Some(text)` carrying the offending token
+    /// when it was present but not a valid callsign — so the service can render the
+    /// same two distinct messages pdn does (mirrors C# `MalformedConnect`).
+    MalformedConnect {
+        /// `None` = no callsign given; `Some(text)` = the offending non-callsign token.
+        target: Option<String>,
+    },
     /// `SHOW` — display the node's effective + pending configuration. Executed
     /// by the embedder (the config lives firmware-side); the parser only
     /// recognises the verb.
@@ -56,8 +61,10 @@ pub enum Command {
     Save,
     /// `REBOOT` — restart the node (how pending config takes effect).
     Reboot,
-    /// An input line that matched no known verb.
-    Unknown,
+    /// An input line that matched no known verb. Carries the trimmed raw line so
+    /// the service can echo it back (`Unknown command: <raw>`), mirroring pdn's
+    /// C# `UnknownCommand`.
+    Unknown(String),
 }
 
 /// Parse raw line bytes (lenient UTF-8) into a [`Command`]. Used by the wire path
@@ -143,12 +150,12 @@ pub fn parse(line: &str) -> Command {
         return Command::Reboot;
     }
 
-    Command::Unknown
+    Command::Unknown(trimmed.to_string())
 }
 
 fn parse_connect(rest: &str) -> Command {
     if rest.trim().is_empty() {
-        return Command::MalformedConnect;
+        return Command::MalformedConnect { target: None };
     }
     // First token is the target; trailing via-path/extras ignored (same-port only).
     let target = match rest.find(char::is_whitespace) {
@@ -157,7 +164,9 @@ fn parse_connect(rest: &str) -> Command {
     };
     match Callsign::parse(target) {
         Some(call) => Command::Connect(call),
-        None => Command::MalformedConnect,
+        None => Command::MalformedConnect {
+            target: Some(target.to_string()),
+        },
     }
 }
 
@@ -191,6 +200,7 @@ fn trim_control(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn connect_full_and_abbrev() {
@@ -210,14 +220,20 @@ mod tests {
 
     #[test]
     fn connect_missing_call_is_malformed() {
-        assert_eq!(parse("C"), Command::MalformedConnect);
-        assert_eq!(parse("C   "), Command::MalformedConnect);
+        assert_eq!(parse("C"), Command::MalformedConnect { target: None });
+        assert_eq!(parse("C   "), Command::MalformedConnect { target: None });
     }
 
     #[test]
-    fn connect_bad_call_is_malformed() {
-        assert_eq!(parse("C not.a.call"), Command::MalformedConnect);
-        assert_eq!(parse("C TOOLONGG"), Command::MalformedConnect);
+    fn connect_bad_call_is_malformed_and_keeps_the_offending_token() {
+        assert_eq!(
+            parse("C not.a.call"),
+            Command::MalformedConnect { target: Some("not.a.call".to_string()) }
+        );
+        assert_eq!(
+            parse("C TOOLONGG"),
+            Command::MalformedConnect { target: Some("TOOLONGG".to_string()) }
+        );
     }
 
     #[test]
@@ -245,9 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_verb() {
-        assert_eq!(parse("FROBNICATE"), Command::Unknown);
-        assert_eq!(parse("xyzzy foo"), Command::Unknown);
+    fn unknown_verb_keeps_the_raw_line_for_echo() {
+        assert_eq!(parse("FROBNICATE"), Command::Unknown("FROBNICATE".to_string()));
+        assert_eq!(parse("xyzzy foo"), Command::Unknown("xyzzy foo".to_string()));
     }
 
     #[test]
@@ -267,7 +283,7 @@ mod tests {
         huge[1] = b' ';
         // Bytes 2.. are 'A's; the first token after "C " is a long run of 'A's,
         // which is not a valid callsign => malformed, not a panic or hang.
-        assert_eq!(parse_bytes(&huge), Command::MalformedConnect);
+        assert!(matches!(parse_bytes(&huge), Command::MalformedConnect { .. }));
     }
 }
 
@@ -303,7 +319,7 @@ mod config_command_tests {
         assert_eq!(parse("SET"), Command::MalformedSet);
         assert_eq!(parse("SET ALIAS"), Command::MalformedSet);
         // "SE" is NOT a SET prefix (mutations don't prefix-match)…
-        assert_eq!(parse("SE ALIAS X"), Command::Unknown);
+        assert_eq!(parse("SE ALIAS X"), Command::Unknown("SE ALIAS X".to_string()));
     }
 
     #[test]
