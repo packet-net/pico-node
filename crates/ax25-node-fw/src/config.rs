@@ -29,6 +29,10 @@ pub struct NodeConfig {
     pub kiss_serial: KissSerialConfig,
     pub telnet: TelnetConfig,
     pub netrom: NetRomConfig,
+    /// Optional `host[:port]` of an MQTT broker to publish logs/status to
+    /// (observability without a debug probe). From `MQTT_HOST` / flash config;
+    /// absent ⇒ no MQTT.
+    pub mqtt_host: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -138,6 +142,7 @@ pub fn load() -> NodeConfig {
             originate: true,
             nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
         },
+        mqtt_host: option_env!("MQTT_HOST"),
     }
 }
 
@@ -186,6 +191,9 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     }
     if let Some(v) = st.originate {
         cfg.netrom.originate = v;
+    }
+    if let Some(v) = &st.mqtt_host {
+        cfg.mqtt_host = Some(leak(v));
     }
 }
 

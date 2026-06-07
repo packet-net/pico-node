@@ -281,8 +281,12 @@ pub async fn task(
                     }
                 }
 
-                // Reflect the live route counts on the OLED status display.
+                // Reflect the live route counts on the OLED + MQTT status.
                 crate::oled::set_counts(
+                    netrom.neighbour_count() as u16,
+                    netrom.destination_count() as u16,
+                );
+                crate::mqtt::set_status(
                     netrom.neighbour_count() as u16,
                     netrom.destination_count() as u16,
                 );
@@ -417,6 +421,7 @@ pub async fn task(
                         "axudp: NODES broadcast ingested ({=u32} destinations known)",
                         netrom.destination_count() as u32
                     );
+                    crate::mqtt::log("NODES broadcast ingested");
                 }
 
                 defmt::info!(
