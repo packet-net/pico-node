@@ -30,8 +30,16 @@ publish = false
 
 [[bin]]
 name = "ax25-node-fw"
-test = false      # on-target tests run via embedded-test (see PLAN), not `cargo test`
+test = false      # on-target tests live in tests/ via embedded-test, not unit tests here
 bench = false
+
+# Gate 7 (HW-BRINGUP.md §4): the on-target test suite. `cargo test` builds this
+# with the embedded-test harness; the probe-rs runner (.cargo/config.toml)
+# autodetects the test binary, flashes it once, and runs each case with a device
+# reset in between.
+[[test]]
+name = "on_target"
+harness = false
 
 [dependencies]
 # The portable core, with std OFF — pulls in only core + alloc on the target.
@@ -93,10 +101,12 @@ embedded-alloc = "0.7"
 # timer set in session.rs). no_std, no alloc.
 heapless = "0.8"
 
-[dev-dependencies]
-# On-target test harness (current; defmt-test/probe-run are deprecated). Runs the
-# conformance subset on the real M0+ via `probe-rs run` as the cargo test runner.
-embedded-test = { version = "0.6", features = ["embassy"] }
+# On-target test harness (Gate 7). Bumped 0.6 → 0.7 to pair with the installed
+# probe-rs 0.31 runner (the coordinated bump HW-BRINGUP §4 Gate 1 anticipated).
+# A regular dependency rather than dev-: its build script must put
+# embedded-test.x on the linker search path for ALL targets (see build.rs); the
+# harness itself is only linked into the tests/ binaries.
+embedded-test = { version = "0.7", features = ["defmt"] }
 
 # Size matters on a 264 KB-RAM M0+. Optimise even in dev so it fits and the
 # defmt/RTT loop is responsive.

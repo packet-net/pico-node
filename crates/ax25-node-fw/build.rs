@@ -20,4 +20,10 @@ fn main() {
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Gate 7 (HW-BRINGUP.md §4): the embedded-test harness's linker script. The
+    // embedded-test crate sits in [dependencies] (not dev-) precisely so its
+    // build script puts embedded-test.x on the search path for ALL targets —
+    // in the normal firmware binary the script resolves to empty sections.
+    println!("cargo::rustc-link-arg=-Tembedded-test.x");
 }
