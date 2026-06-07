@@ -170,7 +170,10 @@ impl StoredConfig {
     }
 }
 
-type ConfigFlash = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
+/// The blocking flash driver over the whole 2 MB chip. Public so the OTA path
+/// (`crate::ota`) can take ownership of it to drive `embassy-boot`'s
+/// `FirmwareUpdater` (see [`take_flash_for_ota`]).
+pub type ConfigFlash = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
 
 /// The flash-backed config service: the driver, the pending (console-staged)
 /// copy, and the generation counter for A/B writes.
@@ -357,6 +360,14 @@ pub fn netrom_save(netrom: &crate::session::NetRom) -> Result<usize, &'static st
             SaveOutcome::Unchanged | SaveOutcome::Empty => Ok(0),
         }
     })
+}
+
+/// Take ownership of the flash driver for an OTA update, removing the
+/// `ConfigService` from the global handle. Returns `None` if the store is
+/// unavailable or already taken. The OTA path always ends in a reset, so the
+/// service is never restored — config/routing saves no-op until the reboot.
+pub fn take_flash_for_ota() -> Option<ConfigFlash> {
+    CONFIG.lock(|cell| cell.borrow_mut().take().map(|svc| svc.into_flash()))
 }
 
 /// Execute one console [`ConfigOp`]: returns the response text (newline-

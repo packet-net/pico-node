@@ -95,3 +95,11 @@ jobs:
       - name: Build the on-target test ELF (embedded-test; link only, no probe)
         working-directory: crates/ax25-node-fw
         run: cargo test --release --locked --no-run
+
+      # The OTA bootloader (crates/ax25-node-bootloader) is its own standalone
+      # thumbv6m crate (embassy-boot-rp). Build it here so the A/B layout +
+      # linker glue can't bitrot. No ax25sdl sibling needed (it doesn't depend
+      # on core). See docs/OTA.md.
+      - name: Build the OTA bootloader (release, locked)
+        working-directory: crates/ax25-node-bootloader
+        run: cargo build --release --locked

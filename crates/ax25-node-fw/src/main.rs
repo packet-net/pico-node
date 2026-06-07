@@ -52,6 +52,8 @@ mod netrom_store;
 #[cfg(target_os = "none")]
 mod oled;
 #[cfg(target_os = "none")]
+mod ota;
+#[cfg(target_os = "none")]
 mod provisioning;
 #[cfg(target_os = "none")]
 mod session;
@@ -89,6 +91,7 @@ mod firmware {
     use crate::mqtt;
     use crate::net;
     use crate::oled;
+    use crate::ota;
     use crate::provisioning;
     use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
@@ -109,6 +112,16 @@ mod firmware {
 
         let p = embassy_rp::init(Default::default());
 
+        // OTA rollback bench-test hook: a build with OTA_FORCE_BRICK set resets
+        // immediately, BEFORE marking the firmware good — simulating a trial
+        // image that never confirms. The bootloader then reverts to the prior
+        // image on the following boot. Off in every normal build (the env var is
+        // unset), compiled to nothing.
+        if option_env!("OTA_FORCE_BRICK").is_some() {
+            defmt::error!("OTA_FORCE_BRICK: resetting without marking good (rollback test)");
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+
         // Compiled factory defaults, then the flash store on top (provisioning
         // steps 1–2 — docs/PROVISIONING.md). The store also feeds the console
         // SET/SHOW/SAVE executor via the CONFIG static.
@@ -117,6 +130,10 @@ mod firmware {
             embassy_rp::flash::Flash::<_, _, { crate::config_store::FLASH_SIZE }>::new_blocking(
                 p.FLASH,
             );
+        // OTA: confirm this boot as good (no-op/wear-free unless we're a freshly
+        // swapped trial image). Done first, before anything can panic — a hang
+        // before this point makes the bootloader roll back on the next reset.
+        let flash = ota::mark_booted_early(flash);
         let (service, stored) = config_store::ConfigService::new(flash);
         config_store::CONFIG.lock(|cell| cell.borrow_mut().replace(service));
         if let Some(stored) = stored {
@@ -277,6 +294,14 @@ mod firmware {
             console_id,
             prompt,
         )));
+
+        // --- OTA firmware update over HTTP (docs/OTA.md) — STA mode only: in
+        // AP mode the captive portal owns :80 and you're physically present
+        // (BOOTSEL). A configured, networked node serves the upload page +
+        // POST /firmware at http://<ip>/. ---
+        if sta_ok {
+            spawner.spawn(defmt::unwrap!(ota::http_task(stack)));
+        }
 
         // --- GATE 5 (HW-BRINGUP.md §4): KISS-over-TCP (capability 2) ---
         // Disabled unless KISS_TCP_TARGET is set in the build env (§5).

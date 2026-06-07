@@ -1,38 +1,47 @@
-/* RP2040 memory layout for cortex-m-rt + embassy-rp.
+/* RP2040 memory layout for the pico-node application — the OTA/A-B variant.
  *
- * The RP2040 boots from a 256-byte second-stage bootloader (BOOT2) at the start
- * of XIP flash, which configures the QSPI flash for execute-in-place; the rest of
- * flash holds the program, and SRAM is 264 KB. This is the canonical layout from
- * the rp2040-project-template / embassy examples. build.rs copies this file to the
- * linker search path. (Not used until the firmware is built — see docs/PLAN.md.)
+ * Since OTA (docs/OTA.md) the application is ALWAYS chained by the bootloader
+ * (crates/ax25-node-bootloader): it is NOT independently bootable. Its FLASH
+ * region IS the ACTIVE partition (0x10009000); the bootloader owns BOOT2 at the
+ * flash base and jumps here after any pending A/B swap. The combined
+ * bootloader+app UF2 is the first-flash artifact; thereafter updates are staged
+ * into DFU over the air.
  *
- * The Pico W's WiFi firmware + CLM blobs are large (~230 KB) and are linked as
- * byte arrays into the program FLASH region; 2 MB is ample.
+ * No `.boot2` SECTIONS block here: embassy-rp still emits a `.boot2` static, but
+ * for a chained app it is an unused orphan (the bootloader's boot2 at the flash
+ * base is the one the BootROM runs). We deliberately do NOT place it at
+ * ORIGIN(BOOT2) — that belongs to the bootloader — and the linker keeps the
+ * vector table at ACTIVE origin where the bootloader's `load()` points VTOR.
+ *
+ * The persisted config + NET/ROM routing stores live at absolute offsets in the
+ * top 16 KiB (src/config_store.rs, src/netrom_store.rs); the Flash driver
+ * addresses the whole 2 MB chip, so those are reachable regardless of this
+ * (ACTIVE-bounded) FLASH region — they sit in the gap above DFU, outside it.
+ *
+ * Layout (must match crates/ax25-node-bootloader/memory.x):
+ *   BOOT2            0x10000000  256 B    (bootloader-provided; not placed here)
+ *   bootloader       0x10000100  ~32 KB
+ *   BOOTLOADER_STATE 0x10008000  4 KB
+ *   ACTIVE (=FLASH)  0x10009000  896 KB   <- this application
+ *   DFU              0x100E9000  900 KB   <- staged OTA image
+ *   config + netrom  0x101FC000  16 KB
  */
 
-MEMORY {
-    /* BOOT2: the 256-byte second-stage bootloader at the base of XIP flash. */
-    BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
+MEMORY
+{
+    BOOT2            : ORIGIN = 0x10000000, LENGTH = 0x100
+    BOOTLOADER_STATE : ORIGIN = 0x10008000, LENGTH = 4K
+    FLASH            : ORIGIN = 0x10009000, LENGTH = 896K
+    DFU              : ORIGIN = 0x100E9000, LENGTH = 900K
 
-    /* FLASH: the program, immediately after BOOT2. 2 MB on the stock Pico W,
-       minus the 256 bytes of BOOT2 and minus the top 16 KiB reserved for persisted state: the node
-       config (two 4 KiB sectors, src/config_store.rs) and the NET/ROM
-       routing table (two more, src/netrom_store.rs) + docs/PROVISIONING.md; keeping them out of the
-       linker's FLASH region guarantees the program can never overlap them). */
-    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100 - 16K
-
-    /* RAM: 264 KB of SRAM (the RP2040's 6 banks, contiguous for the linker). */
-    RAM   : ORIGIN = 0x20000000, LENGTH = 264K
+    RAM              : ORIGIN = 0x20000000, LENGTH = 264K
 }
 
-/* cortex-m-rt places the vector table at the start of FLASH; embassy-rp + the
-   rp2040 boot2 crate populate BOOT2. The `_stack_start` default (top of RAM) is
-   relocated by flip-link at link time. */
-SECTIONS {
-    /* The second-stage bootloader, CRC-checked by the BootROM. The boot2 helper
-       (pulled in by embassy-rp / a boot2 crate) provides `__boot2_*` symbols. */
-    .boot2 ORIGIN(BOOT2) :
-    {
-        KEEP(*(.boot2));
-    } > BOOT2
-} INSERT BEFORE .text;
+/* embassy-boot partition symbols (offsets from flash base), consumed by
+   FirmwareUpdaterConfig::from_linkerfile_blocking in src/ota.rs. The app needs
+   only DFU + STATE; ACTIVE is the bootloader's concern. */
+__bootloader_state_start = ORIGIN(BOOTLOADER_STATE) - ORIGIN(BOOT2);
+__bootloader_state_end   = ORIGIN(BOOTLOADER_STATE) + LENGTH(BOOTLOADER_STATE) - ORIGIN(BOOT2);
+
+__bootloader_dfu_start = ORIGIN(DFU) - ORIGIN(BOOT2);
+__bootloader_dfu_end   = ORIGIN(DFU) + LENGTH(DFU) - ORIGIN(BOOT2);
