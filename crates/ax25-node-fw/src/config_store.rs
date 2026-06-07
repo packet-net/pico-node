@@ -175,6 +175,9 @@ pub struct ConfigService {
     generation: u32,
     /// Generation counter for the NET/ROM routing store (separate sectors).
     netrom_generation: u32,
+    /// Content CRC of the last persisted routing table — the wear gate (a save
+    /// whose content matches this writes no flash).
+    netrom_content_crc: u16,
 }
 
 /// Global handle for the console executors (telnet + AX.25 console both reach
@@ -234,6 +237,7 @@ impl ConfigService {
                 pending: stored.clone().unwrap_or_default(),
                 generation,
                 netrom_generation: 0,
+                netrom_content_crc: 0,
             },
             stored,
         )
@@ -322,19 +326,30 @@ pub fn netrom_load(
     })
 }
 
-/// Persist the current routing table. Returns the route count written (0 if the
-/// table is empty — no flash erase). Locks the config flash.
+/// Persist the current routing table — but only if its content changed since
+/// the last write (the flash-wear gate; a stable table writes nothing). Returns
+/// the route count actually written (0 = unchanged or empty, no erase). Locks
+/// the config flash.
 pub fn netrom_save(netrom: &crate::session::NetRom) -> Result<usize, &'static str> {
+    use crate::netrom_store::SaveOutcome;
     CONFIG.lock(|cell| {
         let mut borrow = cell.borrow_mut();
         let Some(svc) = borrow.as_mut() else {
             return Err("config store unavailable");
         };
-        let n = crate::netrom_store::save(&mut svc.flash, netrom, svc.netrom_generation)?;
-        if n > 0 {
-            svc.netrom_generation += 1;
+        match crate::netrom_store::save(
+            &mut svc.flash,
+            netrom,
+            svc.netrom_generation,
+            svc.netrom_content_crc,
+        )? {
+            SaveOutcome::Wrote { count, content_crc } => {
+                svc.netrom_generation += 1;
+                svc.netrom_content_crc = content_crc;
+                Ok(count)
+            }
+            SaveOutcome::Unchanged | SaveOutcome::Empty => Ok(0),
         }
-        Ok(n)
     })
 }
 

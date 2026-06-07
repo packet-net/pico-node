@@ -178,7 +178,6 @@ pub async fn task(
     // Persist the table periodically (NOT per-broadcast — flash wear), and only
     // when it changed since the last save.
     let mut next_save_at = Instant::now() + Duration::from_secs(NETROM_SAVE_SECS);
-    let mut last_saved_dests = 0usize;
     let mut next_interlink_at = Instant::now() + Duration::from_secs(INTERLINK_ENSURE_SECS);
 
     // NODES origination: our own broadcasts, built from the live routing table
@@ -286,8 +285,7 @@ pub async fn task(
                 // NET/ROM neighbour, so the connector's L4 datagrams always
                 // have transport (no "no L2 session" drops) — BPQ-style.
                 if Instant::now() >= next_interlink_at {
-                    next_interlink_at =
-                        Instant::now() + Duration::from_secs(INTERLINK_ENSURE_SECS);
+                    next_interlink_at = Instant::now() + Duration::from_secs(INTERLINK_ENSURE_SECS);
                     ensure_interlinks(
                         &mut sessions,
                         &mut peers,
@@ -304,19 +302,18 @@ pub async fn task(
                     .await;
                 }
 
-                // Routing-table persistence: save if due AND the table changed.
+                // Routing-table persistence: the save self-gates on a content
+                // CRC, so this only erases flash when the table actually changed
+                // (a stable node writes nothing — flash wear tracks topology
+                // churn, not the save cadence).
                 if Instant::now() >= next_save_at {
                     next_save_at = Instant::now() + Duration::from_secs(NETROM_SAVE_SECS);
-                    let dests = netrom.destination_count();
-                    if dests != last_saved_dests {
-                        match crate::config_store::netrom_save(&netrom) {
-                            Ok(n) if n > 0 => {
-                                defmt::info!("netrom: {=usize} route(s) saved to flash", n);
-                                last_saved_dests = dests;
-                            }
-                            Ok(_) => {}
-                            Err(e) => defmt::warn!("netrom: save failed: {=str}", e),
+                    match crate::config_store::netrom_save(&netrom) {
+                        Ok(n) if n > 0 => {
+                            defmt::info!("netrom: {=usize} route(s) saved to flash (changed)", n)
                         }
+                        Ok(_) => {} // unchanged — no write
+                        Err(e) => defmt::warn!("netrom: save failed: {=str}", e),
                     }
                 }
 

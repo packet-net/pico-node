@@ -10,7 +10,9 @@
 use cyw43::{Control, JoinAuth, JoinOptions, NetDriver};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_net::{Config, DhcpConfig, Ipv4Address, Ipv4Cidr, StaticConfigV4, Stack, StackResources};
+use embassy_net::{
+    Config, DhcpConfig, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
+};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma;

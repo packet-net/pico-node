@@ -156,7 +156,10 @@ mod firmware {
         if sta_ok {
             // STA mode: DHCP client, re-associate forever if the link drops.
             stack = net::start_stack(net_device, &spawner, cfg.hostname).await;
-            spawner.spawn(defmt::unwrap!(net::sta_keepalive(control, cfg.wifi.clone())));
+            spawner.spawn(defmt::unwrap!(net::sta_keepalive(
+                control,
+                cfg.wifi.clone()
+            )));
             defmt::info!("waiting for link + DHCPv4 lease...");
             stack.wait_link_up().await;
             stack.wait_config_up().await;

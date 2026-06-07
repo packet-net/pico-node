@@ -102,18 +102,54 @@ fn snapshot(netrom: &NetRom, routes: &mut heapless::Vec<Route, MAX_ROUTES>) {
     });
 }
 
-/// Write the current routing table to flash (alternating sector, generation+1).
-/// Returns `Ok(count)` of routes persisted; a no-op `Ok(0)` if the table is
-/// empty (nothing worth a flash erase).
+/// Outcome of a [`save`] attempt.
+pub enum SaveOutcome {
+    /// The table content was unchanged since `prev_content_crc` — NO flash
+    /// write occurred (the wear-saving fast path; a stable node hits this
+    /// every save tick).
+    Unchanged,
+    /// Wrote `count` routes; carries the new content CRC for the next gate.
+    Wrote { count: usize, content_crc: u16 },
+    /// The table is empty — nothing persisted, no write.
+    Empty,
+}
+
+/// CRC over just the route payload (not the header/generation) — the change
+/// detector. Same routes ⇒ same CRC regardless of save generation.
+fn content_crc(routes: &[Route]) -> u16 {
+    let mut buf = [0u8; MAX_BODY];
+    let mut at = 0;
+    for r in routes {
+        encode_call(&r.neighbour, &mut buf[at..]);
+        encode_alias(&r.neighbour_alias, &mut buf[at + ADDRESS_LEN..]);
+        encode_call(&r.destination, &mut buf[at + ADDRESS_LEN + ALIAS_LEN..]);
+        encode_alias(&r.dest_alias, &mut buf[at + 2 * ADDRESS_LEN + ALIAS_LEN..]);
+        buf[at + ROUTE_LEN - 1] = r.quality;
+        at += ROUTE_LEN;
+    }
+    crc::compute(&buf[..at])
+}
+
+/// Write the current routing table to flash (alternating sector, generation+1)
+/// — but ONLY if its content changed since `prev_content_crc`. A stable node's
+/// table CRC never changes, so it never erases a sector: flash wear is bounded
+/// by *topology churn*, not by the save cadence. (Routing state is non-critical
+/// — re-learned from on-air NODES within a cycle — so saving conservatively
+/// costs nothing.)
 pub fn save(
     flash: &mut ConfigFlash,
     netrom: &NetRom,
     generation: u32,
-) -> Result<usize, &'static str> {
+    prev_content_crc: u16,
+) -> Result<SaveOutcome, &'static str> {
     let mut routes = heapless::Vec::<Route, MAX_ROUTES>::new();
     snapshot(netrom, &mut routes);
     if routes.is_empty() {
-        return Ok(0);
+        return Ok(SaveOutcome::Empty);
+    }
+    let content = content_crc(&routes);
+    if content == prev_content_crc {
+        return Ok(SaveOutcome::Unchanged); // no erase/write — the wear win
     }
 
     let mut record = [0xFFu8; HEADER_LEN + MAX_BODY + 2];
@@ -151,7 +187,10 @@ pub fn save(
     flash
         .blocking_write(offset, &record[..padded])
         .map_err(|_| "write failed")?;
-    Ok(routes.len())
+    Ok(SaveOutcome::Wrote {
+        count: routes.len(),
+        content_crc: content,
+    })
 }
 
 /// Read one sector's routes. Returns `(generation, routes)` when valid.
