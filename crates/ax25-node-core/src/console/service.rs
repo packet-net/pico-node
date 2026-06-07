@@ -102,8 +102,15 @@ pub fn render_line(text: &str, kind: TransportKind) -> Vec<u8> {
 /// The banner + first prompt as one buffer (one I-frame on the air — see #292 in
 /// the C# host). `prompt` is the already-expanded prompt string.
 pub fn banner_and_prompt(id: &Identity, prompt: &str, kind: TransportKind) -> Vec<u8> {
-    let mut banner = String::new();
+    // "Welcome to {node} ({call})  [pico-node <ver>]" — the same banner shape pdn
+    // uses (its configurable default is "Welcome to {node} ({call})"); the software
+    // tag differs by design (pico-node vs Packet.NET). Keeps the node-prompt
+    // experience aligned across the two node implementations.
+    let mut banner = String::from("Welcome to ");
     banner.push_str(&id.node_name);
+    banner.push_str(" (");
+    banner.push_str(&id.callsign);
+    banner.push(')');
     banner.push_str("  [pico-node ");
     banner.push_str(VERSION);
     banner.push(']');
@@ -154,7 +161,15 @@ pub fn dispatch(cmd: &Command, id: &Identity, kind: TransportKind) -> Response {
                 outcome: DispatchOutcome::ConnectThenRelay(*call),
             }
         }
-        Command::MalformedConnect => line("Connect needs a valid callsign, e.g. C M0LTE-1", kind),
+        Command::MalformedConnect { target } => match target {
+            None => line("Connect needs a callsign, e.g. C M0LTE-1", kind),
+            Some(t) => {
+                let mut s = String::from("'");
+                s.push_str(t);
+                s.push_str("' is not a valid callsign (1-6 letters/digits, optional -SSID 0-15).");
+                line(&s, kind)
+            }
+        },
         Command::ShowConfig => config_op(ConfigOp::Show),
         Command::Set { key, value } => config_op(ConfigOp::Set {
             key: key.clone(),
@@ -163,8 +178,24 @@ pub fn dispatch(cmd: &Command, id: &Identity, kind: TransportKind) -> Response {
         Command::MalformedSet => line("Usage: SET <KEY> <VALUE>  (SHOW lists keys)", kind),
         Command::Save => config_op(ConfigOp::Save),
         Command::Reboot => config_op(ConfigOp::Reboot),
-        Command::Unknown => line("Unknown command  (type H for help)", kind),
+        Command::Unknown(raw) => {
+            // Echo the offending line back (sanitised — strip control chars so a
+            // hostile line can't inject terminal escapes / extra newlines), mirroring
+            // pdn's `Unknown command: <raw>  (type H for help)`.
+            let mut s = String::from("Unknown command: ");
+            s.push_str(&sanitise(raw));
+            s.push_str("  (type H for help)");
+            line(&s, kind)
+        }
     }
+}
+
+// Replace control characters with '.' so an echoed unknown command can't inject
+// terminal escapes or extra newlines into our reply. Mirrors C# `Sanitise`.
+fn sanitise(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
 }
 
 fn config_op(op: ConfigOp) -> Response {
@@ -331,19 +362,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_is_friendly_and_continues() {
-        let r = dispatch(&Command::Unknown, &id(), TransportKind::Telnet);
+    fn unknown_echoes_the_raw_line_and_continues() {
+        let r = dispatch(&Command::Unknown(String::from("frobnicate")), &id(), TransportKind::Telnet);
         let txt = String::from_utf8(r.body).unwrap();
-        assert!(txt.contains("Unknown command"));
+        assert!(txt.contains("Unknown command: frobnicate"), "echoes the offending line (pdn parity)");
+        assert!(txt.contains("(type H for help)"));
         assert_eq!(r.outcome, DispatchOutcome::Continue);
     }
 
     #[test]
-    fn banner_includes_node_and_version() {
-        let out = banner_and_prompt(&id(), "M0LTE-1} ", TransportKind::Telnet);
+    fn unknown_echo_is_sanitised() {
+        // Control chars in the echoed line become '.' so a hostile line can't inject
+        // terminal escapes / newlines (pdn's Sanitise).
+        let r = dispatch(&Command::Unknown(String::from("ev\u{1b}il")), &id(), TransportKind::Telnet);
+        let txt = String::from_utf8(r.body).unwrap();
+        assert!(txt.contains("ev.il"));
+        assert!(!txt.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn malformed_connect_messages_match_pdn() {
+        let none = dispatch(&Command::MalformedConnect { target: None }, &id(), TransportKind::Telnet);
+        assert!(String::from_utf8(none.body).unwrap().contains("Connect needs a callsign"));
+
+        let bad = dispatch(
+            &Command::MalformedConnect { target: Some(String::from("not.a.call")) },
+            &id(),
+            TransportKind::Telnet,
+        );
+        let t = String::from_utf8(bad.body).unwrap();
+        assert!(t.contains("not.a.call"), "echoes the offending token");
+        assert!(t.contains("not a valid callsign"));
+    }
+
+    #[test]
+    fn banner_is_welcome_node_call_version() {
+        let out = banner_and_prompt(&id(), "M0LTE-1> ", TransportKind::Telnet);
         let txt = String::from_utf8(out).unwrap();
-        assert!(txt.contains("LONDON"));
+        assert!(txt.contains("Welcome to LONDON (M0LTE-1)"), "the pdn-aligned welcome banner");
         assert!(txt.contains("pico-node"));
-        assert!(txt.ends_with("M0LTE-1} "));
+        assert!(txt.ends_with("M0LTE-1> "));
     }
 }
