@@ -1,25 +1,29 @@
 //! Capability 1 — AXUDP: AX.25-over-UDP for node↔node connectivity over WiFi.
 //!
 //! Ports `Packet.Axudp.AxudpSocket` onto `embassy_net::udp::UdpSocket` (the 1:1
-//! mapping the research note identifies). The UDP payload *is* the AX.25 frame
-//! body; framing/encode/decode (incl. the optional XRouter CRC FCS) come from
+//! mapping the research note identifies). The UDP payload is the AX.25 frame
+//! body + the mandatory trailing FCS; framing comes from
 //! [`ax25_node_core::axudp`].
 //!
-//! Beyond the Gate-3 socket loop + read-only NET/ROM tap, this task now owns
-//! **the connected-mode session layer for the AXUDP port**: inbound frames that
-//! pass the address filter are classified ([`classify_incoming`]) and posted
-//! into a [`session::Sessions`] manager (the host-tested SDL runtime); the wire
-//! frames each session emits go back to the peer's UDP endpoint, and the DL
-//! signals raised upward drive **the node console over AX.25**
-//! (`TransportKind::Ax25`, CR line discipline) — connect to the node from a real
-//! BPQ peer and you land at the same prompt telnet users get.
+//! Beyond the socket loop + read-only NET/ROM tap, this task owns **the
+//! connected-mode session layer for the AXUDP port**: inbound frames that pass
+//! the address filter are classified ([`classify_incoming`]) and posted into a
+//! [`session::Sessions`] manager (the host-tested SDL runtime); the wire frames
+//! each session emits go back to the peer's UDP endpoint, and the DL signals
+//! raised upward drive **the node console over AX.25** (`TransportKind::Ax25`,
+//! CR line discipline) — connect from a real BPQ peer and you land at the same
+//! prompt telnet users get.
+//!
+//! **Timers are live**: each peer carries its own [`session::EmbassyTimers`]
+//! (T1 retransmit / T2 ack-delay / T3 idle), the main select loop wakes at the
+//! earliest armed deadline across all peers, and expiries post the matching
+//! `Event::T?Expiry` into that peer's session — so retransmission, ack timing
+//! and dead-peer link failure (N2 retries exhausted → teardown) run exactly as
+//! the SDL tables specify, against the peer's *last heard* UDP endpoint.
 //!
 //! Single-transport ownership (this task owns `Sessions` exclusively) keeps the
 //! `&mut` story trivial; when a second connected-mode transport arrives the
-//! manager moves behind the supervisor seam `session.rs` documents. Timer note:
-//! T1/T3 expiries aren't driven yet (no timer task) — responsive exchanges work
-//! (every reply here is immediate); retransmit/keepalive behaviour is the
-//! documented follow-up.
+//! manager moves behind the supervisor seam `session.rs` documents.
 
 use ax25_node_core::ax25::{Callsign, PID_NO_LAYER3};
 use ax25_node_core::axudp;
@@ -32,10 +36,10 @@ use ax25_node_core::sdl::{classify_incoming, DataLinkSignal, Event};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Stack};
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 
 use crate::config::AxudpConfig;
 use crate::session;
@@ -44,11 +48,14 @@ use crate::transports::{call_str, parse_endpoint, ui_frame};
 /// Seconds between beacon UI frames when a beacon target is configured.
 const BEACON_INTERVAL_SECS: u64 = 10;
 
-/// Per-connected-peer console state: the CR/LF line assembler for the inbound
-/// byte stream. One per session slot.
-struct ConsolePeer {
+/// Per-peer link state alongside the manager's session slot: the peer's own
+/// T1/T2/T3 timer service, the UDP endpoint it was last heard from (where
+/// timer-generated frames go), and the console line assembler once attached.
+struct PeerState {
     peer: Callsign,
-    asm: LineAssembler,
+    timers: session::EmbassyTimers,
+    endpoint: IpEndpoint,
+    console: Option<LineAssembler>,
 }
 
 #[embassy_executor::task]
@@ -80,10 +87,9 @@ pub async fn task(
     let mut netrom = session::new_netrom();
     let port_id = PortId::from_str_lossy("axudp");
 
-    // The connected-mode session layer for this port + the AX.25 console state.
+    // The connected-mode session layer for this port + per-peer link state.
     let mut sessions = session::new_sessions(my_call);
-    let mut timers = session::EmbassyTimers::new();
-    let mut consoles: [Option<ConsolePeer>; session::MAX_SESSIONS] =
+    let mut peers: [Option<PeerState>; session::MAX_SESSIONS] =
         [const { None }; session::MAX_SESSIONS];
 
     let mut dgram_buf = [0u8; 2048];
@@ -92,8 +98,21 @@ pub async fn task(
     let mut dst_buf = [0u8; 16];
 
     loop {
-        match select(ticker.next(), socket.recv_from(&mut dgram_buf)).await {
-            Either::First(()) => {
+        // Wake at the earliest armed timer deadline across all peers (if any).
+        let next_deadline: Option<Instant> = peers
+            .iter()
+            .flatten()
+            .filter_map(|p| p.timers.next_deadline())
+            .min();
+        let timer_wait = async {
+            match next_deadline {
+                Some(at) => Timer::at(at).await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+
+        match select3(ticker.next(), socket.recv_from(&mut dgram_buf), timer_wait).await {
+            Either3::First(()) => {
                 if let Some(ep) = beacon_ep {
                     let beacon = ui_frame(
                         my_call,
@@ -107,7 +126,7 @@ pub async fn task(
                     }
                 }
             }
-            Either::Second(Ok((n, meta))) => {
+            Either3::Second(Ok((n, meta))) => {
                 let rx = axudp::decode_datagram(&dgram_buf[..n]);
                 let Some(frame) = rx.frame else {
                     defmt::warn!(
@@ -149,42 +168,105 @@ pub async fn task(
                         continue;
                     };
                     let peer = frame.source.callsign;
-                    let to_send = run_session(
-                        &mut sessions,
-                        &mut timers,
-                        &mut consoles,
-                        peer,
-                        event,
-                        &console_id,
-                        &prompt,
-                    );
-                    for wire in to_send {
-                        let dgram = axudp::append_fcs(wire);
-                        if let Err(e) = socket.send_to(&dgram, meta.endpoint).await {
-                            defmt::warn!("axudp: session tx error {:?}", e);
-                        }
-                    }
+                    let Some(i) = peer_slot(&mut peers, peer, meta.endpoint) else {
+                        defmt::warn!("axudp: peer table full, dropping session frame");
+                        continue;
+                    };
+                    let ps = peers[i].as_mut().expect("slot just ensured");
+                    ps.endpoint = meta.endpoint; // frames go to the last-heard endpoint
+                    let to_send = run_session(&mut sessions, ps, event, &console_id, &prompt);
+                    send_all(&socket, ps.endpoint, to_send).await;
+                    reap(&mut sessions, &mut peers, i);
                 }
             }
-            Either::Second(Err(e)) => {
+            Either3::Second(Err(e)) => {
                 defmt::warn!("axudp: recv error {:?}", e);
+            }
+            Either3::Third(()) => {
+                // One or more peer timers hit their deadline: post the expiry
+                // events into the owning sessions and flush what they emit.
+                let now = Instant::now();
+                for i in 0..peers.len() {
+                    let Some(ps) = peers[i].as_mut() else {
+                        continue;
+                    };
+                    let expired = ps.timers.take_expired(now);
+                    if expired.is_empty() {
+                        continue;
+                    }
+                    let mut to_send = Vec::new();
+                    for id in expired {
+                        defmt::debug!("axudp: timer expiry ({=u8})", id as u8);
+                        to_send.extend(run_session(
+                            &mut sessions,
+                            ps,
+                            session::expiry_event(id),
+                            &console_id,
+                            &prompt,
+                        ));
+                    }
+                    let ep = ps.endpoint;
+                    send_all(&socket, ep, to_send).await;
+                    reap(&mut sessions, &mut peers, i);
+                }
             }
         }
     }
 }
 
-/// Post one classified event into `peer`'s session and service every DL signal
-/// it raises — the AX.25 console loop. Returns all wire frames to transmit.
+/// Find or create the [`PeerState`] slot for `peer`. Returns its index.
+fn peer_slot(
+    peers: &mut [Option<PeerState>],
+    peer: Callsign,
+    endpoint: IpEndpoint,
+) -> Option<usize> {
+    if let Some(i) = peers
+        .iter()
+        .position(|p| matches!(p, Some(ps) if ps.peer == peer))
+    {
+        return Some(i);
+    }
+    let free = peers.iter().position(|p| p.is_none())?;
+    peers[free] = Some(PeerState {
+        peer,
+        timers: session::EmbassyTimers::new(),
+        endpoint,
+        console: None,
+    });
+    Some(free)
+}
+
+/// Reap a fully-disconnected session (after its upward signals were drained)
+/// and the peer slot with it — capacity reclaimed, timers stopped.
+fn reap(sessions: &mut session::Sessions, peers: &mut [Option<PeerState>], i: usize) {
+    if let Some(ps) = &peers[i] {
+        if sessions.reap(&ps.peer) {
+            peers[i] = None;
+        }
+    }
+}
+
+/// Send each wire frame to `ep` with the AXUDP FCS appended.
+async fn send_all(socket: &UdpSocket<'_>, ep: IpEndpoint, frames: Vec<Vec<u8>>) {
+    for wire in frames {
+        let dgram = axudp::append_fcs(wire);
+        if let Err(e) = socket.send_to(&dgram, ep).await {
+            defmt::warn!("axudp: session tx error {:?}", e);
+        }
+    }
+}
+
+/// Post one event into `ps.peer`'s session and service every DL signal it
+/// raises — the AX.25 console loop. Returns all wire frames to transmit.
 fn run_session(
     sessions: &mut session::Sessions,
-    timers: &mut session::EmbassyTimers,
-    consoles: &mut [Option<ConsolePeer>],
-    peer: Callsign,
+    ps: &mut PeerState,
     event: Event,
     console_id: &Identity,
     prompt: &str,
 ) -> Vec<Vec<u8>> {
-    let mut to_send = sessions.post(peer, event, timers);
+    let peer = ps.peer;
+    let mut to_send = sessions.post(peer, event, &mut ps.timers);
 
     // Service upward signals until quiescent (each console reply posts a
     // DlDataRequest, which can raise further signals; bounded in practice).
@@ -201,22 +283,17 @@ fn run_session(
                         "axudp: AX.25 session up from {=str} — attaching console",
                         call_str(&peer, &mut name)
                     );
-                    if let Some(slot) = consoles.iter_mut().find(|c| c.is_none()) {
-                        *slot = Some(ConsolePeer {
-                            peer,
-                            asm: LineAssembler::default(),
-                        });
-                    }
+                    ps.console = Some(LineAssembler::default());
                     let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
                     to_send.extend(sessions.post(
                         peer,
                         Event::DlDataRequest(PID_NO_LAYER3, banner),
-                        timers,
+                        &mut ps.timers,
                     ));
                 }
                 DataLinkSignal::DataIndication(_pid, info) => {
-                    let lines = match consoles.iter_mut().flatten().find(|c| c.peer == peer) {
-                        Some(c) => c.asm.push(&info),
+                    let lines = match ps.console.as_mut() {
+                        Some(asm) => asm.push(&info),
                         None => Vec::new(),
                     };
                     for line in lines {
@@ -240,11 +317,15 @@ fn run_session(
                             to_send.extend(sessions.post(
                                 peer,
                                 Event::DlDataRequest(PID_NO_LAYER3, reply),
-                                timers,
+                                &mut ps.timers,
                             ));
                         }
                         if disconnect {
-                            to_send.extend(sessions.post(peer, Event::DlDisconnectRequest, timers));
+                            to_send.extend(sessions.post(
+                                peer,
+                                Event::DlDisconnectRequest,
+                                &mut ps.timers,
+                            ));
                         }
                     }
                 }
@@ -254,14 +335,10 @@ fn run_session(
                         "axudp: AX.25 session with {=str} closed",
                         call_str(&peer, &mut name)
                     );
-                    for slot in consoles.iter_mut() {
-                        if matches!(slot, Some(c) if c.peer == peer) {
-                            *slot = None;
-                        }
-                    }
+                    ps.console = None;
                 }
                 DataLinkSignal::ConnectConfirm => {
-                    // Outbound connects (node-to-node) arrive with the supervisor.
+                    // Outbound connects (node-to-node) arrive with the relay work.
                 }
                 DataLinkSignal::UnitDataIndication(..) => {}
                 DataLinkSignal::ErrorIndication(code) => {
