@@ -40,6 +40,8 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 mod config;
 #[cfg(target_os = "none")]
+mod mdns;
+#[cfg(target_os = "none")]
 mod net;
 #[cfg(target_os = "none")]
 mod session;
@@ -72,6 +74,7 @@ mod firmware {
     use embassy_time::{Duration, Instant, Ticker};
 
     use crate::config;
+    use crate::mdns;
     use crate::net;
     use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
@@ -114,7 +117,7 @@ mod firmware {
             &spawner, p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0,
         )
         .await;
-        let stack = net::start_stack(net_device, &spawner).await;
+        let stack = net::start_stack(net_device, &spawner, cfg.hostname).await;
 
         net::join(&mut control, &cfg.wifi).await;
 
@@ -162,6 +165,26 @@ mod firmware {
             stack,
             cfg.kiss_tcp.clone(),
             cfg.identity.callsign,
+        )));
+
+        // --- mDNS: make the node discoverable as <hostname>.local + _telnet._tcp ---
+        // The CYW43 filters RX by hardware address: stack.join_multicast_group
+        // (inside the mdns task) only handles the IGMP side — the chip must ALSO
+        // be told to accept the mDNS group's multicast MAC, or queries never
+        // reach smoltcp. 01:00:5e + the low 23 bits of 224.0.0.251.
+        if control
+            .add_multicast_address([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb])
+            .await
+            .is_err()
+        {
+            defmt::warn!("mdns: CYW43 multicast filter add failed");
+        }
+        spawner.spawn(defmt::unwrap!(mdns::task(
+            stack,
+            mdns::MdnsConfig {
+                hostname: cfg.hostname,
+                telnet_port: cfg.telnet.port,
+            },
         )));
 
         // GATE 6+ returns kiss_serial (needs a NinoTNC) + the session supervisor.

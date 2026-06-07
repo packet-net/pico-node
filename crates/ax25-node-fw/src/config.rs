@@ -20,6 +20,9 @@ use ax25_node_core::ax25::Callsign;
 #[derive(Clone)]
 pub struct NodeConfig {
     pub identity: Identity,
+    /// LAN hostname: the DHCP option-12 name and the mDNS `<hostname>.local`
+    /// label — how the node is found on the WLAN without knowing its IP.
+    pub hostname: &'static str,
     pub wifi: WifiConfig,
     pub axudp: AxudpConfig,
     pub kiss_tcp: KissTcpConfig,
@@ -76,6 +79,7 @@ pub struct TelnetConfig {
 /// (flash sector / network) is the follow-up.
 pub fn load() -> NodeConfig {
     NodeConfig {
+        hostname: "pico-node",
         identity: Identity {
             callsign: Callsign::parse("M0LTE-1").expect("valid default callsign"),
             alias: "PICO",
