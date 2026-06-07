@@ -65,6 +65,7 @@ mod firmware {
     use defmt_rtt as _; // global defmt logger over RTT
     use panic_probe as _; // panic => defmt message + halt, seen over RTT
 
+    use alloc::string::String;
     use core::mem::MaybeUninit;
 
     use embassy_executor::Spawner;
@@ -135,7 +136,27 @@ mod firmware {
             cfg.identity.callsign,
         )));
 
-        // GATE 4+ returns the telnet/kiss transports + the session supervisor here.
+        // --- GATE 4 (HW-BRINGUP.md §4): telnet console (capability 4) ---
+        let call_text = core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?");
+        let console_id = ax25_node_core::console::service::Identity {
+            node_name: String::from(cfg.identity.alias),
+            callsign: String::from(call_text),
+            grid: Some(String::from(cfg.identity.grid)),
+            ports: alloc::vec![alloc::format!(
+                "axudp [up] udp/0.0.0.0:{}",
+                cfg.axudp.listen_port
+            )],
+        };
+        let mut prompt = String::from(call_text);
+        prompt.push_str("} ");
+        spawner.spawn(defmt::unwrap!(transports::telnet::task(
+            stack,
+            cfg.telnet.clone(),
+            console_id,
+            prompt,
+        )));
+
+        // GATE 5+ returns the KISS transports + the session supervisor here.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {

@@ -6,9 +6,9 @@
 //! [`crate::session`] layer.
 
 pub mod axudp;
-// GATE 4–6 (HW-BRINGUP.md §4): the remaining transports return gate by gate —
-// telnet (Gate 4), kiss_tcp (Gate 5), kiss_serial (Gate 6; its UART generics
-// also don't compile against embassy-rp 0.10 yet).
+pub mod telnet;
+// GATE 5–6 (HW-BRINGUP.md §4): the KISS transports return gate by gate —
+// kiss_tcp (Gate 5), kiss_serial (Gate 6; its UART generics also don't compile
+// against embassy-rp 0.10 yet).
 // pub mod kiss_serial;
 // pub mod kiss_tcp;
-// pub mod telnet;
