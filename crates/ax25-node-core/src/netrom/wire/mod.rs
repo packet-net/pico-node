@@ -39,7 +39,7 @@ pub use nodes_broadcast_builder::{
 pub use options::NetRomParseOptions;
 pub use packet::{NetRomPacket, MAX_PAYLOAD, PACKET_HEADER_LEN};
 pub use transport_header::{
-    NetRomOpcode, NetRomTransportHeader, FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK, FLAGS_MASK,
+    NetRomOpcode, NetRomTransportHeader, FLAGS_MASK, FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK,
     OPCODE_MASK, TRANSPORT_HEADER_LEN,
 };
 

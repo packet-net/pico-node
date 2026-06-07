@@ -200,7 +200,11 @@ impl CircuitManager {
     /// Connect Acknowledge.
     pub fn accept(&mut self, incoming: &IncomingCircuit) {
         if let Some(c) = self.circuit_mut(incoming.key) {
-            c.accept_inbound(incoming.peer_index, incoming.peer_id, incoming.proposed_window);
+            c.accept_inbound(
+                incoming.peer_index,
+                incoming.peer_id,
+                incoming.proposed_window,
+            );
         }
     }
 
@@ -317,7 +321,8 @@ impl CircuitManager {
         self.outbox.append(&mut new_out);
         self.events.append(&mut new_events);
         if !closed.is_empty() {
-            self.circuits.retain(|m| !closed.contains(&key_of(&m.circuit)));
+            self.circuits
+                .retain(|m| !closed.contains(&key_of(&m.circuit)));
         }
     }
 }
@@ -416,7 +421,10 @@ mod tests {
         }
 
         fn new() -> Self {
-            Self::with_options(NetRomCircuitOptions::default(), NetRomCircuitOptions::default())
+            Self::with_options(
+                NetRomCircuitOptions::default(),
+                NetRomCircuitOptions::default(),
+            )
         }
 
         /// One options object applied to both ends — the TS single-arg form
@@ -438,7 +446,10 @@ mod tests {
 
         fn connect_a(&mut self, key: CircuitKey, originating_user: Callsign) {
             let now = self.now_ms;
-            self.a.circuit_mut(key).unwrap().connect(originating_user, now);
+            self.a
+                .circuit_mut(key)
+                .unwrap()
+                .connect(originating_user, now);
         }
 
         fn send_a(&mut self, key: CircuitKey, data: &[u8]) {
@@ -596,7 +607,10 @@ mod tests {
         h.connect_a(a, user());
         h.pump();
 
-        assert!(h.cap_a(a).connected, "the Connect Acknowledge reached the originator");
+        assert!(
+            h.cap_a(a).connected,
+            "the Connect Acknowledge reached the originator"
+        );
         assert_eq!(h.a.circuit_state(a), Some(State::Connected));
         assert_eq!(h.accepted_b.len(), 1);
         let b = h.accepted(0);
@@ -607,8 +621,14 @@ mod tests {
     #[test]
     fn window_is_negotiated_down_to_the_responders_ceiling() {
         let mut h = Harness::with_options(
-            NetRomCircuitOptions { window_size: 8, ..Default::default() },
-            NetRomCircuitOptions { window_size: 2, ..Default::default() },
+            NetRomCircuitOptions {
+                window_size: 8,
+                ..Default::default()
+            },
+            NetRomCircuitOptions {
+                window_size: 2,
+                ..Default::default()
+            },
         );
         h.auto_accept_on_b();
         let a = h.open_from_a();
@@ -641,7 +661,10 @@ mod tests {
 
     #[test]
     fn a_multi_frame_burst_delivers_in_order_within_the_window() {
-        let mut h = Harness::with_both(NetRomCircuitOptions { window_size: 4, ..Default::default() });
+        let mut h = Harness::with_both(NetRomCircuitOptions {
+            window_size: 4,
+            ..Default::default()
+        });
         h.auto_accept_on_b();
         let a = h.open_from_a();
         h.connect_a(a, user());
@@ -659,7 +682,10 @@ mod tests {
 
     #[test]
     fn a_large_payload_fragments_and_reassembles_at_236_bytes() {
-        let mut h = Harness::with_both(NetRomCircuitOptions { window_size: 8, ..Default::default() });
+        let mut h = Harness::with_both(NetRomCircuitOptions {
+            window_size: 8,
+            ..Default::default()
+        });
         h.auto_accept_on_b();
         let a = h.open_from_a();
         h.connect_a(a, user());
@@ -686,9 +712,17 @@ mod tests {
         h.disconnect_a(a);
         h.pump();
 
-        assert_eq!(h.a.circuit_state(a), None, "A's circuit was deregistered on close");
+        assert_eq!(
+            h.a.circuit_state(a),
+            None,
+            "A's circuit was deregistered on close"
+        );
         assert_eq!(h.cap_a(a).closed, alloc::vec![Reason::Normal]);
-        assert_eq!(h.b.circuit_state(b), None, "B's circuit was deregistered on close");
+        assert_eq!(
+            h.b.circuit_state(b),
+            None,
+            "B's circuit was deregistered on close"
+        );
         assert!(h.cap_b(b).closed.contains(&Reason::Normal));
     }
 
@@ -743,7 +777,10 @@ mod tests {
         assert!(!h.cap_a(a).connected);
 
         h.advance(6000); // retransmit the connect
-        assert!(h.cap_a(a).connected, "the retransmitted Connect Request was acknowledged");
+        assert!(
+            h.cap_a(a).connected,
+            "the retransmitted Connect Request was acknowledged"
+        );
         assert_eq!(h.accepted_b.len(), 1);
     }
 
@@ -812,12 +849,20 @@ mod tests {
 
         h.send_a(a, b"two");
         h.pump();
-        assert_eq!(h.cap_b(b).received.len(), 1, "A is choked, so the second frame is held");
+        assert_eq!(
+            h.cap_b(b).received.len(),
+            1,
+            "A is choked, so the second frame is held"
+        );
 
         h.drain_b(b);
         h.pump();
         let received = h.cap_b(b).received;
-        assert_eq!(received.len(), 2, "the held frame went out once choke was released");
+        assert_eq!(
+            received.len(),
+            2,
+            "the held frame went out once choke was released"
+        );
         assert_eq!(received[1], b"two");
 
         h.drain_b(b); // drain "two" → release the re-choke
@@ -875,11 +920,22 @@ mod tests {
         h.connect_a(a, user());
         h.pump();
         assert!(!h.cap_a(a).connected, "the connect-ack was dropped");
-        assert_eq!(h.b.circuit_count(), 1, "B minted exactly one inbound circuit");
+        assert_eq!(
+            h.b.circuit_count(),
+            1,
+            "B minted exactly one inbound circuit"
+        );
 
         h.advance(6000); // A retransmits the Connect Request
-        assert!(h.cap_a(a).connected, "the re-ack from the deduped circuit completes the connect");
-        assert_eq!(h.b.circuit_count(), 1, "the retransmit re-acked the existing circuit");
+        assert!(
+            h.cap_a(a).connected,
+            "the re-ack from the deduped circuit completes the connect"
+        );
+        assert_eq!(
+            h.b.circuit_count(),
+            1,
+            "the retransmit re-acked the existing circuit"
+        );
         assert_eq!(h.accepted_b.len(), 1, "IncomingCircuit fired exactly once");
     }
 
@@ -892,7 +948,11 @@ mod tests {
 
         assert!(!h.cap_a(a).connected);
         assert_eq!(h.cap_a(a).closed, alloc::vec![Reason::Refused]);
-        assert_eq!(h.b.circuit_count(), 0, "the refused inbound circuit was deregistered");
+        assert_eq!(
+            h.b.circuit_count(),
+            0,
+            "the refused inbound circuit was deregistered"
+        );
     }
 
     #[test]
@@ -915,7 +975,11 @@ mod tests {
             payload: alloc::vec![1, 2, 3],
         };
         manager.on_packet(&as_packet(&stray), SEED_MS);
-        assert_eq!(manager.take_outbox().len(), 0, "a stray Information datagram is silently dropped");
+        assert_eq!(
+            manager.take_outbox().len(),
+            0,
+            "a stray Information datagram is silently dropped"
+        );
     }
 
     #[test]

@@ -113,7 +113,11 @@ impl NetRomOriginator {
     /// single header-only frame (7 octets: `0xFF` + 6-octet alias) is still
     /// produced — the node announcing itself. Mirrors the C#
     /// `NetRomService.BroadcastNodes`.
-    pub fn broadcast_nodes<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>(
+    pub fn broadcast_nodes<
+        const MAX_DESTS: usize,
+        const MAX_ROUTES: usize,
+        const MAX_NBRS: usize,
+    >(
         &self,
         table: &NetRomRoutingTable<MAX_DESTS, MAX_ROUTES, MAX_NBRS>,
     ) -> Vec<Vec<u8>> {
@@ -229,7 +233,10 @@ mod tests {
             ..Default::default()
         });
         assert!(!orig.enabled());
-        assert!(orig.broadcast_nodes(&table).is_empty(), "disabled ⇒ no frames");
+        assert!(
+            orig.broadcast_nodes(&table).is_empty(),
+            "disabled ⇒ no frames"
+        );
     }
 
     #[test]
@@ -258,7 +265,10 @@ mod tests {
             .entries()
             .find(|e| e.destination == call("GB7SOT"))
             .expect("SOT advertised");
-        assert!(sot.best_quality < 255, "advertised at A's combined (decayed) quality");
+        assert!(
+            sot.best_quality < 255,
+            "advertised at A's combined (decayed) quality"
+        );
         assert!(sot.best_quality > 0);
         assert_eq!(sot.best_neighbour, call("GB7HUB"));
     }
@@ -269,7 +279,11 @@ mod tests {
         let frames = enabled_originator("AAANOD").broadcast_nodes(&table);
 
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].len(), HEADER_LEN, "0xFF + 6-byte alias, no entries");
+        assert_eq!(
+            frames[0].len(),
+            HEADER_LEN,
+            "0xFF + 6-byte alias, no entries"
+        );
         let parsed = NodesBroadcast::try_parse(&frames[0]).unwrap();
         assert_eq!(parsed.sender_alias(), Alias::from_str_lossy("AAANOD"));
         assert_eq!(parsed.entry_count(), 0);
@@ -288,7 +302,13 @@ mod tests {
             specs.push(entry(dest, "N", "GB7HUB", 250 - i));
         }
         for chunk in specs.chunks(NodesBroadcast::MAX_ENTRIES_PER_FRAME) {
-            table.ingest(call("GB7HUB"), call("GB7AAA"), port(), &broadcast("HUB", chunk), NOW);
+            table.ingest(
+                call("GB7HUB"),
+                call("GB7AAA"),
+                port(),
+                &broadcast("HUB", chunk),
+                NOW,
+            );
         }
 
         let frames = enabled_originator("AAANOD").broadcast_nodes(&table);
@@ -320,7 +340,10 @@ mod tests {
             NOW,
         );
 
-        assert!(advertises(&orig.broadcast_nodes(&table), &call("GB7SOT")), "fresh: obs 6 ≥ 4");
+        assert!(
+            advertises(&orig.broadcast_nodes(&table), &call("GB7SOT")),
+            "fresh: obs 6 ≥ 4"
+        );
         table.sweep(); // 6 → 5
         table.sweep(); // 5 → 4 (still ≥ 4)
         assert!(advertises(&orig.broadcast_nodes(&table), &call("GB7SOT")));

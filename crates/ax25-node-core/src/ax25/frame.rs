@@ -131,8 +131,8 @@ impl Frame {
             if bytes.len() < offset + ADDRESS_LEN {
                 return Err(ParseError::BadAddressField);
             }
-            let digi =
-                Address::decode(&bytes[offset..offset + ADDRESS_LEN]).ok_or(ParseError::BadAddress)?;
+            let digi = Address::decode(&bytes[offset..offset + ADDRESS_LEN])
+                .ok_or(ParseError::BadAddress)?;
             last_ext = digi.extension;
             digipeaters.push(digi);
             offset += ADDRESS_LEN;
@@ -180,10 +180,7 @@ impl Frame {
 
     /// Number of bytes [`Frame::encode_into`] will write.
     pub fn encoded_len(&self) -> usize {
-        ADDRESS_LEN * (2 + self.digipeaters.len())
-            + 1
-            + self.pid.map_or(0, |_| 1)
-            + self.info.len()
+        ADDRESS_LEN * (2 + self.digipeaters.len()) + 1 + self.pid.map_or(0, |_| 1) + self.info.len()
     }
 
     /// Encode this frame (KISS body form) into `dst`. Returns bytes written, or

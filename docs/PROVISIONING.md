@@ -106,3 +106,14 @@ migrations.
 
 Steps 1–2 deliver most of the practical value (no more compile-time config)
 and de-risk 3–5, which are UX.
+
+## Status (2026-06-07)
+
+- **Steps 1–2 DONE** (PR #21): flash config store + console SHOW/SET/SAVE/REBOOT.
+- **Step 3 DONE** (this PR): the mode machine + AP mode + DHCP server. Boot tries
+  STA when WiFi is configured (bounded, 3 attempts) and falls back to the config
+  AP otherwise; AP SSID is `pico-<callsign>`, WPA2 with the `ap_passphrase`
+  default, gateway 192.168.4.1, DHCP pool 192.168.4.10+. Verified on hardware:
+  a laptop associated to `pico-M9YYY-9` and received `192.168.4.10` from the
+  node's DHCP server.
+- **Step 4 NEXT**: the DNS catch-all + HTTP config form (the captive-portal pop).

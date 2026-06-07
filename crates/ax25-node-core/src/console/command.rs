@@ -178,7 +178,9 @@ fn parse_set(rest: &str) -> Command {
 
 // An input verb matches a canonical verb if it's a non-empty case-folded prefix.
 fn matches_prefix(upper_verb: &[u8], canonical: &[u8]) -> bool {
-    !upper_verb.is_empty() && upper_verb.len() <= canonical.len() && canonical.starts_with(upper_verb)
+    !upper_verb.is_empty()
+        && upper_verb.len() <= canonical.len()
+        && canonical.starts_with(upper_verb)
 }
 
 // Trim leading/trailing control + whitespace; keep the interior intact.
@@ -252,7 +254,10 @@ mod tests {
     fn parse_bytes_is_total_on_garbage() {
         // Invalid UTF-8 + control bytes: must not panic, must classify.
         assert_eq!(parse_bytes(&[0xFF, 0xFE, 0x00]), Command::Empty);
-        assert_eq!(parse_bytes(b"C M0LTE\xFF\xFE"), Command::Connect(Callsign::parse("M0LTE").unwrap()));
+        assert_eq!(
+            parse_bytes(b"C M0LTE\xFF\xFE"),
+            Command::Connect(Callsign::parse("M0LTE").unwrap())
+        );
     }
 
     #[test]

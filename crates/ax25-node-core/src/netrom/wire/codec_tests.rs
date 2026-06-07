@@ -22,7 +22,13 @@ const OPCODES: [NetRomOpcode; 6] = [
 #[test]
 fn transport_header_round_trips_each_opcode_and_flags() {
     for op in OPCODES {
-        for flags in [0u8, FLAG_CHOKE, FLAG_NAK, FLAG_MORE_FOLLOWS, FLAG_CHOKE | FLAG_NAK] {
+        for flags in [
+            0u8,
+            FLAG_CHOKE,
+            FLAG_NAK,
+            FLAG_MORE_FOLLOWS,
+            FLAG_CHOKE | FLAG_NAK,
+        ] {
             let h = NetRomTransportHeader {
                 circuit_index: 7,
                 circuit_id: 9,
@@ -194,6 +200,12 @@ fn nodes_frame_chunks_at_eleven_entries() {
     let mut buf = [0u8; MAX_NODES_FRAME_LEN];
     let n = write_nodes_frame(&sender, &many, &mut buf).unwrap();
     let max = NodesBroadcast::MAX_ENTRIES_PER_FRAME;
-    assert_eq!(n, 1 + ALIAS_LENGTH + max * NodesRoutingEntry::ENCODED_LENGTH);
-    assert_eq!(NodesBroadcast::try_parse(&buf[..n]).unwrap().entry_count(), max);
+    assert_eq!(
+        n,
+        1 + ALIAS_LENGTH + max * NodesRoutingEntry::ENCODED_LENGTH
+    );
+    assert_eq!(
+        NodesBroadcast::try_parse(&buf[..n]).unwrap().entry_count(),
+        max
+    );
 }

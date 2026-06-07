@@ -121,7 +121,7 @@ mod tests {
         let mut buf = [0u8; ADDRESS_LEN];
         a.encode(&mut buf).unwrap();
         assert_eq!(buf[0], b'A' << 1); // 0x82
-        // Positions 1..6 are space-padded => 0x40.
+                                       // Positions 1..6 are space-padded => 0x40.
         assert_eq!(buf[1], b' ' << 1);
     }
 
@@ -172,7 +172,14 @@ mod tests {
         a.encode(&mut buf).unwrap();
         assert_eq!(
             &buf[..6],
-            &[b'M' << 1, b'0' << 1, b'L' << 1, b'T' << 1, b'E' << 1, b' ' << 1]
+            &[
+                b'M' << 1,
+                b'0' << 1,
+                b'L' << 1,
+                b'T' << 1,
+                b'E' << 1,
+                b' ' << 1
+            ]
         );
         // SSID octet: 0x60 | (0<<1) | 0x80 (crh) | 0 (ext clear) = 0xE0.
         assert_eq!(buf[6], 0xE0);
