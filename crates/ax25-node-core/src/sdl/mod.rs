@@ -51,10 +51,10 @@ pub mod timer;
 pub mod tx;
 
 pub use bridge::{classify_incoming, WireSink};
-pub use manager::{SessionManager, Slot};
 pub use context::{Payload, SessionContext};
 pub use event::{Event, FrameInfo};
 pub use loop_exec::{run_loop, MAX_ITERATIONS};
+pub use manager::{SessionManager, Slot};
 pub use quirks::Quirks;
 pub use session::{Session, State};
 pub use signal::{

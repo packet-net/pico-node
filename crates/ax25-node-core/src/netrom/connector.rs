@@ -312,7 +312,14 @@ impl NetRomConnector {
         packet: &NetRomPacket,
         received_from: Callsign,
     ) {
-        let decision = decide_forward(packet, &received_from, &self.node_call, routing, self.max_ttl, self.forward_mode);
+        let decision = decide_forward(
+            packet,
+            &received_from,
+            &self.node_call,
+            routing,
+            self.max_ttl,
+            self.forward_mode,
+        );
         let Some(neighbour) = decision.next_hop else {
             return; // dropped — TTL expired, looped back, or no onward route
         };
@@ -474,11 +481,22 @@ mod tests {
     }
 
     /// Seed a table the way real ingest would: `originator` advertised `entry`.
-    fn seed(table: &mut Table, originator: Callsign, my_call: Callsign, entry: NodesAdvertisementEntry) {
+    fn seed(
+        table: &mut Table,
+        originator: Callsign,
+        my_call: Callsign,
+        entry: NodesAdvertisementEntry,
+    ) {
         let mut buf = [0u8; MAX_NODES_FRAME_LEN];
         let n = write_nodes_frame(&Alias::from_str_lossy("BNODE"), &[entry], &mut buf).unwrap();
         let broadcast = NodesBroadcast::try_parse(&buf[..n]).unwrap();
-        table.ingest(originator, my_call, PortId::from_str_lossy("p1"), &broadcast, NOW);
+        table.ingest(
+            originator,
+            my_call,
+            PortId::from_str_lossy("p1"),
+            &broadcast,
+            NOW,
+        );
     }
 
     /// Node A's table: a route to END via neighbour B (so `connect ENDND` resolves to
@@ -552,7 +570,11 @@ mod tests {
         }
 
         /// Dial `connect <target>` from A and pump to quiescence.
-        fn connect_a(&mut self, target: &str, user: Callsign) -> Result<NetRomConnection, NetRomNoRoute> {
+        fn connect_a(
+            &mut self,
+            target: &str,
+            user: Callsign,
+        ) -> Result<NetRomConnection, NetRomNoRoute> {
             let now = self.now;
             let result = self.a.connect(&self.table_a, target, user, now);
             self.pump();
@@ -617,7 +639,9 @@ mod tests {
                     if self.echo_on_b {
                         let mut ack = b"ack:".to_vec();
                         ack.extend_from_slice(data);
-                        if let Some(conn) = self.b_connections.iter().find(|c| c.key == key).copied() {
+                        if let Some(conn) =
+                            self.b_connections.iter().find(|c| c.key == key).copied()
+                        {
                             self.b.write(&self.table_b, &conn, &ack, now);
                         }
                     }
@@ -628,11 +652,13 @@ mod tests {
 
             // Deliver the interlink datagrams each way (from = the sender's node call).
             for send in self.a.take_interlink_sends() {
-                self.b.on_interlink_data(&self.table_b, a_node(), &send.datagram, now);
+                self.b
+                    .on_interlink_data(&self.table_b, a_node(), &send.datagram, now);
                 progressed = true;
             }
             for send in self.b.take_interlink_sends() {
-                self.a.on_interlink_data(&self.table_a, b_node(), &send.datagram, now);
+                self.a
+                    .on_interlink_data(&self.table_a, b_node(), &send.datagram, now);
                 progressed = true;
             }
 
@@ -657,7 +683,10 @@ mod tests {
 
     #[test]
     fn routes_connect_alias_across_a_circuit_round_trips_data_and_tears_down() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
 
         let conn = h
@@ -666,14 +695,20 @@ mod tests {
 
         // 1. The interlink to B is up, the L4 circuit Connected, peer is END.
         assert!(h.a.interlink_neighbours().contains(&b_node()));
-        assert_eq!(h.a.circuit_state(conn.key), Some(NetRomCircuitState::Connected));
+        assert_eq!(
+            h.a.circuit_state(conn.key),
+            Some(NetRomCircuitState::Connected)
+        );
         assert_eq!(conn.peer, end_node());
         assert_eq!(h.a.circuit_count(), 1);
 
         // 2. B holds the accepted, Connected circuit.
         assert_eq!(h.b_connections.len(), 1);
         let b_conn = h.b_connections[0];
-        assert_eq!(h.b.circuit_state(b_conn.key), Some(NetRomCircuitState::Connected));
+        assert_eq!(
+            h.b.circuit_state(b_conn.key),
+            Some(NetRomCircuitState::Connected)
+        );
         assert_eq!(b_conn.peer, a_node(), "B's circuit remote is the dialler A");
 
         // 3. B's banner reached A.
@@ -681,46 +716,77 @@ mod tests {
 
         // 4. A line A sends reaches B's console and the ack relays back.
         h.write_a(&conn, b"hello-over-circuit\r");
-        assert!(h.a_cap(conn.key).received_text().contains("ack:hello-over-circuit"));
+        assert!(h
+            .a_cap(conn.key)
+            .received_text()
+            .contains("ack:hello-over-circuit"));
 
         // 5. Disconnect tears down the circuit on both ends.
         h.disconnect_a(&conn);
         assert!(h.a.connection_closed(&conn));
         assert_eq!(h.a.circuit_count(), 0);
-        assert_eq!(h.b.circuit_count(), 0, "the manager deregisters a closed circuit");
+        assert_eq!(
+            h.b.circuit_count(),
+            0,
+            "the manager deregisters a closed circuit"
+        );
         assert_eq!(h.a.circuit_state(conn.key), None);
     }
 
     #[test]
     fn opens_the_interlink_once_and_reuses_it_for_a_second_circuit() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
 
         let c1 = h.connect_a("ENDND", a_node()).unwrap();
         let neighbours_after_first: Vec<Callsign> = h.a.interlink_neighbours().to_vec();
         let c2 = h.connect_a("ENDND", a_node()).unwrap();
 
-        assert_eq!(h.a.circuit_state(c1.key), Some(NetRomCircuitState::Connected));
-        assert_eq!(h.a.circuit_state(c2.key), Some(NetRomCircuitState::Connected));
+        assert_eq!(
+            h.a.circuit_state(c1.key),
+            Some(NetRomCircuitState::Connected)
+        );
+        assert_eq!(
+            h.a.circuit_state(c2.key),
+            Some(NetRomCircuitState::Connected)
+        );
         assert_eq!(neighbours_after_first, alloc::vec![b_node()]);
-        assert_eq!(h.a.interlink_neighbours(), &[b_node()], "second connect reused the interlink");
+        assert_eq!(
+            h.a.interlink_neighbours(),
+            &[b_node()],
+            "second connect reused the interlink"
+        );
         assert_eq!(h.a.circuit_count(), 2);
         assert_ne!(c1.key, c2.key);
     }
 
     #[test]
     fn resolves_connect_by_the_destination_callsign_as_well_as_its_alias() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
 
-        let conn = h.connect_a("GB7BBB", a_node()).expect("route to the endpoint by callsign");
-        assert_eq!(h.a.circuit_state(conn.key), Some(NetRomCircuitState::Connected));
+        let conn = h
+            .connect_a("GB7BBB", a_node())
+            .expect("route to the endpoint by callsign");
+        assert_eq!(
+            h.a.circuit_state(conn.key),
+            Some(NetRomCircuitState::Connected)
+        );
         assert_eq!(conn.peer, end_node());
     }
 
     #[test]
     fn surfaces_a_no_route_connect_cleanly_so_the_host_can_fall_back() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
 
         let result = h.connect_a("NOWHER", a_node());
         assert!(matches!(result, Err(ref e) if e.target() == "NOWHER"));
@@ -731,7 +797,13 @@ mod tests {
     #[test]
     fn treats_connect_as_a_no_route_miss_when_connect_routing_is_disabled() {
         let table = seeded_table_a();
-        let mut connector = NetRomConnector::new(a_node(), NetRomConnectorOptions { enabled: false, ..Default::default() });
+        let mut connector = NetRomConnector::new(
+            a_node(),
+            NetRomConnectorOptions {
+                enabled: false,
+                ..Default::default()
+            },
+        );
         assert!(!connector.enabled());
         let result = connector.connect(&table, "ENDND", a_node(), NOW);
         assert!(matches!(result, Err(ref e) if e.target() == "ENDND"));
@@ -747,7 +819,10 @@ mod tests {
 
     #[test]
     fn the_connection_wraps_the_circuit_as_a_duplex_stream() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
 
         let conn = h.connect_a("ENDND", a_node()).unwrap();
@@ -763,7 +838,10 @@ mod tests {
 
     #[test]
     fn a_peer_initiated_disconnect_closes_the_connection() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
         let conn = h.connect_a("ENDND", a_node()).unwrap();
         let b_conn = h.b_connections[0];
@@ -777,7 +855,10 @@ mod tests {
 
     #[test]
     fn write_after_dispose_is_a_no_op() {
-        let mut h = ConnectHarness::create(NetRomConnectorOptions { enabled: true, ..Default::default() });
+        let mut h = ConnectHarness::create(NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        });
         h.echo_console_on_b();
         let conn = h.connect_a("ENDND", a_node()).unwrap();
 
@@ -800,7 +881,13 @@ mod tests {
         let mut buf = [0u8; MAX_NODES_FRAME_LEN];
         let n = write_nodes_frame(&Alias::from_str_lossy("N"), &[], &mut buf).unwrap();
         let broadcast = NodesBroadcast::try_parse(&buf[..n]).unwrap();
-        table.ingest(originator, my_call, PortId::from_str_lossy("p1"), &broadcast, NOW);
+        table.ingest(
+            originator,
+            my_call,
+            PortId::from_str_lossy("p1"),
+            &broadcast,
+            NOW,
+        );
     }
 
     /// Drive the in-process interlinks between three connectors (A, B, C) until
@@ -924,19 +1011,38 @@ mod tests {
         seed_neighbour(&mut table_b, a_node(), b_node());
         seed_neighbour(&mut table_b, c_node(), b_node());
 
-        let conn = a.connect(&table_a, "CCC", a_node(), NOW).expect("A routes to C via B");
+        let conn = a
+            .connect(&table_a, "CCC", a_node(), NOW)
+            .expect("A routes to C via B");
 
         let mut c_conns: Vec<NetRomConnection> = Vec::new();
         let mut a_received: Vec<Vec<u8>> = Vec::new();
         let banner = b"c-prompt";
-        pump3(&mut a, &table_a, &mut b, &table_b, &mut c, &table_c, &mut c_conns, &mut a_received, banner);
+        pump3(
+            &mut a,
+            &table_a,
+            &mut b,
+            &table_b,
+            &mut c,
+            &table_c,
+            &mut c_conns,
+            &mut a_received,
+            banner,
+        );
 
         // The circuit established end-to-end, transiting B.
-        assert_eq!(a.circuit_state(conn.key), Some(NetRomCircuitState::Connected));
+        assert_eq!(
+            a.circuit_state(conn.key),
+            Some(NetRomCircuitState::Connected)
+        );
         assert_eq!(conn.peer, c_node());
         assert_eq!(c.circuit_count(), 1, "C terminated the circuit");
         assert_eq!(c_conns.len(), 1);
-        assert_eq!(c_conns[0].peer, a_node(), "C's inbound circuit is from the dialler A");
+        assert_eq!(
+            c_conns[0].peer,
+            a_node(),
+            "C's inbound circuit is from the dialler A"
+        );
         assert_eq!(
             b.circuit_count(),
             0,
@@ -952,13 +1058,27 @@ mod tests {
 
         // A→C→A round-trip: A sends a line, C echoes `ack:`, it returns through B.
         a.write(&table_a, &conn, b"hi-transit", NOW);
-        pump3(&mut a, &table_a, &mut b, &table_b, &mut c, &table_c, &mut c_conns, &mut a_received, banner);
+        pump3(
+            &mut a,
+            &table_a,
+            &mut b,
+            &table_b,
+            &mut c,
+            &table_c,
+            &mut c_conns,
+            &mut a_received,
+            banner,
+        );
         let a_text: Vec<u8> = a_received.iter().flatten().copied().collect();
         let want = b"ack:hi-transit";
         assert!(
             a_text.windows(want.len()).any(|w| w == want),
             "the line A sent transited to C and the ack relayed back through B"
         );
-        assert_eq!(b.circuit_count(), 0, "B is still pure transit after the data exchange");
+        assert_eq!(
+            b.circuit_count(),
+            0,
+            "B is still pure transit after the data exchange"
+        );
     }
 }

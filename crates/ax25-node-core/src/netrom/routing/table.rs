@@ -44,8 +44,8 @@ use super::model::{NetRomDestination, NetRomNeighbour, NetRomRoute};
 use super::options::NetRomRoutingOptions;
 use super::quality;
 use crate::netrom::wire::{Alias, NodesAdvertisementEntry, NodesBroadcast};
-use alloc::vec::Vec;
 use crate::netrom::PortId;
+use alloc::vec::Vec;
 
 /// One kept route inside a destination's route set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,7 +373,10 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
     /// (quality, then neighbour callsign) the table uses for forwarding: the
     /// freshest route is what keys the OBSMIN decision, so advertisement tie-breaks
     /// on obsolescence, not neighbour.
-    pub fn build_advertisement(&self, obsolete_minimum: Option<u8>) -> Vec<NodesAdvertisementEntry> {
+    pub fn build_advertisement(
+        &self,
+        obsolete_minimum: Option<u8>,
+    ) -> Vec<NodesAdvertisementEntry> {
         let obsmin = obsolete_minimum.unwrap_or(self.options.obsolete_minimum);
         let mut entries: Vec<NodesAdvertisementEntry> = Vec::new();
 
@@ -470,7 +473,12 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
     /// by quality, and `flow_hash` picks one. A circuit's datagrams (constant flow
     /// hash) pin to one route while distinct circuits spread ∝ quality. `None` if no
     /// route is usable. The transit-forwarding load-balancing selector.
-    pub fn select_route_excluding(&self, dest: &Callsign, exclude: &Callsign, flow_hash: u32) -> Option<Callsign> {
+    pub fn select_route_excluding(
+        &self,
+        dest: &Callsign,
+        exclude: &Callsign,
+        flow_hash: u32,
+    ) -> Option<Callsign> {
         let mut total: u32 = 0;
         self.for_each_route(dest, |route| {
             if route.neighbour != *exclude && route.quality > 0 {

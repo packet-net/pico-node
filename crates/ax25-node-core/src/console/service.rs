@@ -154,10 +154,7 @@ pub fn dispatch(cmd: &Command, id: &Identity, kind: TransportKind) -> Response {
                 outcome: DispatchOutcome::ConnectThenRelay(*call),
             }
         }
-        Command::MalformedConnect => line(
-            "Connect needs a valid callsign, e.g. C M0LTE-1",
-            kind,
-        ),
+        Command::MalformedConnect => line("Connect needs a valid callsign, e.g. C M0LTE-1", kind),
         Command::ShowConfig => config_op(ConfigOp::Show),
         Command::Set { key, value } => config_op(ConfigOp::Set {
             key: key.clone(),

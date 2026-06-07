@@ -41,7 +41,12 @@ pub trait NetRomRoutingView {
     /// (neighbour ≠ `exclude`, quality &gt; 0): `flow_hash` deterministically selects
     /// one, weighted by route quality, so a circuit's datagrams pin to one route while
     /// distinct circuits spread across the kept routes. `None` if none is usable.
-    fn select_route_excluding(&self, dest: &Callsign, exclude: &Callsign, flow_hash: u32) -> Option<Callsign>;
+    fn select_route_excluding(
+        &self,
+        dest: &Callsign,
+        exclude: &Callsign,
+        flow_hash: u32,
+    ) -> Option<Callsign>;
 }
 
 impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> NetRomRoutingView
@@ -59,7 +64,12 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> Net
     fn best_route_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
         NetRomRoutingTable::best_route_excluding(self, dest, exclude)
     }
-    fn select_route_excluding(&self, dest: &Callsign, exclude: &Callsign, flow_hash: u32) -> Option<Callsign> {
+    fn select_route_excluding(
+        &self,
+        dest: &Callsign,
+        exclude: &Callsign,
+        flow_hash: u32,
+    ) -> Option<Callsign> {
         NetRomRoutingTable::select_route_excluding(self, dest, exclude, flow_hash)
     }
 }

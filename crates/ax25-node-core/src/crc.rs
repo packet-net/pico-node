@@ -66,7 +66,10 @@ mod tests {
         let r1 = residue(b"M0LTE de G7XYZ test");
         let r2 = residue(b"a completely different payload of another length");
         assert_eq!(r1, r2, "residue must be message-independent");
-        assert_eq!(r1, 0x0F47, "fixed CRC-16/X.25 residue for low-byte-first FCS");
+        assert_eq!(
+            r1, 0x0F47,
+            "fixed CRC-16/X.25 residue for low-byte-first FCS"
+        );
     }
 
     #[test]

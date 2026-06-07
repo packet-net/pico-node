@@ -48,6 +48,8 @@ mod net;
 #[cfg(target_os = "none")]
 mod netrom_store;
 #[cfg(target_os = "none")]
+mod provisioning;
+#[cfg(target_os = "none")]
 mod session;
 #[cfg(target_os = "none")]
 mod transports;
@@ -81,6 +83,7 @@ mod firmware {
     use crate::config_store;
     use crate::mdns;
     use crate::net;
+    use crate::provisioning;
     use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
 
@@ -138,24 +141,46 @@ mod firmware {
             &spawner, p.PIO0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0,
         )
         .await;
-        let stack = net::start_stack(net_device, &spawner, cfg.hostname).await;
+        // --- Mode machine (docs/PROVISIONING.md): STA if WiFi is configured and
+        // joinable, else the config AP. STA join is bounded (not forever) so a
+        // node with no reachable home WiFi falls back to offering its AP. ---
+        let call_text = core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?");
+        let sta_ok = if cfg.wifi.ssid.is_empty() {
+            defmt::info!("mode: no WiFi configured — AP mode");
+            false
+        } else {
+            net::try_join(&mut control, &cfg.wifi, 3).await
+        };
 
-        net::join(&mut control, &cfg.wifi).await;
-
-        defmt::info!("waiting for link + DHCPv4 lease...");
-        stack.wait_link_up().await;
-        stack.wait_config_up().await;
-        if let Some(v4) = stack.config_v4() {
-            defmt::info!("IP address: {}", v4.address);
+        let stack;
+        if sta_ok {
+            // STA mode: DHCP client, re-associate forever if the link drops.
+            stack = net::start_stack(net_device, &spawner, cfg.hostname).await;
+            spawner.spawn(defmt::unwrap!(net::sta_keepalive(control, cfg.wifi.clone())));
+            defmt::info!("waiting for link + DHCPv4 lease...");
+            stack.wait_link_up().await;
+            stack.wait_config_up().await;
+            if let Some(v4) = stack.config_v4() {
+                defmt::info!("IP address: {} (STA mode)", v4.address);
+            }
+        } else {
+            // AP mode: become the gateway, serve DHCP (captive portal = step 4).
+            // SSID is "pico-<callsign>" — unique + meaningful in a WiFi list.
+            let mut ssid_buf = String::from("pico-");
+            ssid_buf.push_str(call_text);
+            net::start_ap(&mut control, &ssid_buf, cfg.wifi.ap_passphrase).await;
+            stack = net::start_stack_static(net_device, &spawner).await;
+            spawner.spawn(defmt::unwrap!(provisioning::dhcp_server(stack)));
+            defmt::info!(
+                "AP mode up: SSID {=str}, gateway 192.168.4.1 (connect to configure)",
+                ssid_buf.as_str()
+            );
+            // Keep the control handle alive for the AP's lifetime.
+            core::mem::forget(control);
         }
-
-        // The Pico W LED hangs off the CYW43 (GPIO 0), not an RP2040 pin — turning
-        // it on here is the visible "radio alive" check (HW-BRINGUP.md §4 Gate 2).
-        control.gpio_set(0, true).await;
 
         // The node console identity + prompt — shared by every console-bearing
         // transport (telnet now, AX.25 sessions on the AXUDP port too).
-        let call_text = core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?");
         let console_id = ax25_node_core::console::service::Identity {
             node_name: String::from(cfg.identity.alias),
             callsign: String::from(call_text),
@@ -196,17 +221,6 @@ mod firmware {
         )));
 
         // --- mDNS: make the node discoverable as <hostname>.local + _telnet._tcp ---
-        // The CYW43 filters RX by hardware address: stack.join_multicast_group
-        // (inside the mdns task) only handles the IGMP side — the chip must ALSO
-        // be told to accept the mDNS group's multicast MAC, or queries never
-        // reach smoltcp. 01:00:5e + the low 23 bits of 224.0.0.251.
-        if control
-            .add_multicast_address([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb])
-            .await
-            .is_err()
-        {
-            defmt::warn!("mdns: CYW43 multicast filter add failed");
-        }
         spawner.spawn(defmt::unwrap!(mdns::task(
             stack,
             mdns::MdnsConfig {

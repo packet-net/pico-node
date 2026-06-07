@@ -42,6 +42,10 @@ pub struct Identity {
 pub struct WifiConfig {
     pub ssid: &'static str,
     pub password: &'static str,
+    /// WPA2 passphrase for the node's own config AP (provisioning fallback —
+    /// docs/PROVISIONING.md). A well-known default for field usability; the AP
+    /// guards configuration, not radio traffic (which is cleartext by law).
+    pub ap_passphrase: &'static str,
 }
 
 /// AXUDP node↔node (capability 1).
@@ -107,6 +111,7 @@ pub fn load() -> NodeConfig {
         wifi: WifiConfig {
             ssid: option_env!("WIFI_SSID").unwrap_or(""),
             password: option_env!("WIFI_PASSWORD").unwrap_or(""),
+            ap_passphrase: option_env!("AP_PASSPHRASE").unwrap_or("pico-node-config"),
         },
         axudp: AxudpConfig {
             listen_port: 10093,
