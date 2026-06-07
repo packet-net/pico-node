@@ -12,12 +12,9 @@
 //! pass the address filter currently stop at a log line; they will post into
 //! [`crate::session::Sessions`] when the supervisor lands (Gate 3 stretch+).
 
-use ax25_node_core::ax25::frame::CONTROL_UI;
-use ax25_node_core::ax25::{Address, Callsign, Frame, PID_NO_LAYER3};
+use ax25_node_core::ax25::Callsign;
 use ax25_node_core::axudp;
 use ax25_node_core::netrom::{ObserveOutcome, PortId};
-
-use alloc::vec::Vec;
 
 use embassy_futures::select::{select, Either};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -26,35 +23,10 @@ use embassy_time::{Duration, Ticker};
 
 use crate::config::AxudpConfig;
 use crate::session;
+use crate::transports::{call_str, parse_endpoint, ui_frame};
 
 /// Seconds between beacon UI frames when a beacon target is configured.
 const BEACON_INTERVAL_SECS: u64 = 10;
-
-/// Render a callsign into a small stack buffer for defmt logging.
-fn call_str<'b>(call: &Callsign, buf: &'b mut [u8; 16]) -> &'b str {
-    let n = call.write_display(buf).unwrap_or(0);
-    core::str::from_utf8(&buf[..n]).unwrap_or("?")
-}
-
-/// Build the Gate-3 beacon: a UI frame `my_call → IDENT`, standard 0xF0 PID.
-fn beacon_frame(my_call: Callsign) -> Frame {
-    Frame {
-        destination: Address {
-            callsign: Callsign::parse("IDENT").expect("static callsign"),
-            crh: true,
-            extension: false,
-        },
-        source: Address {
-            callsign: my_call,
-            crh: false,
-            extension: false,
-        },
-        digipeaters: Vec::new(),
-        control: CONTROL_UI,
-        pid: Some(PID_NO_LAYER3),
-        info: b"pico-node AXUDP beacon (HW-BRINGUP Gate 3)".to_vec(),
-    }
-}
 
 #[embassy_executor::task]
 pub async fn task(stack: Stack<'static>, cfg: AxudpConfig, my_call: Callsign) {
@@ -92,7 +64,12 @@ pub async fn task(stack: Stack<'static>, cfg: AxudpConfig, my_call: Callsign) {
         match select(ticker.next(), socket.recv_from(&mut dgram_buf)).await {
             Either::First(()) => {
                 if let Some(ep) = beacon_ep {
-                    let dgram = axudp::encode_datagram(&beacon_frame(my_call), cfg.include_fcs);
+                    let beacon = ui_frame(
+                        my_call,
+                        "IDENT",
+                        b"pico-node AXUDP beacon (HW-BRINGUP Gate 3)",
+                    );
+                    let dgram = axudp::encode_datagram(&beacon, cfg.include_fcs);
                     match socket.send_to(&dgram, ep).await {
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
@@ -142,13 +119,4 @@ pub async fn task(stack: Stack<'static>, cfg: AxudpConfig, my_call: Callsign) {
             }
         }
     }
-}
-
-/// Parse `"a.b.c.d:port"` into an endpoint (build-env config — host-side LAN
-/// detail, so kept out of committed defaults per HW-BRINGUP §5).
-fn parse_endpoint(s: &str) -> Option<IpEndpoint> {
-    let (ip, port) = s.split_once(':')?;
-    let ip: core::net::Ipv4Addr = ip.parse().ok()?;
-    let port: u16 = port.parse().ok()?;
-    Some(IpEndpoint::new(ip.into(), port))
 }

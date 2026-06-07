@@ -54,8 +54,10 @@ pub struct AxudpConfig {
 /// KISS-over-TCP to net-sim (capability 2).
 #[derive(Clone)]
 pub struct KissTcpConfig {
-    pub host: &'static str,
-    pub port: u16,
+    /// Optional `"a.b.c.d:port"` KISS-TCP endpoint to connect to. From the
+    /// build env (`KISS_TCP_TARGET`) — a LAN detail, never a committed default
+    /// (HW-BRINGUP §5). Absent ⇒ the transport is disabled.
+    pub target: Option<&'static str>,
 }
 
 /// KISS-over-UART to a NinoTNC (capability 3).
@@ -92,8 +94,7 @@ pub fn load() -> NodeConfig {
             beacon_target: option_env!("AXUDP_BEACON_TARGET"),
         },
         kiss_tcp: KissTcpConfig {
-            host: "192.168.1.10",
-            port: 8001,
+            target: option_env!("KISS_TCP_TARGET"),
         },
         kiss_serial: KissSerialConfig { baud: 57600 },
         telnet: TelnetConfig { port: 8023 },

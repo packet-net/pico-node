@@ -28,6 +28,7 @@ use embassy_net::Stack;
 use embassy_time::Duration;
 
 use crate::config::TelnetConfig;
+use crate::transports::tcp_write_all as write_all;
 
 /// Idle timeout for a console connection; a dead peer frees the slot.
 const IDLE_TIMEOUT_SECS: u64 = 300;
@@ -57,21 +58,6 @@ pub async fn task(stack: Stack<'static>, cfg: TelnetConfig, id: Identity, prompt
         socket.abort();
         defmt::info!("telnet: connection closed");
     }
-}
-
-/// Write all of `bytes`, returning `false` on any socket error (caller drops).
-async fn write_all(socket: &mut TcpSocket<'_>, mut bytes: &[u8]) -> bool {
-    while !bytes.is_empty() {
-        match socket.write(bytes).await {
-            Ok(0) => return false,
-            Ok(n) => bytes = &bytes[n..],
-            Err(e) => {
-                defmt::warn!("telnet: write error {:?}", e);
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// One connection's banner + prompt loop. Returns when the peer goes away or a
