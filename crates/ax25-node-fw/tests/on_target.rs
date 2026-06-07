@@ -26,6 +26,16 @@ use embedded_alloc::LlffHeap;
 #[path = "../src/config_store.rs"]
 mod config_store;
 
+// The session module's NetRom alias is what netrom_store operates on; the test
+// builds a NetRomService directly, so a thin shim provides the `session::NetRom`
+// path netrom_store references.
+mod session {
+    pub type NetRom = ax25_node_core::netrom::NetRomService;
+}
+#[allow(dead_code)]
+#[path = "../src/netrom_store.rs"]
+mod netrom_store;
+
 #[global_allocator]
 static HEAP: LlffHeap = LlffHeap::empty();
 
@@ -105,6 +115,61 @@ mod tests {
 
     /// The codec fundamentals execute on the M0+: callsign parse/display, frame
     /// encode/decode round trip, CRC-16/X.25 over a known vector.
+    /// The NET/ROM routing store round-trips on real flash: learn routes from a
+    /// NODES broadcast, save, then load into a fresh service via replay and
+    /// confirm the destinations came back.
+    #[test]
+    fn netrom_store_round_trips_on_flash(p: embassy_rp::Peripherals) {
+        use crate::config_store::FLASH_SIZE;
+        use ax25_node_core::netrom::wire::nodes_broadcast_builder::{
+            write_nodes_frame, NodesAdvertisementEntry, MAX_NODES_FRAME_LEN,
+        };
+        use ax25_node_core::netrom::wire::{Alias, NodesBroadcast};
+        use ax25_node_core::netrom::{NetRomService, PortId};
+
+        let my_call = Callsign::parse("M9YYY-9").unwrap();
+        let neighbour = Callsign::parse("M0LTE-9").unwrap();
+
+        // A service that has heard one NODES broadcast (neighbour advertises one
+        // destination): two destinations result (the neighbour + the advertised).
+        let mut svc = NetRomService::new();
+        let entry = NodesAdvertisementEntry {
+            destination: Callsign::parse("GB7SOT").unwrap(),
+            destination_alias: Alias::from_str_lossy("SOT"),
+            best_neighbour: neighbour,
+            quality: 200,
+        };
+        let mut buf = [0u8; MAX_NODES_FRAME_LEN];
+        let n = write_nodes_frame(&Alias::from_str_lossy("RDGBPQ"), &[entry], &mut buf).unwrap();
+        let bc = NodesBroadcast::try_parse(&buf[..n]).unwrap();
+        svc.ingest_broadcast(
+            neighbour,
+            my_call,
+            PortId::from_str_lossy("axudp"),
+            &bc,
+            1000,
+        );
+        let before = svc.destination_count();
+        assert!(before >= 2);
+
+        let mut flash = embassy_rp::flash::Flash::<_, _, FLASH_SIZE>::new_blocking(p.FLASH);
+        crate::netrom_store::erase(&mut flash).unwrap();
+        let saved = crate::netrom_store::save(&mut flash, &svc, 0).unwrap();
+        assert!(saved >= 1);
+
+        // Replay into a fresh service.
+        let mut restored = NetRomService::new();
+        let (_, replayed) = crate::netrom_store::load(&mut flash, &mut restored, my_call);
+        assert!(replayed >= 1);
+        assert_eq!(restored.destination_count(), before);
+        assert!(restored
+            .table()
+            .destination(&Callsign::parse("GB7SOT").unwrap())
+            .is_some());
+
+        crate::netrom_store::erase(&mut flash).unwrap();
+    }
+
     /// The flash config store round-trips on real flash: encode → save (A/B
     /// generations) → reload picks the newest record, fields intact. Runs on
     /// the reserved sectors, so it exercises the true erase/program path.

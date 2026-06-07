@@ -68,6 +68,8 @@ use crate::transports::{call_str, parse_endpoint, ui_frame};
 
 /// Seconds between beacon UI frames when a beacon target is configured.
 const BEACON_INTERVAL_SECS: u64 = 10;
+/// Seconds between routing-table flash saves (bounds wear; only saves on change).
+const NETROM_SAVE_SECS: u64 = 300;
 
 /// Set by a console REBOOT on the AX.25 path; honoured by [`drive`] after the
 /// response frames have been transmitted (so the farewell reaches the user).
@@ -157,6 +159,18 @@ pub async fn task(
     // equivalent): fed every decoded inbound frame BEFORE address filtering.
     let mut netrom = session::new_netrom();
     let port_id = PortId::from_str_lossy("axudp");
+
+    // Repopulate the routing table from flash (survives power failure — like
+    // BPQ's BPQNODES.dat). Replays persisted routes through the live ingest
+    // path so a rebooted node knows its routes immediately.
+    let replayed = crate::config_store::netrom_load(&mut netrom, my_call);
+    if replayed > 0 {
+        defmt::info!("netrom: {=usize} route(s) restored from flash", replayed);
+    }
+    // Persist the table periodically (NOT per-broadcast — flash wear), and only
+    // when it changed since the last save.
+    let mut next_save_at = Instant::now() + Duration::from_secs(NETROM_SAVE_SECS);
+    let mut last_saved_dests = 0usize;
 
     // NODES origination: our own broadcasts, built from the live routing table
     // (header alias + an entry per advertisable route, OBSMIN-gated) — the node
@@ -256,6 +270,22 @@ pub async fn task(
                     match socket.send_to(&dgram, ep).await {
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
+                    }
+                }
+
+                // Routing-table persistence: save if due AND the table changed.
+                if Instant::now() >= next_save_at {
+                    next_save_at = Instant::now() + Duration::from_secs(NETROM_SAVE_SECS);
+                    let dests = netrom.destination_count();
+                    if dests != last_saved_dests {
+                        match crate::config_store::netrom_save(&netrom) {
+                            Ok(n) if n > 0 => {
+                                defmt::info!("netrom: {=usize} route(s) saved to flash", n);
+                                last_saved_dests = dests;
+                            }
+                            Ok(_) => {}
+                            Err(e) => defmt::warn!("netrom: save failed: {=str}", e),
+                        }
                     }
                 }
 
