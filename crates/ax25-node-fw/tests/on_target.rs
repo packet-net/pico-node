@@ -154,8 +154,19 @@ mod tests {
 
         let mut flash = embassy_rp::flash::Flash::<_, _, FLASH_SIZE>::new_blocking(p.FLASH);
         crate::netrom_store::erase(&mut flash).unwrap();
-        let saved = crate::netrom_store::save(&mut flash, &svc, 0).unwrap();
-        assert!(saved >= 1);
+        let outcome = crate::netrom_store::save(&mut flash, &svc, 0, 0).unwrap();
+        let saved =
+            matches!(outcome, crate::netrom_store::SaveOutcome::Wrote { count, .. } if count >= 1);
+        assert!(saved);
+        // Re-saving the SAME content writes nothing (the wear gate).
+        let crc = match outcome {
+            crate::netrom_store::SaveOutcome::Wrote { content_crc, .. } => content_crc,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            crate::netrom_store::save(&mut flash, &svc, 1, crc).unwrap(),
+            crate::netrom_store::SaveOutcome::Unchanged
+        ));
 
         // Replay into a fresh service.
         let mut restored = NetRomService::new();

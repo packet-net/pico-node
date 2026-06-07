@@ -71,10 +71,22 @@ pub async fn dhcp_server(stack: Stack<'static>) {
 
         let len = build_reply(&mut out, &req, yiaddr, reply_type);
         // Broadcast the reply (the client has no IP yet).
-        let dst = IpEndpoint::new(Ipv4Address::new(255, 255, 255, 255).into(), DHCP_CLIENT_PORT);
+        let dst = IpEndpoint::new(
+            Ipv4Address::new(255, 255, 255, 255).into(),
+            DHCP_CLIENT_PORT,
+        );
         if socket.send_to(&out[..len], dst).await.is_ok() {
-            let mt = if reply_type == DHCPOFFER { "OFFER" } else { "ACK" };
-            defmt::info!("dhcp: {=str} 192.168.4.{=u8} to {=u8:02x}:..", mt, host, req.mac[5]);
+            let mt = if reply_type == DHCPOFFER {
+                "OFFER"
+            } else {
+                "ACK"
+            };
+            defmt::info!(
+                "dhcp: {=str} 192.168.4.{=u8} to {=u8:02x}:..",
+                mt,
+                host,
+                req.mac[5]
+            );
         }
     }
 }
@@ -102,8 +114,8 @@ fn parse(pkt: &[u8]) -> Option<Request> {
     let mut i = 240;
     while i < pkt.len() {
         match pkt[i] {
-            0 => i += 1,    // PAD
-            255 => break,   // END
+            0 => i += 1,  // PAD
+            255 => break, // END
             opt => {
                 let l = *pkt.get(i + 1)? as usize;
                 if opt == 53 && l == 1 {
@@ -121,10 +133,7 @@ fn assign(leases: &mut [Option<Lease>], mac: [u8; 6]) -> u8 {
     if let Some(l) = leases.iter().flatten().find(|l| l.mac == mac) {
         return l.host;
     }
-    let idx = leases
-        .iter()
-        .position(|l| l.is_none())
-        .unwrap_or(0);
+    let idx = leases.iter().position(|l| l.is_none()).unwrap_or(0);
     let host = POOL_BASE + idx as u8;
     leases[idx] = Some(Lease { mac, host });
     host
