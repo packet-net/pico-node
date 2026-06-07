@@ -21,14 +21,28 @@ fn main() {
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // OTA build knobs read via option_env! (src/ota.rs, src/main.rs). Declared
-    // here so changing them actually forces a recompile — without this, cargo
-    // would serve a cached build and silently ignore the new value.
-    println!("cargo:rerun-if-env-changed=OTA_BUILD_TAG");
-    println!("cargo:rerun-if-env-changed=OTA_FORCE_BRICK");
-    // Existing compile-time config knobs (config.rs) — same rationale.
-    println!("cargo:rerun-if-env-changed=NODE_CALLSIGN");
-    println!("cargo:rerun-if-env-changed=MQTT_HOST");
+    // Compile-time config knobs read via option_env! (config.rs, ota.rs,
+    // main.rs). Declared here so changing them forces a recompile — without
+    // this, cargo serves a cached build and silently bakes in STALE values.
+    // This is security-relevant: WIFI_* / NODE_* live in this machine's
+    // ~/.cargo/config.toml [env], so a release build MUST be able to clear them
+    // and have that actually take effect (see scripts/package-ota.sh).
+    for var in [
+        "NODE_CALLSIGN",
+        "NODE_ALIAS",
+        "NODE_GRID",
+        "WIFI_SSID",
+        "WIFI_PASSWORD",
+        "AP_PASSPHRASE",
+        "AXUDP_BEACON_TARGET",
+        "KISS_TCP_TARGET",
+        "NODES_INTERVAL_SECS",
+        "MQTT_HOST",
+        "OTA_BUILD_TAG",
+        "OTA_FORCE_BRICK",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 
     // Gate 7 (HW-BRINGUP.md §4): the embedded-test harness's linker script. The
     // embedded-test crate sits in [dependencies] (not dev-) precisely so its
