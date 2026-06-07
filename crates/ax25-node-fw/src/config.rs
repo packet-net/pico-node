@@ -9,6 +9,11 @@
 //!
 //! STUB — fields + shape only; the persistent loader is a follow-up.
 
+// GATE 1 (HW-BRINGUP.md §4): the wifi/axudp/kiss/telnet fields' only consumers
+// (net.rs + transports) are gated out until Gates 2–6; keep the full config shape
+// without dead-code noise meanwhile. Remove this allow when the transports return.
+#![allow(dead_code)]
+
 use ax25_node_core::ax25::Callsign;
 
 /// Complete node config (mirrors `NodeConfig`).

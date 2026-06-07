@@ -34,12 +34,16 @@
 // `target_os = "none"` (thumbv6m-none-eabi).
 #[cfg(target_os = "none")]
 mod config;
-#[cfg(target_os = "none")]
-mod net;
-#[cfg(target_os = "none")]
-mod session;
-#[cfg(target_os = "none")]
-mod transports;
+// GATE 2+ (HW-BRINGUP.md §4): the CYW43/net bring-up and the four transport socket
+// stubs don't compile against the real cyw43/embassy-net APIs yet — they were
+// deliberately not written blind (no CYW43 emulator). They return module by module
+// as Gates 2–6 land; Gate 1 is the minimal link + flash + defmt-heartbeat binary.
+// #[cfg(target_os = "none")]
+// mod net;
+// #[cfg(target_os = "none")]
+// mod session;
+// #[cfg(target_os = "none")]
+// mod transports;
 
 // The global allocator. `ax25-node-core` uses `alloc` (the session queues, the
 // streaming codecs), so the firmware must install one. `embedded-alloc`'s
@@ -63,22 +67,13 @@ mod firmware {
     use core::mem::MaybeUninit;
 
     use embassy_executor::Spawner;
-    use embassy_rp::bind_interrupts;
-    use embassy_rp::peripherals::PIO0;
-    use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+    use embassy_time::{Duration, Instant, Ticker};
 
     use crate::config;
-    use crate::net as netmod;
-    use crate::session;
-    use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
 
-    bind_interrupts!(struct Irqs {
-        PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    });
-
     #[embassy_executor::main]
-    async fn main(spawner: Spawner) {
+    async fn main(_spawner: Spawner) {
         defmt::info!("pico-node {} starting", ax25_node_core::VERSION);
 
         // Initialise the global heap arena ONCE, before anything allocates. SAFETY:
@@ -91,36 +86,36 @@ mod firmware {
             }
         }
 
-        let p = embassy_rp::init(Default::default());
+        let _p = embassy_rp::init(Default::default());
         let cfg = config::load();
 
-        // --- Bring up the CYW43 WiFi chip over PIO-SPI ---
-        // Firmware + CLM blobs are linked from flash (see docs/PLAN.md for how the
-        // blobs are vendored). cyw43-pio bit-bangs the half-duplex SPI on PIO0.
-        let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
-        let (net_device, mut control) =
-            netmod::init_wifi(common, sm0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.DMA_CH0, &spawner)
-                .await;
+        // GATE 1 (HW-BRINGUP.md §4): minimal first-silicon binary — boot, init
+        // embassy-rp, and heartbeat over defmt/RTT. Proves the whole hands-free
+        // loop: memory.x + flip-link + probe-rs flash + reset + RTT streaming.
+        // The CYW43/net/transport/session spawns return at Gates 2–6.
+        //
+        // The config load + callsign log below is deliberate, not decoration: it
+        // exercises ax25-node-core (Callsign::parse + write_display) on the real M0+.
+        let mut call_buf = [0u8; 16];
+        let call_len = cfg
+            .identity
+            .callsign
+            .write_display(&mut call_buf)
+            .unwrap_or(0);
+        defmt::info!(
+            "node identity: {=str} (alias {=str}, grid {=str})",
+            core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?"),
+            cfg.identity.alias,
+            cfg.identity.grid,
+        );
 
-        // --- Join the AP and start embassy-net (DHCP) ---
-        netmod::join(&mut control, &cfg.wifi).await;
-        let stack = netmod::start_stack(net_device, &spawner, &cfg).await;
-
-        // --- Spawn the transports (each maps to one C# capability) ---
-        // 1. AXUDP node↔node over WiFi.
-        spawner.must_spawn(transports::axudp::task(stack, cfg.axudp.clone()));
-        // 2. KISS-over-TCP to net-sim.
-        spawner.must_spawn(transports::kiss_tcp::task(stack, cfg.kiss_tcp.clone()));
-        // 3. KISS-over-UART to a NinoTNC (UART0 on GP0/GP1 by default).
-        spawner.must_spawn(transports::kiss_serial::task(p.UART0, p.PIN_0, p.PIN_1, cfg.kiss_serial.clone()));
-        // 4. Telnet command console.
-        spawner.must_spawn(transports::telnet::task(stack, cfg.telnet.clone()));
-
-        // The link-layer session layer (the SDL runtime) is driven by the
-        // transports; its timer service runs as its own task.
-        spawner.must_spawn(session::timer_task());
-
-        defmt::info!("pico-node up");
+        // NOTE (HW-BRINGUP.md §4 Gate 1): no LED blinky here — the Pico W LED hangs
+        // off the CYW43, which isn't up until Gate 2. defmt IS the heartbeat.
+        let mut ticker = Ticker::every(Duration::from_secs(1));
+        loop {
+            ticker.next().await;
+            defmt::info!("heartbeat: uptime {=u64} s", Instant::now().as_secs());
+        }
     }
 }
 
