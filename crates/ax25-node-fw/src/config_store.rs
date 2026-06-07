@@ -57,6 +57,7 @@ const TAG_AXUDP_PORT: u8 = 9;
 const TAG_TELNET_PORT: u8 = 10;
 const TAG_NODES_INTERVAL: u8 = 11;
 const TAG_ORIGINATE: u8 = 12;
+const TAG_MQTT_HOST: u8 = 13;
 
 /// The persisted fields. Every field optional: only explicitly-set values are
 /// stored, everything else falls back to the compiled factory defaults.
@@ -74,6 +75,7 @@ pub struct StoredConfig {
     pub telnet_port: Option<u16>,
     pub nodes_interval_secs: Option<u32>,
     pub originate: Option<bool>,
+    pub mqtt_host: Option<heapless::String<32>>,
 }
 
 impl StoredConfig {
@@ -114,6 +116,9 @@ impl StoredConfig {
         }
         if let Some(v) = self.originate {
             put(TAG_ORIGINATE, &[v as u8]);
+        }
+        if let Some(s) = &self.mqtt_host {
+            put(TAG_MQTT_HOST, s.as_bytes());
         }
         at
     }
@@ -157,6 +162,7 @@ impl StoredConfig {
                         Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
                 }
                 TAG_ORIGINATE if len == 1 => out.originate = Some(data[0] != 0),
+                TAG_MQTT_HOST => out.mqtt_host = s(data),
                 _ => {} // unknown/short tag: skip (forward compatibility)
             }
         }
@@ -419,8 +425,12 @@ fn render_show(p: &StoredConfig) -> String {
         None => String::from("  NODES_INTERVAL (default: 300)\n"),
     };
     out += &match p.originate {
-        Some(v) => format!("  ORIGINATE      {v}"),
-        None => String::from("  ORIGINATE      (default: true)"),
+        Some(v) => format!("  ORIGINATE      {v}\n"),
+        None => String::from("  ORIGINATE      (default: true)\n"),
+    };
+    out += &match &p.mqtt_host {
+        Some(v) => format!("  MQTT_HOST      {}", v.as_str()),
+        None => String::from("  MQTT_HOST      (unset)"),
     };
     out
 }
@@ -472,6 +482,7 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
             }
             _ => String::from("not a sane interval (>=10s)"),
         },
+        "MQTT_HOST" => put(&mut p.mqtt_host, value, "MQTT_HOST"),
         "ORIGINATE" => match value {
             "true" | "TRUE" | "1" | "on" | "ON" => {
                 p.originate = Some(true);

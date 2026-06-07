@@ -46,6 +46,8 @@ mod mdns;
 #[cfg(target_os = "none")]
 mod net;
 #[cfg(target_os = "none")]
+mod mqtt;
+#[cfg(target_os = "none")]
 mod netrom_store;
 #[cfg(target_os = "none")]
 mod oled;
@@ -84,6 +86,7 @@ mod firmware {
     use crate::config;
     use crate::config_store;
     use crate::mdns;
+    use crate::mqtt;
     use crate::net;
     use crate::oled;
     use crate::provisioning;
@@ -225,6 +228,20 @@ mod firmware {
                 ticker.next().await;
                 defmt::info!("awaiting callsign configuration (uptime {=u64}s)", Instant::now().as_secs());
             }
+        }
+
+        // --- MQTT telemetry/log sink (optional; observability without a probe).
+        // Self-disables if MQTT_HOST is unset. ---
+        {
+            let mut cs = heapless::String::<12>::new();
+            let _ = core::fmt::Write::write_str(&mut cs, call_text);
+            spawner.spawn(defmt::unwrap!(mqtt::task(
+                stack,
+                mqtt::MqttConfig {
+                    host: cfg.mqtt_host,
+                    callsign: cs,
+                },
+            )));
         }
 
         // The node console identity + prompt — shared by every console-bearing
