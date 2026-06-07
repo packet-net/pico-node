@@ -48,6 +48,8 @@ mod net;
 #[cfg(target_os = "none")]
 mod netrom_store;
 #[cfg(target_os = "none")]
+mod oled;
+#[cfg(target_os = "none")]
 mod provisioning;
 #[cfg(target_os = "none")]
 mod session;
@@ -83,6 +85,7 @@ mod firmware {
     use crate::config_store;
     use crate::mdns;
     use crate::net;
+    use crate::oled;
     use crate::provisioning;
     use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
@@ -185,6 +188,19 @@ mod firmware {
             // Keep the control handle alive for the AP's lifetime.
             core::mem::forget(control);
         }
+
+        // --- OLED status display (NinoBLE Rev5, I2C0 GP4/GP5; optional —
+        // the task self-disables if no SSD1306 ACKs at 0x3C). ---
+        {
+            let mut st = oled::Status {
+                sta: sta_ok,
+                ..Default::default()
+            };
+            let n = call_text.len().min(12);
+            st.callsign[..n].copy_from_slice(&call_text.as_bytes()[..n]);
+            oled::set(st);
+        }
+        spawner.spawn(defmt::unwrap!(oled::task(p.I2C0, p.PIN_4, p.PIN_5, stack)));
 
         // The node console identity + prompt — shared by every console-bearing
         // transport (telnet now, AX.25 sessions on the AXUDP port too).

@@ -281,6 +281,12 @@ pub async fn task(
                     }
                 }
 
+                // Reflect the live route counts on the OLED status display.
+                crate::oled::set_counts(
+                    netrom.neighbour_count() as u16,
+                    netrom.destination_count() as u16,
+                );
+
                 // Persistent interlinks: keep an L2 link up to every reachable
                 // NET/ROM neighbour, so the connector's L4 datagrams always
                 // have transport (no "no L2 session" drops) — BPQ-style.

@@ -74,7 +74,7 @@ embassy-net = { version = "0.9", default-features = false, features = ["defmt", 
 # KISS-over-serial transport's `ByteStream` impl (transports::kiss_serial) drives the
 # NinoTNC UART through them. (Re-exported by embassy-rp, pinned explicitly for the
 # direct `Read`/`Write` use.)
-embedded-io-async = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.7", default-features = false }
 
 # --- Cortex-M runtime + logging/diagnostics ---
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
@@ -107,6 +107,8 @@ heapless = "0.8"
 # embedded-test.x on the linker search path for ALL targets (see build.rs); the
 # harness itself is only linked into the tests/ binaries.
 embedded-test = { version = "0.7", features = ["defmt"] }
+ssd1306 = { version = "0.10.0", default-features = false, features = ["graphics"] }
+embedded-graphics = "0.8.2"
 
 # Size matters on a 264 KB-RAM M0+. Optimise even in dev so it fits and the
 # defmt/RTT loop is responsive.

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // built + type-checked; the task is spawned at Gate 6 (a NinoTNC on GP20/21)
+
 //! Capability 3 — KISS-over-serial to a NinoTNC.
 //!
 //! Ports `Packet.Kiss.Serial.KissSerialModem` + the NinoTNC overlay onto an
@@ -13,35 +15,44 @@
 //! do NOT talk to the NinoTNC's USB chip. Instead we wire the Pico's UART directly
 //! to the NinoTNC's UART pins (bypassing its USB-serial bridge) — TX→RX, RX→TX, GND,
 //! at the NinoTNC's KISS baud ([`ax25_node_core::kiss::ninotnc::DEFAULT_BAUD`] =
-//! 57 600 8N1). UART0 on GP0 (TX) / GP1 (RX) by default. This is the planned,
-//! supported path.
+//! 57 600 8N1). **UART1 on GP20 (TX) / GP21 (RX)** — the NinoTNC link pins on the
+//! NinoBLE Rev5 carrier board (docs/HARDWARE-NINOBLE.md), our reference hardware.
 //!
-//! HARDWARE-GATED: the codec + modem loop below are real, but the live UART exchange
-//! needs a physical Pico W wired to a NinoTNC to RUN — there is no UART/NinoTNC
-//! emulator. The `ByteStream` impl's two `embassy_rp` calls are the only seam left;
-//! they are filled against the resolved `embassy-rp` API at hardware bring-up.
+//! The UART layer below is real (embassy-rp 0.10 `BufferedUart`), so this module
+//! compiles and is type-checked by CI. HARDWARE-GATED for *running*: the live
+//! exchange needs a physical NinoTNC on GP20/21 — not present on the bare-Pico
+//! bench rig, so the task is not spawned yet (HW-BRINGUP Gate 6).
 
 use ax25_node_core::kiss::ninotnc::{self, NinoTncInboundEvent};
 use ax25_node_core::kiss::serial::ByteStream;
 use ax25_node_core::kiss::{classify::InboundEvent, SerialKissModem};
 
-use embassy_rp::peripherals::UART0;
-use embassy_rp::uart::{BufferedUart, Error as UartError};
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals::{PIN_20, PIN_21, UART1};
+use embassy_rp::uart::{
+    BufferedInterruptHandler, BufferedUart, Config as UartConfig, Error as UartError,
+};
+use embassy_rp::Peri;
 use embedded_io_async::{Read, Write};
+use static_cell::StaticCell;
 
 use crate::config::KissSerialConfig;
+
+bind_interrupts!(struct Irqs {
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
+});
 
 /// A [`ByteStream`] over an `embassy_rp` buffered UART — the embedded byte source the
 /// portable [`SerialKissModem`] runs on. `read`/`write` are the only hardware seam;
 /// everything above (framing, escaping, the modem, the NinoTNC extensions) is the
 /// host-tested portable core.
 pub struct UartByteStream {
-    uart: BufferedUart<'static, UART0>,
+    uart: BufferedUart,
 }
 
 impl UartByteStream {
     /// Wrap a configured buffered UART.
-    pub fn new(uart: BufferedUart<'static, UART0>) -> Self {
+    pub fn new(uart: BufferedUart) -> Self {
         Self { uart }
     }
 }
@@ -62,21 +73,17 @@ impl ByteStream for UartByteStream {
 
 #[embassy_executor::task]
 pub async fn task(
-    uart: UART0,
-    tx_pin: embassy_rp::peripherals::PIN_0,
-    rx_pin: embassy_rp::peripherals::PIN_1,
+    uart: Peri<'static, UART1>,
+    tx_pin: Peri<'static, PIN_20>,
+    rx_pin: Peri<'static, PIN_21>,
     cfg: KissSerialConfig,
 ) {
     defmt::info!(
-        "kiss-serial: UART @ {} baud (NinoTNC direct UART)",
+        "kiss-serial: UART1 GP20/21 @ {} baud (NinoTNC direct UART)",
         cfg.baud
     );
 
-    // Configure the buffered UART at cfg.baud, 8N1 (NinoTNC default 57600). The TX/RX
-    // ring buffers live in static_cell-backed arenas sized for a couple of frames.
-    // (The exact `BufferedUart::new` signature — IRQ binding, buffer slices — is
-    // resolved against the embassy-rp version at hardware bring-up.)
-    let uart: BufferedUart<'static, UART0> = configure_uart(uart, tx_pin, rx_pin, cfg.baud);
+    let uart = configure_uart(uart, tx_pin, rx_pin, cfg.baud);
 
     let mut modem = SerialKissModem::new(UartByteStream::new(uart));
 
@@ -124,7 +131,7 @@ pub async fn task(
             // error or zero-read we yield and retry rather than spin.
             Ok(None) => embassy_time::Timer::after_millis(10).await,
             Err(e) => {
-                defmt::warn!("kiss-serial read error: {:?}", e);
+                defmt::warn!("kiss-serial read error: {}", defmt::Debug2Format(&e));
                 embassy_time::Timer::after_millis(100).await;
             }
         }
@@ -135,20 +142,26 @@ pub async fn task(
     }
 }
 
-/// Configure UART0 as a buffered 8N1 UART at `baud`. HARDWARE SEAM: the concrete
-/// `BufferedUart::new` call (IRQ binding + static TX/RX buffers) is filled against
-/// the resolved embassy-rp API at bring-up; isolated here so the pump above is final.
+/// Configure UART1 as a buffered 8N1 UART at `baud` on GP20 (TX) / GP21 (RX) —
+/// the NinoBLE Rev5 NinoTNC link. Static TX/RX ring buffers sized for a couple
+/// of KISS frames.
 fn configure_uart(
-    _uart: UART0,
-    _tx_pin: embassy_rp::peripherals::PIN_0,
-    _rx_pin: embassy_rp::peripherals::PIN_1,
-    _baud: u32,
-) -> BufferedUart<'static, UART0> {
-    // let mut config = embassy_rp::uart::Config::default();
-    // config.baudrate = _baud;
-    // static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    // static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    // BufferedUart::new(_uart, Irqs, _tx_pin, _rx_pin,
-    //                   TX_BUF.init([0; 256]), RX_BUF.init([0; 256]), config)
-    unimplemented!("BufferedUart::new — embassy-rp hardware seam (NinoTNC direct UART)")
+    uart: Peri<'static, UART1>,
+    tx_pin: Peri<'static, PIN_20>,
+    rx_pin: Peri<'static, PIN_21>,
+    baud: u32,
+) -> BufferedUart {
+    let mut config = UartConfig::default();
+    config.baudrate = baud;
+    static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    BufferedUart::new(
+        uart,
+        tx_pin,
+        rx_pin,
+        Irqs,
+        TX_BUF.init([0; 256]),
+        RX_BUF.init([0; 256]),
+        config,
+    )
 }

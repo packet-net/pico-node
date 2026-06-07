@@ -9,9 +9,9 @@ pub mod axudp;
 pub mod kiss_tcp;
 pub mod relay;
 pub mod telnet;
-// GATE 6 (HW-BRINGUP.md §4): kiss_serial returns if/when a NinoTNC is present at
-// this machine (its UART generics also don't compile against embassy-rp 0.10 yet).
-// pub mod kiss_serial;
+// kiss_serial (NinoTNC over UART1 GP20/21 — NinoBLE Rev5; HARDWARE-NINOBLE.md).
+// Compiled + type-checked; not spawned until a NinoTNC is wired (HW-BRINGUP Gate 6).
+pub mod kiss_serial;
 
 use ax25_node_core::ax25::frame::CONTROL_UI;
 use ax25_node_core::ax25::{Address, Callsign, Frame};
