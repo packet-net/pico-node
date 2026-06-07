@@ -400,6 +400,64 @@ mod tests {
         );
     }
 
+    // ─── Link-down failover signal (mark_neighbour_down) ───
+
+    #[test]
+    fn marking_a_neighbour_down_drops_its_routes_at_once_without_a_sweep() {
+        let mut t = Table::with_defaults();
+        let me = call("M0LTE");
+        let nbr_a = call("GB7RDG");
+        let sot = call("GB7SOT");
+        // RDG advertises SOT via itself; the assumed-direct route to RDG is via RDG
+        // too. Both routes forward through RDG.
+        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]), 0);
+        assert!(find_dest(&t, &sot).is_some());
+
+        let dropped = t.mark_neighbour_down(&nbr_a);
+
+        assert!(dropped > 0, "the routes via the down neighbour are removed");
+        assert_eq!(dests(&t).len(), 0, "every route forwarded through the down neighbour");
+        assert!(
+            !neighbours(&t).iter().any(|n| n.neighbour == nbr_a),
+            "the down neighbour is removed too"
+        );
+    }
+
+    #[test]
+    fn marking_a_neighbour_down_leaves_an_alternate_route() {
+        let mut t = Table::with_defaults();
+        let me = call("M0LTE");
+        let nbr_a = call("GB7RDG");
+        let nbr_b = call("GB7XYZ");
+        let sot = call("GB7SOT");
+        // SOT reachable via two neighbours; nbr_a is higher quality (best).
+        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 250)]), 0);
+        t.ingest(nbr_b, me, port(), &broadcast("XYZ", &[(sot, "SOT", nbr_b, 150)]), 0);
+        assert_eq!(find_dest(&t, &sot).unwrap().best_route.unwrap().neighbour, nbr_a);
+
+        t.mark_neighbour_down(&nbr_a);
+
+        let after = find_dest(&t, &sot).expect("SOT still reachable");
+        assert!(
+            !routes_of(&t, &sot).iter().any(|r| r.neighbour == nbr_a),
+            "the down neighbour's route is gone"
+        );
+        assert_eq!(after.best_route.unwrap().neighbour, nbr_b, "failed over to the surviving route");
+    }
+
+    #[test]
+    fn marking_an_unknown_neighbour_down_is_a_noop() {
+        let mut t = Table::with_defaults();
+        let me = call("M0LTE");
+        let nbr_a = call("GB7RDG");
+        let nbr_b = call("GB7XYZ");
+        let sot = call("GB7SOT");
+        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]), 0);
+
+        assert_eq!(t.mark_neighbour_down(&nbr_b), 0);
+        assert!(find_dest(&t, &sot).is_some(), "an unrelated neighbour's routes are untouched");
+    }
+
     // ─── Quality floor (MINQUAL) ───
 
     #[test]

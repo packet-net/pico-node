@@ -265,6 +265,48 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
         purged
     }
 
+    /// React to a neighbour going down — its interlink could not be raised (it did
+    /// not answer the connect) or its quality collapsed — by immediately dropping
+    /// every route that forwards through it, and the neighbour entry itself. This is
+    /// the explicit link-down failover signal: instead of waiting for the
+    /// obsolescence [`sweep`](Self::sweep) to age the now-dead routes out over the
+    /// broadcast interval (during which forwarding / connect-routing would keep
+    /// choosing a route that can't carry traffic), the dead routes leave the table at
+    /// once, so the very next forward or connect decision fails over to an alternate
+    /// next hop. A destination that loses all its routes is removed; it and the
+    /// neighbour re-learn naturally from the next NODES broadcast if the neighbour
+    /// returns. Idempotent — marking an unknown / already-removed neighbour down is a
+    /// no-op returning 0. Mirrors C# `NetRomRoutingTable.MarkNeighbourDown`.
+    ///
+    /// Returns the number of routes dropped (across all destinations).
+    pub fn mark_neighbour_down(&mut self, neighbour: &Callsign) -> usize {
+        let mut dropped = 0usize;
+        for slot in self.destinations.iter_mut() {
+            if let Some(dest) = slot {
+                for route in dest.routes.iter_mut() {
+                    if let Some(rt) = route {
+                        if rt.neighbour == *neighbour {
+                            *route = None;
+                            dropped += 1;
+                        }
+                    }
+                }
+                if dest.route_count() == 0 {
+                    *slot = None;
+                }
+            }
+        }
+        for slot in self.neighbours.iter_mut() {
+            if let Some(nb) = slot {
+                if nb.neighbour == *neighbour {
+                    *slot = None;
+                }
+            }
+        }
+        self.prune_orphan_neighbours();
+        dropped
+    }
+
     // ─── Read-side accessors (allocation-free) ───────────────────────────
 
     /// Visit every known destination in stable order (alias-or-callsign ascending,
