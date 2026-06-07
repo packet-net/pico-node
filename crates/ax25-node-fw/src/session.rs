@@ -21,11 +21,14 @@
 //! WiFi bring-up; the manager + timer logic below is hardware-independent and is
 //! host-tested in `ax25_node_core::sdl::manager`.
 
+// GATE 3 (HW-BRINGUP.md §4): only the NET/ROM tap (new_netrom/observe_inbound)
+// is consumed so far; the SessionManager + timer machinery below is the seam the
+// session supervisor wires up when connected mode lands. Remove then.
+#![allow(dead_code)]
+
 use ax25_node_core::ax25::{Callsign, Frame};
 use ax25_node_core::netrom::{NetRomService, ObserveOutcome, PortId};
-use ax25_node_core::sdl::{
-    Event, SessionManager, TimerId, TimerService, TimerSnapshot,
-};
+use ax25_node_core::sdl::{Event, SessionManager, TimerId, TimerService, TimerSnapshot};
 
 use embassy_time::{Duration, Instant, Timer};
 
@@ -122,10 +125,7 @@ impl EmbassyTimers {
     /// The nearest armed deadline across all timers, if any — what [`timer_task`]
     /// sleeps until.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.t1, self.t2, self.t3]
-            .into_iter()
-            .flatten()
-            .min()
+        [self.t1, self.t2, self.t3].into_iter().flatten().min()
     }
 
     /// Return the timer ids whose deadline is at/<= `now`, clearing them. The

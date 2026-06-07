@@ -93,10 +93,6 @@ embedded-alloc = "0.7"
 # timer set in session.rs). no_std, no alloc.
 heapless = "0.8"
 
-# Fixed-point numerics — only to construct the cyw43-pio gSPI clock divider
-# (cyw43-pio's PioSpi::new takes a FixedU32<U8>; same crate it uses internally).
-fixed = { version = "1.23", default-features = false }
-
 [dev-dependencies]
 # On-target test harness (current; defmt-test/probe-run are deprecated). Runs the
 # conformance subset on the real M0+ via `probe-rs run` as the cargo test runner.

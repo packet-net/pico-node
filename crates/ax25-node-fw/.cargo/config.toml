@@ -35,8 +35,8 @@ rustflags = [
 # CLM blob) at info.
 DEFMT_LOG = "info,ax25_node_fw=debug"
 # RTT ring buffer size (defmt-rtt reads this at compile time). Sized big enough
-# to hold the whole boot→join→DHCP log backlog in RAM: on this rig the SWD link
-# drops while the radio is RF-active (HW-BRINGUP gotcha found at Gate 2), so the
-# proven workflow is `probe-rs download`+`reset` detached, then `probe-rs attach`
-# once the radio settles and drain the backlog from this buffer.
+# to hold the whole boot→join→DHCP log backlog in RAM, which makes post-hoc log
+# reads possible: flash + reset detached, `probe-rs attach` later, and the full
+# boot history is still in the buffer. (Bring-up workflow from Gate 2 — useful
+# whenever a debug session wasn't attached at the interesting moment.)
 DEFMT_RTT_BUFFER_SIZE = "16384"

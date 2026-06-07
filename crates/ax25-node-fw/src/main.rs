@@ -28,6 +28,11 @@
 #![no_main]
 #![cfg_attr(not(target_os = "none"), allow(unused))]
 
+// The firmware uses `alloc` (ax25-node-core's frame buffers; the heap is the
+// embedded-alloc arena installed below).
+#[cfg(target_os = "none")]
+extern crate alloc;
+
 // The firmware modules only exist for the bare-metal target. On a host build they
 // are compiled out, so a stray `cargo check` on the host doesn't error before the
 // embedded toolchain + deps are in place. The real firmware only builds for
@@ -36,13 +41,10 @@
 mod config;
 #[cfg(target_os = "none")]
 mod net;
-// GATE 3+ (HW-BRINGUP.md §4): the four transport socket stubs don't compile
-// against the real embassy-net APIs yet — they were deliberately not written
-// blind. They return module by module as Gates 3–6 land.
-// #[cfg(target_os = "none")]
-// mod session;
-// #[cfg(target_os = "none")]
-// mod transports;
+#[cfg(target_os = "none")]
+mod session;
+#[cfg(target_os = "none")]
+mod transports;
 
 // The global allocator. `ax25-node-core` uses `alloc` (the session queues, the
 // streaming codecs), so the firmware must install one. `embedded-alloc`'s
@@ -70,6 +72,7 @@ mod firmware {
 
     use crate::config;
     use crate::net;
+    use crate::transports;
     use crate::{HEAP, HEAP_SIZE};
 
     #[embassy_executor::main]
@@ -125,7 +128,14 @@ mod firmware {
         // it on here is the visible "radio alive" check (HW-BRINGUP.md §4 Gate 2).
         control.gpio_set(0, true).await;
 
-        // GATE 3+ returns the transports + session spawns here.
+        // --- GATE 3 (HW-BRINGUP.md §4): AXUDP over WiFi (capability 1) ---
+        spawner.spawn(defmt::unwrap!(transports::axudp::task(
+            stack,
+            cfg.axudp.clone(),
+            cfg.identity.callsign,
+        )));
+
+        // GATE 4+ returns the telnet/kiss transports + the session supervisor here.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {

@@ -8,7 +8,7 @@
 //! every transport task (AXUDP/KISS-TCP/telnet).
 
 use cyw43::{Control, JoinAuth, JoinOptions, NetDriver};
-use cyw43_pio::PioSpi;
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::bind_interrupts;
@@ -19,8 +19,6 @@ use embassy_rp::peripherals::{DMA_CH0, PIN_23, PIN_24, PIN_25, PIN_29, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::Peri;
 use embassy_time::{with_timeout, Duration, TimeoutError, Timer};
-use fixed::types::extra::U8;
-use fixed::FixedU32;
 use static_cell::StaticCell;
 
 use crate::config::WifiConfig;
@@ -74,11 +72,7 @@ pub async fn init_wifi(
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        // gSPI clock divider. DEFAULT (2.0 → ~33 MHz gSPI) faulted the SWD debug
-        // link whenever the radio was active on this rig (jumper-wired DEBUG
-        // header next to the antenna); divide further for bring-up. TODO(rig):
-        // retest faster dividers once the SWD wiring is hardened.
-        FixedU32::<U8>::from_bits(0x0800), // divider 8 → ~8 MHz gSPI
+        DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         dio_pin,
