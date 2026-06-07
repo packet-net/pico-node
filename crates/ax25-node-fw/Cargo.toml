@@ -68,7 +68,7 @@ cyw43     = { version = "0.7", default-features = false, features = ["defmt", "f
 cyw43-pio = { version = "0.10", default-features = false, features = ["defmt"] }
 
 # --- no-alloc async TCP/IP stack (UDP for AXUDP, TCP for KISS + telnet) ---
-embassy-net = { version = "0.9", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
+embassy-net = { version = "0.9", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "dhcpv4-hostname", "proto-ipv4", "medium-ethernet", "multicast"] }
 
 # Async byte-I/O traits — `embassy_rp::uart::BufferedUart` implements these; the
 # KISS-over-serial transport's `ByteStream` impl (transports::kiss_serial) drives the

@@ -10,7 +10,7 @@
 use cyw43::{Control, JoinAuth, JoinOptions, NetDriver};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Config, DhcpConfig, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma;
@@ -139,8 +139,17 @@ pub async fn join(control: &mut Control<'static>, wifi: &WifiConfig) {
 /// Start the embassy-net stack with DHCPv4 and spawn its runner task. Returns
 /// the `Copy`able stack handle the transports share. Does not wait for a lease —
 /// callers that need the network up await `stack.wait_config_up()`.
-pub async fn start_stack(net_device: NetDriver<'static>, spawner: &Spawner) -> Stack<'static> {
-    let config = Config::dhcpv4(Default::default());
+///
+/// `hostname` rides in DHCP option 12, so the node shows up named in the
+/// router's client list / local DNS even before mDNS is consulted.
+pub async fn start_stack(
+    net_device: NetDriver<'static>,
+    spawner: &Spawner,
+    hostname: &str,
+) -> Stack<'static> {
+    let mut dhcp = DhcpConfig::default();
+    dhcp.hostname = hostname.try_into().ok();
+    let config = Config::dhcpv4(dhcp);
     // Seed smoltcp's TCP sequence numbers from the ring-oscillator TRNG.
     let seed = RoscRng.next_u64();
 
