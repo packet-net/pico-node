@@ -132,14 +132,8 @@ mod firmware {
         // it on here is the visible "radio alive" check (HW-BRINGUP.md §4 Gate 2).
         control.gpio_set(0, true).await;
 
-        // --- GATE 3 (HW-BRINGUP.md §4): AXUDP over WiFi (capability 1) ---
-        spawner.spawn(defmt::unwrap!(transports::axudp::task(
-            stack,
-            cfg.axudp.clone(),
-            cfg.identity.callsign,
-        )));
-
-        // --- GATE 4 (HW-BRINGUP.md §4): telnet console (capability 4) ---
+        // The node console identity + prompt — shared by every console-bearing
+        // transport (telnet now, AX.25 sessions on the AXUDP port too).
         let call_text = core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?");
         let console_id = ax25_node_core::console::service::Identity {
             node_name: String::from(cfg.identity.alias),
@@ -152,6 +146,18 @@ mod firmware {
         };
         let mut prompt = String::from(call_text);
         prompt.push_str("} ");
+
+        // --- GATE 3 (HW-BRINGUP.md §4): AXUDP over WiFi (capability 1), now with
+        // the connected-mode session layer + AX.25 console attached. ---
+        spawner.spawn(defmt::unwrap!(transports::axudp::task(
+            stack,
+            cfg.axudp.clone(),
+            cfg.identity.callsign,
+            console_id.clone(),
+            prompt.clone(),
+        )));
+
+        // --- GATE 4 (HW-BRINGUP.md §4): telnet console (capability 4) ---
         spawner.spawn(defmt::unwrap!(transports::telnet::task(
             stack,
             cfg.telnet.clone(),
