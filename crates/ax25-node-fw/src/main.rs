@@ -171,6 +171,10 @@ mod firmware {
             net::start_ap(&mut control, &ssid_buf, cfg.wifi.ap_passphrase).await;
             stack = net::start_stack_static(net_device, &spawner).await;
             spawner.spawn(defmt::unwrap!(provisioning::dhcp_server(stack)));
+            // Captive portal: DNS catch-all (every name -> us, pops the portal)
+            // + the HTTP config form (PROVISIONING.md step 4).
+            spawner.spawn(defmt::unwrap!(provisioning::dns_catch_all(stack)));
+            spawner.spawn(defmt::unwrap!(provisioning::http_portal(stack)));
             defmt::info!(
                 "AP mode up: SSID {=str}, gateway 192.168.4.1 (connect to configure)",
                 ssid_buf.as_str()

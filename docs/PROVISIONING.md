@@ -116,4 +116,14 @@ and de-risk 3–5, which are UX.
   default, gateway 192.168.4.1, DHCP pool 192.168.4.10+. Verified on hardware:
   a laptop associated to `pico-M9YYY-9` and received `192.168.4.10` from the
   node's DHCP server.
-- **Step 4 NEXT**: the DNS catch-all + HTTP config form (the captive-portal pop).
+- **Step 4 DONE** (PR for it): DNS catch-all (every name -> 192.168.4.1) + the
+  HTTP config form. Verified on hardware: a laptop joined pico-M9YYY-9, got
+  192.168.4.10, the DNS resolved captive.apple.com -> 192.168.4.1 (the iOS
+  portal-pop probe), GET / served the config form, and POST /save wrote the
+  submitted config to flash + rebooted — the change (alias) survived and applied.
+- **Step 5 (polish) remaining**: WiFi scan-and-pick in the portal, AP passphrase
+  change, factory-reset gesture, config export/import.
+
+The same-for-everyone flashable image is now real: a fresh node with no stored
+config raises its AP, a phone/laptop pops the portal, you fill in callsign +
+WiFi, and it reboots onto your network — no toolchain, no build env.

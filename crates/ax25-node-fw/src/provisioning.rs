@@ -158,3 +158,238 @@ fn build_reply(out: &mut [u8], req: &Request, yiaddr: Ipv4Addr, msg_type: u8) ->
     out[at] = 255; // END
     at + 1
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Captive portal (PROVISIONING.md step 4): a DNS catch-all + an HTTP config
+// form. The DNS server answers every A query with 192.168.4.1, so a client's
+// OS connectivity probe resolves to us and — getting the config page instead of
+// its expected response — pops the captive portal automatically.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use ax25_node_core::console::service::ConfigOp;
+use embassy_net::tcp::TcpSocket;
+use embassy_time::Duration;
+
+const DNS_PORT: u16 = 53;
+const HTTP_PORT: u16 = 80;
+
+/// DNS catch-all: every A query → the AP gateway. Minimal — copies the question
+/// into the answer with a fixed A record; non-A / malformed queries are ignored.
+#[embassy_executor::task]
+pub async fn dns_catch_all(stack: Stack<'static>) {
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut rx_buf = [0u8; 512];
+    let mut tx_buf = [0u8; 512];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    defmt::unwrap!(socket.bind(DNS_PORT));
+    defmt::info!("dns: catch-all up (every name -> 192.168.4.1)");
+
+    let mut buf = [0u8; 512];
+    let mut out = [0u8; 512];
+    loop {
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+            continue;
+        };
+        if n < 12 {
+            continue;
+        }
+        // Header: copy ID; set response + recursion-available; QDCOUNT stays;
+        // ANCOUNT = 1. Question section is echoed; one A answer appended.
+        let qd = u16::from_be_bytes([buf[4], buf[5]]);
+        if qd != 1 || (buf[2] & 0x80) != 0 {
+            continue; // not a single-question query
+        }
+        // Find the end of the question (QNAME terminator + QTYPE/QCLASS).
+        let mut i = 12;
+        while i < n && buf[i] != 0 {
+            i += buf[i] as usize + 1;
+        }
+        let qend = i + 5; // null label + qtype(2) + qclass(2)
+        if qend > n || qend > out.len() {
+            continue;
+        }
+        out[..qend].copy_from_slice(&buf[..qend]);
+        out[2] = 0x81; // QR=1, RD copied via low bit below
+        out[3] = 0x80; // RA=1
+        out[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
+        out[10..12].copy_from_slice(&[0, 0]); // ARCOUNT=0
+        let mut at = qend;
+        out[at..at + 2].copy_from_slice(&[0xc0, 0x0c]); // name ptr to question
+        out[at + 2..at + 4].copy_from_slice(&1u16.to_be_bytes()); // TYPE A
+        out[at + 4..at + 6].copy_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        out[at + 6..at + 10].copy_from_slice(&60u32.to_be_bytes()); // TTL
+        out[at + 10..at + 12].copy_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        out[at + 12..at + 16].copy_from_slice(&AP_ADDRESS.octets());
+        at += 16;
+        let _ = socket.send_to(&out[..at], from).await;
+    }
+}
+
+/// HTTP config form: GET serves the form (so any OS probe pops the portal),
+/// POST /save applies the fields + reboots into STA mode.
+#[embassy_executor::task]
+pub async fn http_portal(stack: Stack<'static>) {
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 2048];
+    let mut body_buf = [0u8; 1024];
+    defmt::info!("http: captive portal up on :80");
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_timeout(Some(Duration::from_secs(10)));
+        if socket.accept(HTTP_PORT).await.is_err() {
+            continue;
+        }
+        // Read the request (headers + any body) into one buffer.
+        let mut req = [0u8; 2048];
+        let mut len = 0;
+        loop {
+            match socket.read(&mut req[len..]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    len += n;
+                    // Stop once we have the headers (and a short body fits).
+                    if len >= 4 && req[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                        // Drain a little more for the form body if it's a POST.
+                        if req[..len].starts_with(b"POST") && len < req.len() {
+                            if let Ok(m) = socket.read(&mut req[len..]).await {
+                                len += m;
+                            }
+                        }
+                        break;
+                    }
+                    if len == req.len() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let request = &req[..len];
+
+        let response = if request.starts_with(b"POST /save") {
+            let saved = apply_form(request, &mut body_buf);
+            if saved {
+                // Reboot shortly after the page is sent (into STA mode).
+                REBOOT_AFTER_HTTP.store(true, core::sync::atomic::Ordering::Relaxed);
+                SAVED_PAGE
+            } else {
+                FORM_PAGE
+            }
+        } else {
+            FORM_PAGE
+        };
+
+        let _ = http_write(&mut socket, response).await;
+        let _ = socket.flush().await;
+        socket.close();
+        if REBOOT_AFTER_HTTP.load(core::sync::atomic::Ordering::Relaxed) {
+            embassy_time::Timer::after_millis(500).await;
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+    }
+}
+
+static REBOOT_AFTER_HTTP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+async fn http_write(socket: &mut TcpSocket<'_>, body: &str) -> bool {
+    use core::fmt::Write;
+    let mut head = heapless::String::<128>::new();
+    let _ = write!(
+        head,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.as_bytes();
+    while !bytes.is_empty() {
+        match socket.write(bytes).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => bytes = &bytes[n..],
+        }
+    }
+    let mut b = body.as_bytes();
+    while !b.is_empty() {
+        match socket.write(b).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => b = &b[n..],
+        }
+    }
+    true
+}
+
+/// Parse the urlencoded POST body, apply each field to the pending config via
+/// the console ConfigOp path, then SAVE. Returns whether anything was saved.
+fn apply_form(request: &[u8], scratch: &mut [u8; 1024]) -> bool {
+    let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &request[pos + 4..];
+    let n = body.len().min(scratch.len());
+    scratch[..n].copy_from_slice(&body[..n]);
+    let body = &scratch[..n];
+
+    let mut any = false;
+    for pair in body.split(|&b| b == b'&') {
+        let Some(eq) = pair.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        let key = &pair[..eq];
+        let val = url_decode(&pair[eq + 1..]);
+        let (Ok(key), Some(val)) = (core::str::from_utf8(key), val) else {
+            continue;
+        };
+        if val.is_empty() {
+            continue;
+        }
+        // Map form names to config keys (uppercased) and stage them.
+        let op = ConfigOp::Set {
+            key: key.to_ascii_uppercase(),
+            value: val,
+        };
+        let (_text, _reboot) = crate::config_store::handle_op(&op);
+        any = true;
+    }
+    if any {
+        let (_text, _) = crate::config_store::handle_op(&ConfigOp::Save);
+    }
+    any
+}
+
+/// Decode application/x-www-form-urlencoded (%XX + `+`). Returns an owned String.
+fn url_decode(bytes: &[u8]) -> Option<alloc::string::String> {
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h = hex(bytes[i + 1])?;
+                let l = hex(bytes[i + 2])?;
+                out.push((h << 4) | l);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    alloc::string::String::from_utf8(out).ok()
+}
+
+fn hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+const FORM_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node config</title><style>body{font-family:sans-serif;max-width:30em;margin:2em auto;padding:0 1em}label{display:block;margin:.8em 0 .2em}input{width:100%;padding:.4em;box-sizing:border-box}button{margin-top:1.2em;padding:.6em 1.2em;font-size:1em}</style></head><body><h2>pico-node configuration</h2><form method=post action=/save><label>Callsign</label><input name=callsign placeholder=M0ABC-1><label>Alias</label><input name=alias placeholder=NODE><label>Grid</label><input name=grid placeholder=IO91><label>WiFi network (SSID)</label><input name=wifi_ssid><label>WiFi password</label><input name=wifi_pass type=password><button type=submit>Save &amp; reboot</button></form><p>Leave a field blank to keep its current value. Set a WiFi network to join it on the next boot; the node returns to this AP if it can't.</p></body></html>";
+
+const SAVED_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>saved</title></head><body style=\"font-family:sans-serif;max-width:30em;margin:2em auto\"><h2>Saved &mdash; rebooting</h2><p>The node is restarting. If you set a WiFi network it will join that now; otherwise it returns to this configuration AP.</p></body></html>";
