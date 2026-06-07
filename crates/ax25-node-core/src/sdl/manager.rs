@@ -116,15 +116,12 @@ impl<const N: usize> SessionManager<N> {
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
         slot.session.post_event(event, timers, &mut slot.sink);
-        let out = core::mem::take(&mut slot.sink.sent);
+        core::mem::take(&mut slot.sink.sent)
 
-        // Free a slot that has fully disconnected so its capacity is reclaimed.
-        if slot.session.state == super::session::State::Disconnected
-            && slot.session.context.i_frame_queue.is_empty()
-        {
-            self.slots[i] = None;
-        }
-        out
+        // NB: a slot whose session has returned to Disconnected is NOT freed
+        // here — its upward signals (DisconnectIndication/-Confirm) haven't
+        // been drained yet, and freeing now would lose them (found wiring the
+        // firmware's link-failure path). Call [`Self::reap`] after draining.
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -134,6 +131,24 @@ impl<const N: usize> SessionManager<N> {
             Some(slot) => core::mem::take(&mut slot.sink.upward),
             None => Vec::new(),
         }
+    }
+
+    /// Free `peer`'s slot if its session has fully disconnected (state back to
+    /// `Disconnected`, nothing queued), reclaiming its capacity. Call after
+    /// draining [`Self::take_upward`]; a no-op otherwise. Returns whether the
+    /// slot was freed.
+    pub fn reap(&mut self, peer: &Callsign) -> bool {
+        if let Some(i) = self.index_of(peer) {
+            if let Some(slot) = &self.slots[i] {
+                if slot.session.state == super::session::State::Disconnected
+                    && slot.session.context.i_frame_queue.is_empty()
+                {
+                    self.slots[i] = None;
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -209,13 +224,24 @@ mod tests {
         mgr.post(call("G7AAA"), sabm(), &mut t);
         assert_eq!(mgr.active(), 1);
 
-        // Inbound DISC ⇒ session returns to Disconnected ⇒ slot reclaimed.
+        // Inbound DISC ⇒ session returns to Disconnected. The slot is kept
+        // until the upward signals are drained + the caller reaps — freeing
+        // inside post() would lose the DisconnectIndication.
         let disc = Event::DiscReceived(FrameInfo {
             poll_final: true,
             is_command: true,
             ..Default::default()
         });
         mgr.post(call("G7AAA"), disc, &mut t);
+        assert_eq!(mgr.active(), 1);
+        let ups = mgr.take_upward(&call("G7AAA"));
+        assert!(ups.contains(&DataLinkSignal::DisconnectIndication));
+        assert!(mgr.reap(&call("G7AAA")));
         assert_eq!(mgr.active(), 0);
+
+        // Reaping a live session is a no-op.
+        mgr.post(call("G7AAA"), sabm(), &mut t);
+        assert!(!mgr.reap(&call("G7AAA")));
+        assert_eq!(mgr.active(), 1);
     }
 }

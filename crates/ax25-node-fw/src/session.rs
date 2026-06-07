@@ -30,7 +30,7 @@ use ax25_node_core::ax25::{Callsign, Frame};
 use ax25_node_core::netrom::{NetRomService, ObserveOutcome, PortId};
 use ax25_node_core::sdl::{Event, SessionManager, TimerId, TimerService, TimerSnapshot};
 
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
 
 /// Maximum concurrent link-layer sessions. Fixed (no heap session map). Sized for
 /// a Pico node; bump with care given the per-session window buffers (research §6).
@@ -191,18 +191,6 @@ pub fn expiry_event(id: TimerId) -> Event {
     }
 }
 
-/// The T1/T2/T3 timer service task. Waits on the nearest armed deadline, then feeds
-/// the expiry into the session walk. STUB at the wiring seam: the shared-state
-/// access (which session, which sink) is finalised with the supervisor's chosen
-/// sharing model at WiFi bring-up. The timer math + service above are complete and
-/// host-tested via the core `MockTimerService` parity (`ax25_node_core::sdl::timer`).
-#[embassy_executor::task]
-pub async fn timer_task() {
-    loop {
-        // The real loop borrows the shared EmbassyTimers, computes next_deadline(),
-        // waits until it (or until re-armed), then for each take_expired() id posts
-        // expiry_event(id) into the SessionManager and flushes the resulting frames
-        // to the owning transport. Placeholder cadence until that shared state lands.
-        Timer::after_millis(100).await;
-    }
-}
+// (The former `timer_task` stub is gone: timers are driven by the transport
+// that owns the sessions — see `transports::axudp`'s per-peer `EmbassyTimers`
+// and its deadline arm in the main select loop.)

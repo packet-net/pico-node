@@ -83,7 +83,7 @@ pub async fn task(stack: Stack<'static>, cfg: MdnsConfig) {
             continue;
         };
         let pkt = &inbuf[..n];
-        defmt::debug!("mdns: rx {=usize}B from {:?}", n, meta.endpoint);
+        defmt::trace!("mdns: rx {=usize}B from {:?}", n, meta.endpoint);
         let Some(query_id) = parse_query(pkt, &cfg) else {
             continue;
         };
