@@ -156,7 +156,15 @@ mod firmware {
             prompt,
         )));
 
-        // GATE 5+ returns the KISS transports + the session supervisor here.
+        // --- GATE 5 (HW-BRINGUP.md §4): KISS-over-TCP (capability 2) ---
+        // Disabled unless KISS_TCP_TARGET is set in the build env (§5).
+        spawner.spawn(defmt::unwrap!(transports::kiss_tcp::task(
+            stack,
+            cfg.kiss_tcp.clone(),
+            cfg.identity.callsign,
+        )));
+
+        // GATE 6+ returns kiss_serial (needs a NinoTNC) + the session supervisor.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {
