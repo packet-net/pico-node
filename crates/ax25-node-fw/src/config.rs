@@ -47,7 +47,6 @@ pub struct WifiConfig {
 #[derive(Clone)]
 pub struct AxudpConfig {
     pub listen_port: u16,
-    pub include_fcs: bool, // XRouter AXIP-with-CRC variant
     /// Optional `"a.b.c.d:port"` endpoint to beacon UI frames at (the Gate-3
     /// host harness). From the build env (`AXUDP_BEACON_TARGET`) — a LAN
     /// detail, never a committed default (HW-BRINGUP §5).
@@ -94,11 +93,6 @@ pub fn load() -> NodeConfig {
         },
         axudp: AxudpConfig {
             listen_port: 10093,
-            // AXIP-with-CRC: LinBPQ (6.0.25) transmits with the trailing
-            // CRC-16/X.25 and ignores FCS-less datagrams (verified on the wire
-            // against a real LinBPQ during bring-up — the "FCS-less is the
-            // LinBPQ-accepted default" note in core::axudp turned out wrong).
-            include_fcs: true,
             beacon_target: option_env!("AXUDP_BEACON_TARGET"),
         },
         kiss_tcp: KissTcpConfig {

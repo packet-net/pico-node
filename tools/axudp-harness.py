@@ -7,6 +7,8 @@ sender's callsign — giving the firmware its "a frame sent back is decoded and
 logged by the Pico" half of the gate.
 
 Zero dependencies; standalone AX.25 address codec (shift-left-1 per spec).
+AXUDP datagrams always carry the trailing CRC-16/X.25 FCS (low byte first) —
+appended on send, verified + stripped on receive.
 
 Usage:  python3 tools/axudp-harness.py [--port 10093] [--reply-text TEXT]
 """
@@ -15,6 +17,30 @@ import argparse
 import socket
 import sys
 import time
+
+
+def crc16_x25(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFF
+
+
+def append_fcs(body: bytes) -> bytes:
+    fcs = crc16_x25(body)
+    return body + bytes((fcs & 0xFF, fcs >> 8))
+
+
+def strip_fcs(payload: bytes) -> bytes | None:
+    """Verify + strip the trailing FCS; None if missing/invalid."""
+    if len(payload) < 2:
+        return None
+    body, fcs = payload[:-2], payload[-2:]
+    if crc16_x25(body) != (fcs[0] | (fcs[1] << 8)):
+        return None
+    return body
 
 
 def decode_addr(b: bytes) -> tuple[str, bool]:
@@ -98,10 +124,15 @@ def main() -> None:
     while True:
         payload, peer = sock.recvfrom(65535)
         ts = time.strftime("%H:%M:%S")
-        f = decode_frame(payload)
+        body = strip_fcs(payload)
+        if body is None:
+            print(f"{ts} {peer[0]}:{peer[1]} {len(payload)}B REJECTED (bad/missing "
+                  f"FCS): {payload.hex()}", flush=True)
+            continue
+        f = decode_frame(body)
         if f is None:
-            print(f"{ts} {peer[0]}:{peer[1]} {len(payload)}B (not AX.25): "
-                  f"{payload.hex()}", flush=True)
+            print(f"{ts} {peer[0]}:{peer[1]} {len(body)}B (not AX.25): "
+                  f"{body.hex()}", flush=True)
             continue
         kind = "UI" if (f["control"] & 0xEF) == 0x03 else f"ctl=0x{f['control']:02x}"
         info = f["info"].decode("ascii", "replace")
@@ -110,8 +141,8 @@ def main() -> None:
 
         if args.reply_every or peer not in replied:
             replied.add(peer)
-            reply = build_ui(dest=f["src"], src="HARNES-1",
-                             info=args.reply_text.encode())
+            reply = append_fcs(build_ui(dest=f["src"], src="HARNES-1",
+                                        info=args.reply_text.encode()))
             sock.sendto(reply, peer)
             print(f"{ts} -> replied to {f['src']} at {peer[0]}:{peer[1]} "
                   f"({len(reply)}B UI)", flush=True)
