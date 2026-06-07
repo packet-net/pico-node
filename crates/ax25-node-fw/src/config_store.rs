@@ -173,6 +173,8 @@ pub struct ConfigService {
     /// The console-staged copy (starts as the stored record, or empty).
     pub pending: StoredConfig,
     generation: u32,
+    /// Generation counter for the NET/ROM routing store (separate sectors).
+    netrom_generation: u32,
 }
 
 /// Global handle for the console executors (telnet + AX.25 console both reach
@@ -231,6 +233,7 @@ impl ConfigService {
                 flash,
                 pending: stored.clone().unwrap_or_default(),
                 generation,
+                netrom_generation: 0,
             },
             stored,
         )
@@ -300,6 +303,39 @@ impl ConfigService {
             _ => Err("flash verify failed"),
         }
     }
+}
+
+/// Replay the persisted NET/ROM routing table into `netrom` at boot. Returns
+/// the number of routes replayed (0 if none stored). Locks the config flash.
+pub fn netrom_load(
+    netrom: &mut crate::session::NetRom,
+    my_call: ax25_node_core::ax25::Callsign,
+) -> usize {
+    CONFIG.lock(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(svc) = borrow.as_mut() else {
+            return 0;
+        };
+        let (generation, replayed) = crate::netrom_store::load(&mut svc.flash, netrom, my_call);
+        svc.netrom_generation = generation;
+        replayed
+    })
+}
+
+/// Persist the current routing table. Returns the route count written (0 if the
+/// table is empty — no flash erase). Locks the config flash.
+pub fn netrom_save(netrom: &crate::session::NetRom) -> Result<usize, &'static str> {
+    CONFIG.lock(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(svc) = borrow.as_mut() else {
+            return Err("config store unavailable");
+        };
+        let n = crate::netrom_store::save(&mut svc.flash, netrom, svc.netrom_generation)?;
+        if n > 0 {
+            svc.netrom_generation += 1;
+        }
+        Ok(n)
+    })
 }
 
 /// Execute one console [`ConfigOp`]: returns the response text (newline-

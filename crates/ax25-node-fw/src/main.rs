@@ -46,6 +46,8 @@ mod mdns;
 #[cfg(target_os = "none")]
 mod net;
 #[cfg(target_os = "none")]
+mod netrom_store;
+#[cfg(target_os = "none")]
 mod session;
 #[cfg(target_os = "none")]
 mod transports;
