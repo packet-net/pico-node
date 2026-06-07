@@ -70,6 +70,9 @@ use crate::transports::{call_str, parse_endpoint, ui_frame};
 const BEACON_INTERVAL_SECS: u64 = 10;
 /// Seconds between routing-table flash saves (bounds wear; only saves on change).
 const NETROM_SAVE_SECS: u64 = 300;
+/// Seconds between "ensure interlinks" passes — proactively (re)establish an
+/// L2 link to every known NET/ROM neighbour we can reach, BPQ-style.
+const INTERLINK_ENSURE_SECS: u64 = 30;
 
 /// Set by a console REBOOT on the AX.25 path; honoured by [`drive`] after the
 /// response frames have been transmitted (so the farewell reaches the user).
@@ -93,6 +96,11 @@ enum Role {
     Bridge { other: Callsign, initiator: bool },
     /// Piped to the telnet console relay statics.
     TelnetRelay,
+    /// A persistent L2 link to a NET/ROM neighbour — kept up (proactively
+    /// established + auto-reconnected) so L4 circuits always have transport,
+    /// like a BPQ interlink. Carries only PID-0xCF L4 traffic (handled before
+    /// the role match); other DL signals are ignored.
+    Interlink,
 }
 
 /// Per-peer link state alongside the manager's session slot.
@@ -171,6 +179,7 @@ pub async fn task(
     // when it changed since the last save.
     let mut next_save_at = Instant::now() + Duration::from_secs(NETROM_SAVE_SECS);
     let mut last_saved_dests = 0usize;
+    let mut next_interlink_at = Instant::now() + Duration::from_secs(INTERLINK_ENSURE_SECS);
 
     // NODES origination: our own broadcasts, built from the live routing table
     // (header alias + an entry per advertisable route, OBSMIN-gated) — the node
@@ -271,6 +280,28 @@ pub async fn task(
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
                     }
+                }
+
+                // Persistent interlinks: keep an L2 link up to every reachable
+                // NET/ROM neighbour, so the connector's L4 datagrams always
+                // have transport (no "no L2 session" drops) — BPQ-style.
+                if Instant::now() >= next_interlink_at {
+                    next_interlink_at =
+                        Instant::now() + Duration::from_secs(INTERLINK_ENSURE_SECS);
+                    ensure_interlinks(
+                        &mut sessions,
+                        &mut peers,
+                        &socket,
+                        &heard,
+                        beacon_ep,
+                        my_call,
+                        &netrom,
+                        &mut connector,
+                        &mut circuits,
+                        &console_id,
+                        &prompt,
+                    )
+                    .await;
                 }
 
                 // Routing-table persistence: save if due AND the table changed.
@@ -862,6 +893,69 @@ fn service_l4(
     }
 }
 
+/// Proactively (re)establish an L2 link to every known NET/ROM neighbour we
+/// have a heard endpoint for and no live session with. Each link is an
+/// [`Role::Interlink`]; the connector ships its L4 datagrams over them. A
+/// neighbour with no session was either never up or was torn down — either way
+/// we re-SABM it here (the periodic cadence is the reconnect backoff).
+#[allow(clippy::too_many_arguments)]
+async fn ensure_interlinks(
+    sessions: &mut session::Sessions,
+    peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
+    socket: &UdpSocket<'_>,
+    heard: &[Option<(Callsign, IpEndpoint)>; 8],
+    beacon_ep: Option<IpEndpoint>,
+    my_call: Callsign,
+    netrom: &session::NetRom,
+    connector: &mut NetRomConnector,
+    circuits: &mut [Option<CircuitConsole>; 4],
+    console_id: &Identity,
+    prompt: &str,
+) {
+    // Collect neighbour callsigns (can't borrow the table across the connect).
+    let mut neighbours = heapless::Vec::<Callsign, 16>::new();
+    netrom.for_each_neighbour(|n| {
+        let _ = neighbours.push(n.neighbour);
+    });
+
+    for nbr in neighbours {
+        if nbr == my_call || find_peer(peers, &nbr).is_some() {
+            continue; // ourselves, or already linked
+        }
+        if heard_lookup(heard, &nbr).is_none() {
+            continue; // no endpoint to reach it — wait until we hear it
+        }
+        match start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
+            Ok(i) => {
+                let mut name = [0u8; 16];
+                defmt::info!(
+                    "axudp: bringing up interlink to {=str}",
+                    call_str(&nbr, &mut name)
+                );
+                drive(
+                    sessions,
+                    peers,
+                    socket,
+                    heard,
+                    beacon_ep,
+                    my_call,
+                    &mut L4 {
+                        connector,
+                        netrom,
+                        circuits,
+                    },
+                    i,
+                    Event::DlConnectRequest,
+                    console_id,
+                    prompt,
+                )
+                .await;
+            }
+            Err(_) => {} // busy/no-slot — fine, try again next pass
+        }
+    }
+}
+
 /// Create the peer slot + role for an outbound connect to `target`, resolving
 /// its endpoint from the heard-table (beacon target as fallback).
 fn start_outbound(
@@ -1015,7 +1109,7 @@ fn post_one(
                             "axudp: interlink L2 up from node {=str}",
                             call_str(&peer, &mut name)
                         );
-                        ps.role = Role::None;
+                        ps.role = Role::Interlink;
                     } else {
                         defmt::info!(
                             "axudp: AX.25 session up from {=str} — attaching console",
@@ -1043,6 +1137,13 @@ fn post_one(
                             call_str(&peer, &mut name)
                         );
                         // The target's own banner flows over the bridge next.
+                    }
+                    Role::Interlink => {
+                        let mut name = [0u8; 16];
+                        defmt::info!(
+                            "axudp: interlink to {=str} established",
+                            call_str(&peer, &mut name)
+                        );
                     }
                     _ => {}
                 },
@@ -1123,7 +1224,7 @@ fn post_one(
                             defmt::warn!("axudp: relay pipe full, dropping {=usize}B", info.len());
                         }
                     }
-                    Role::None => {}
+                    Role::None | Role::Interlink => {}
                 },
                 DataLinkSignal::DisconnectIndication | DataLinkSignal::DisconnectConfirm => {
                     let mut name = [0u8; 16];
