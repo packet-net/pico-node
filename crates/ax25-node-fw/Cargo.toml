@@ -63,6 +63,12 @@ embassy-time     = { version = "0.5", default-features = false, features = ["def
 embassy-sync     = { version = "0.8", default-features = false, features = ["defmt"] }
 embassy-futures  = { version = "0.1", default-features = false }
 
+# --- OTA: A/B firmware update (embassy-boot). The app stages a new image into
+# the DFU partition via FirmwareUpdater and marks itself good early in main; the
+# bootloader (crates/ax25-node-bootloader) performs the swap + rollback. The
+# partition offsets come from memory.x (__bootloader_* symbols). See docs/OTA.md.
+embassy-boot-rp = { version = "0.10", default-features = false, features = ["defmt"] }
+
 # --- WiFi (CYW43439) over PIO-SPI ---
 cyw43     = { version = "0.7", default-features = false, features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10", default-features = false, features = ["defmt"] }

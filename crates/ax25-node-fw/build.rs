@@ -21,6 +21,15 @@ fn main() {
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // OTA build knobs read via option_env! (src/ota.rs, src/main.rs). Declared
+    // here so changing them actually forces a recompile — without this, cargo
+    // would serve a cached build and silently ignore the new value.
+    println!("cargo:rerun-if-env-changed=OTA_BUILD_TAG");
+    println!("cargo:rerun-if-env-changed=OTA_FORCE_BRICK");
+    // Existing compile-time config knobs (config.rs) — same rationale.
+    println!("cargo:rerun-if-env-changed=NODE_CALLSIGN");
+    println!("cargo:rerun-if-env-changed=MQTT_HOST");
+
     // Gate 7 (HW-BRINGUP.md §4): the embedded-test harness's linker script. The
     // embedded-test crate sits in [dependencies] (not dev-) precisely so its
     // build script puts embedded-test.x on the search path for ALL targets —

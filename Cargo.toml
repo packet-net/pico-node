@@ -32,6 +32,7 @@ members = [
 #     cargo build --manifest-path crates/ax25-node-fw/Cargo.toml --release
 exclude = [
     "crates/ax25-node-fw",
+    "crates/ax25-node-bootloader",
 ]
 
 # Shared package metadata inherited by the workspace member(s) via

@@ -1,87 +1,133 @@
-# OTA firmware update — feasibility, design, and plan
+# OTA firmware update — design + implementation
 
-*Written 2026-06-07 answering Tom's question: "is any OTA firmware upgrade path
-possible? I want no requirement for users to have or use a debug probe."*
+*Implemented 2026-06-07 (PR follows the design originally written the same day).
+Answers Tom's question: "is any OTA firmware upgrade path possible? I want no
+requirement for users to have or use a debug probe."*
 
 ## Short answer
 
-**Two separate things:**
+**Two separate things, both now true:**
 
-1. **Users already need no debug probe today.** The released `.uf2` (v0.3.0+)
-   flashes by **BOOTSEL + drag-and-drop over USB** — hold BOOTSEL, plug the
-   Pico's USB, drag the UF2 onto the `RPI-RP2` drive. No probe, no soldering.
-   That covers initial flash and any re-flash where someone can touch the board.
+1. **No debug probe is needed to flash.** The released `.uf2` flashes by
+   **BOOTSEL + drag-and-drop over USB** — hold BOOTSEL, plug the Pico's USB, drag
+   the UF2 onto the `RPI-RP2` drive. No probe, no soldering.
 
-2. **Over-the-air (network) update is also feasible** — for genuinely remote /
-   headless nodes you can't physically reach. It **fits**: the firmware image is
-   **~503 KB** (the UF2 looks like ~1 MB only because UF2 stores 256 payload
-   bytes per 512-byte block), so two copies (A/B) sit comfortably in the Pico
-   W's 2 MB flash. This document is the validated design; it's the next focused
-   piece of work (it changes the flash layout + the first-flash story, so it
-   wants its own careful, bench-tested PR — a half-built bootloader bricks
-   boards).
+2. **Over-the-air (network) update works.** A configured, networked node serves a
+   firmware-upload page at **`http://<node-ip>/`**; drop in the raw app image and
+   it writes it to a spare flash partition, reboots into it on **trial**, and
+   **rolls back automatically** if the new image fails to confirm itself. The
+   real image is **~510 KB**, so two copies (A/B) fit comfortably in the Pico W's
+   2 MB flash. Verified on hardware (see "Verification" below).
 
-## Why A/B, and the space budget
+## Architecture
 
-The power-fail-safe approach is **`embassy-boot` + `embassy-boot-rp`** (0.10):
-a small bootloader manages two equal partitions (ACTIVE + DFU) and a state
-sector. The app writes a new image into DFU, marks it, and resets; the
-bootloader swaps DFU↔ACTIVE and boots the new image on a **trial** — if the new
-firmware doesn't "mark itself good" (we do, early in `main`), the next boot
-**rolls back** to the previous image. A bad update self-heals; a truly dead
-image is still recoverable via BOOTSEL.
+`embassy-boot` A/B scheme. A small **bootloader** (`crates/ax25-node-bootloader`,
+`embassy-boot-rp` 0.10) runs first on every boot; it inspects a state partition
+and, if the app staged + marked an update, swaps DFU↔ACTIVE before chaining the
+active image; if a prior trial never confirmed itself, it reverts. The
+**application** (`crates/ax25-node-fw`) is now **always bootloader-chained** — it
+is not independently bootable — and does two OTA things (`src/ota.rs`):
 
-Flash budget (2 MB = 0x10000000–0x10200000), measured against our 503 KB image:
+- **Marks itself good** early in `main` (`mark_booted_early`), confirming any
+  pending trial. Idempotent + wear-free on a normal boot (magic already set).
+- **Serves the upload** (`http_task`, STA mode, port 80): `POST /firmware`
+  streams the raw image straight into the DFU partition via `FirmwareUpdater`,
+  marks it for swap, and resets.
+
+**No watchdog.** A hung trial still self-heals: the next reset finds the
+unconfirmed swap and reverts. (A trial that *resets itself* — e.g. a crash that
+reboots — auto-reverts within one extra cycle, with no human present. A trial
+that hangs hard needs one manual reset/power-cycle to trigger the revert.) We
+deliberately omit `WatchdogFlash`: an 8 s watchdog would fight the app's slow
+WiFi-join boot and the large OTA erases.
+
+## Flash layout (2 MB Pico W)
+
+Must match between `crates/ax25-node-bootloader/memory.x` and
+`crates/ax25-node-fw/memory.x`:
 
 | Region | Offset | Size |
 |---|---|---|
 | BOOT2 | 0x10000000 | 256 B |
-| Bootloader | 0x10000100 | ~64 KB |
-| Bootloader state | 0x10010000 | 4 KB |
-| **ACTIVE** (running app) | 0x10011000 | **896 KB** |
-| **DFU** (staged update) | 0x100F1000 | **896 KB (+scratch)** |
-| *(free gap)* | | ~168 KB |
-| Config + routing store (existing) | 0x101FC000 | 16 KB |
+| Bootloader | 0x10000100 | 32 KB (uses ~9.5 KB) |
+| Bootloader state | 0x10008000 | 4 KB |
+| **ACTIVE** (running app) | 0x10009000 | **896 KB** |
+| **DFU** (staged update) | 0x100E9000 | **900 KB** (= ACTIVE + 1 scratch page) |
+| *(free gap)* | 0x101CA000 | ~200 KB |
+| Config + routing store | 0x101FC000 | 16 KB |
 
-896 KB partitions for a 503 KB image = ~390 KB headroom for growth. The
-existing config/routing sectors (top 16 KB) are untouched.
+The ~510 KB image leaves ~386 KB of headroom in ACTIVE. The config + NET/ROM
+routing sectors (top 16 KB, `src/config_store.rs` + `src/netrom_store.rs`) are at
+absolute offsets in the full-chip Flash driver — untouched by OTA and by the
+relink (they sit in the gap above DFU, outside the app's FLASH region).
 
-## Delivery path: the captive portal / HTTP upload
+**Flash sharing:** there is one `FLASH` peripheral, owned by `config_store`. The
+OTA path *takes* it (`config_store::take_flash_for_ota`) and never returns it —
+every OTA path ends in a reset, so that's fine.
 
-The least-friction UX (and the one that needs no extra tooling): the node's
-existing HTTP server gains a **firmware-upload page**. Drag the new `.bin` in a
-browser → it streams into the DFU partition via `embassy_boot`'s
-`FirmwareUpdater`, marks it, and reboots into the trial. Works from a phone on
-the node's AP, or from a browser on the LAN. A `POST` of the raw image (not UF2
-— we want the plain binary, no 2× block overhead) is all it takes. An MQTT- or
-HTTP-pull trigger ("fetch this URL and update") is a later convenience on top.
+## Using it
 
-## Implementation steps (the next PR)
+- **Check the running build:** `GET http://<node-ip>/version` → plain-text build
+  tag (the crate version by default; override with `OTA_BUILD_TAG` at build time).
+- **Update:** browse `http://<node-ip>/`, pick the raw **`pico-node-app.bin`**
+  (NOT the `.uf2`), upload. The node writes it, reboots, and swaps. Reconnect in
+  ~30 s; `/version` should show the new build.
+- **AP mode:** the captive portal owns :80 there, so OTA isn't offered in AP mode
+  — you're physically present, so use BOOTSEL.
 
-1. **Bootloader binary** — a tiny crate using `embassy-boot-rp`'s `BootLoader`,
-   its own `memory.x` (BOOT2 + bootloader region + the active/dfu/state symbols).
-2. **App relink** — `memory.x` FLASH origin moves to the ACTIVE offset; export
-   the DFU/STATE symbols for `FirmwareUpdater`.
-3. **Mark-good** — early in `main`, `FirmwareUpdater::mark_booted()` so a
-   successful boot confirms the trial (else the bootloader rolls back).
-4. **Flash sharing** — the single `FLASH` peripheral is already owned by
-   `config_store`'s `ConfigService`; the OTA writer reuses it (a `config_store`
-   helper hands the DFU/STATE partitions to a `BlockingFirmwareUpdater`), so
-   there's one owner and no aliasing.
-5. **HTTP upload** — a `POST /firmware` (+ a small upload page) streaming the
-   image into DFU, then `mark_updated()` + `SCB::sys_reset()`.
-6. **First-flash story** — ship a *combined* bootloader+app UF2 for the initial
-   BOOTSEL flash (built by merging the two images), so the out-of-box experience
-   is unchanged; OTA takes over after that.
-7. **Bench verification** — flash bootloader+app, OTA a deliberately-changed
-   build (bumped version string), confirm the swap boots the new image, then
-   confirm rollback by OTA-ing a deliberately-broken image and watching the
-   bootloader revert. Only claim OTA works once both are observed on hardware.
+**Security:** the upload is unauthenticated, like the captive portal — anyone on
+the node's LAN can push firmware. Fine for a hobby node on a trusted LAN; gate it
+(a token, or signed images via embassy-boot's `_verify` ed25519 support) before
+exposing a node to an untrusted network.
+
+## Building the artifacts
+
+- **Bootloader:** `cd crates/ax25-node-bootloader && cargo build --release`
+- **App:** `cd crates/ax25-node-fw && cargo build --release` → ELF; the raw
+  OTA image is `rust-objcopy -O binary <elf> pico-node-app.bin`.
+- **Combined first-flash UF2** (bootloader + app, for BOOTSEL):
+  ```
+  picotool uf2 convert <bootloader-elf> -t elf bootloader.uf2
+  picotool uf2 convert <app-elf>        -t elf app.uf2
+  cat bootloader.uf2 app.uf2 > pico-node-combined.uf2
+  ```
+  UF2 blocks are independent (each carries its own target address + the RP2040
+  family id), so concatenation is a valid combined image. `scripts/package-ota.sh`
+  automates this.
+
+## Bench notes
+
+Because the app is now bootloader-chained, the dev loop and on-target tests need
+the **bootloader pre-flashed once**:
+`probe-rs download --chip RP2040 <bootloader-elf>`. Thereafter `cargo run` /
+`cargo test` flash only the app/test to ACTIVE and the resident bootloader chains
+them. (CI is unaffected — it only link-checks.)
+
+## Verification (on hardware, 2026-06-07)
+
+Proven end-to-end on the bench Pico W (probe used only to flash the bootloader +
+the initial app; the updates themselves went over WiFi):
+
+- **Chained boot:** bootloader → relinked app at ACTIVE → `mark_booted` → full
+  service (telnet `M9YYY-9}`, AXUDP, OTA server), with the stored flash config
+  (callsign/WiFi) preserved through the relink.
+- **Swap:** `/version` = `base`; `POST /firmware` of a `v2`-tagged image →
+  reboot → bootloader swap → `/version` = `v2`. The new image booted and ran.
+- **Rollback:** from `v2`, OTA'd a deliberately-broken image (resets before
+  marking good). The bootloader swapped it in, it self-reset, the bootloader
+  detected the unconfirmed trial and reverted — `/version` back to `v2`, with no
+  human intervention.
+- **Combined UF2:** structurally validated (2078 blocks, RP2040 family, segments
+  at 0x10000000 and 0x10009000, state sector left erased) and byte-identical to
+  the probe-flashed images that booted. The literal BOOTSEL drag-drop wasn't
+  exercised on the remote bench (no physical button access).
 
 ## Risk + recovery
 
-- Power loss mid-update is safe: ACTIVE is untouched until the bootloader swaps,
-  and the swap itself is journaled by `embassy-boot`.
-- A bad image that boots-but-misbehaves rolls back automatically (trial/mark-good).
-- A catastrophic image (won't boot at all) is recovered with BOOTSEL + the
-  combined UF2 — the same no-probe path users already have.
+- Power loss mid-update is safe: ACTIVE is untouched until the bootloader's
+  journaled swap; an interrupted DFU write is simply never marked, so nothing
+  swaps.
+- A bad-but-self-resetting image rolls back automatically; a hard-hung image
+  rolls back on the next manual reset.
+- A catastrophic image is always recoverable with BOOTSEL + the combined UF2 —
+  the same no-probe path users already have.

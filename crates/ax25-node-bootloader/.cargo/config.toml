@@ -1,0 +1,18 @@
+# Bootloader build config. Standalone crate (excluded from the workspace), so
+# this is the active cargo config when building from this directory.
+#
+# Link args (link.x / link-rp.x / --nmagic / defmt.x) are set by build.rs via
+# rustc-link-arg-bins — NOT here — so they apply once and in the right order.
+# No flip-link: the bootloader is tiny and chains away immediately.
+
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+# Flash + attach over SWD on the bench. The bootloader is flashed once; on the
+# rig probe-rs downloads it to its linked address (0x10000000).
+runner = "probe-rs run --chip RP2040"
+
+[env]
+DEFMT_LOG = "debug"
+DEFMT_RTT_BUFFER_SIZE = "1024"
