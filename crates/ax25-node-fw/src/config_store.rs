@@ -238,6 +238,7 @@ impl ConfigService {
 
     /// Tear down into the flash driver (test support: lets a fresh service
     /// re-read what this one wrote).
+    #[allow(dead_code)] // bin build: consumed by tests/on_target.rs (+ the future portal)
     pub fn into_flash(self) -> ConfigFlash {
         self.flash
     }
@@ -245,6 +246,7 @@ impl ConfigService {
     /// Erase both config sectors — back to factory defaults on next boot.
     /// (The provisioning flow's "factory reset"; also used by the on-target
     /// test so it never leaves its fixtures in the real store.)
+    #[allow(dead_code)] // bin build: consumed by tests/on_target.rs (+ the future portal)
     pub fn factory_reset(&mut self) -> Result<(), &'static str> {
         self.flash
             .blocking_erase(SECTOR_A, SECTOR_A + ERASE_SIZE as u32)

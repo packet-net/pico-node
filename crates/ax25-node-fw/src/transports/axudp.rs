@@ -26,19 +26,31 @@
 //! retransmission, ack timing and dead-peer link failure (N2 exhausted →
 //! teardown) run exactly as the SDL tables specify.
 //!
+//! **NET/ROM L4 circuits terminate here too**: inbound PID-0xCF I-frames are
+//! interlink datagrams, fed to a [`NetRomConnector`] (the host-tested sans-io
+//! L4 stack). Circuits addressed to this node are auto-accepted and get the
+//! node console attached — `C PICO` from any NET/ROM neighbour lands at the
+//! same prompt L2 users get; the connector's outbound datagrams ride back as
+//! PID-0xCF I-frames over the neighbour's L2 session.
+//!
 //! Single-transport ownership (this task owns `Sessions` exclusively) keeps the
 //! `&mut` story trivial; when a second connected-mode transport arrives the
 //! manager moves behind the supervisor seam `session.rs` documents.
 
-use ax25_node_core::ax25::{Callsign, PID_NO_LAYER3};
+use ax25_node_core::ax25::{Callsign, PID_NETROM, PID_NO_LAYER3};
 use ax25_node_core::axudp;
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
 use ax25_node_core::console::{DispatchOutcome, LineAssembler, TransportKind};
 use ax25_node_core::netrom::wire::Alias;
-use ax25_node_core::netrom::{NetRomOriginator, NetRomOriginatorOptions};
+use ax25_node_core::netrom::{
+    CircuitEvent, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomOriginator,
+    NetRomOriginatorOptions,
+};
 use ax25_node_core::netrom::{ObserveOutcome, PortId};
-use ax25_node_core::sdl::{classify_incoming, DataLinkSignal, Event};
+use ax25_node_core::sdl::{
+    classify_incoming, DataLinkSignal, Event, FrameSpec, UnnumberedKind, WireSink,
+};
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -109,6 +121,11 @@ enum FollowUp {
     /// A bridged link ended. The surviving side is handled by its own bridge
     /// direction: a console user gets a notice + prompt, a target gets DISC'd.
     BridgeEnded { survivor: Callsign },
+    /// An inbound PID-0xCF interlink datagram for the NET/ROM connector.
+    NetRom {
+        neighbour: Callsign,
+        datagram: Vec<u8>,
+    },
 }
 
 #[embassy_executor::task]
@@ -152,6 +169,18 @@ pub async fn task(
         node_call: Some(my_call),
         obsolete_minimum: None,
     });
+    // The NET/ROM L4 connector: terminates circuits addressed to us (and can
+    // forward transit datagrams). Sans-io: fed by FollowUp::NetRom, drained in
+    // service_l4.
+    let mut connector = NetRomConnector::new(
+        my_call,
+        NetRomConnectorOptions {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    let mut circuits: [Option<CircuitConsole>; 4] = [const { None }; 4];
+
     let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
     let mut next_nodes_at = Instant::now(); // announce on the first tick
     if netrom_cfg.originate {
@@ -227,6 +256,43 @@ pub async fn task(
                     match socket.send_to(&dgram, ep).await {
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
+                    }
+                }
+
+                // L4 circuit timers (ack/retransmit/idle) ride the beacon tick.
+                connector.tick(netrom.table(), now_ms());
+                {
+                    let mut queue: VecDeque<(usize, Event)> = VecDeque::new();
+                    service_l4(
+                        &mut L4 {
+                            connector: &mut connector,
+                            netrom: &netrom,
+                            circuits: &mut circuits,
+                        },
+                        &peers,
+                        &mut queue,
+                        &console_id,
+                        &prompt,
+                    );
+                    while let Some((i, ev)) = queue.pop_front() {
+                        drive(
+                            &mut sessions,
+                            &mut peers,
+                            &socket,
+                            &heard,
+                            beacon_ep,
+                            my_call,
+                            &mut L4 {
+                                connector: &mut connector,
+                                netrom: &netrom,
+                                circuits: &mut circuits,
+                            },
+                            i,
+                            ev,
+                            &console_id,
+                            &prompt,
+                        )
+                        .await;
                     }
                 }
 
@@ -316,10 +382,35 @@ pub async fn task(
                         .flatten()
                         .any(|ps| ps.peer == frame.source.callsign && ps.local == dest);
                 if for_us && !frame.is_ui() {
+                    let peer = frame.source.callsign;
+
+                    // v2.2 XID negotiation arrives BEFORE SABM and isn't an SDL
+                    // event (classify_incoming returns None — the tables carry
+                    // only the initiator MDL). Detect it by control byte (0xAF
+                    // + optional P/F) and answer like a v2.0 station: DM, so the
+                    // peer (BPQ does) falls back to a plain SABM. Only when no
+                    // session is up — a mid-session XID is ignored like any
+                    // other unclassified frame.
+                    const XID: u8 = 0xAF;
+                    if frame.control & !0x10 == XID && sessions.session_for(&peer).is_none() {
+                        defmt::info!("axudp: XID received — answering DM (v2.0 fallback)");
+                        let sink = WireSink::new(my_call, peer, alloc::vec::Vec::new());
+                        let dm = sink.build_frame(&FrameSpec::Unnumbered {
+                            kind: UnnumberedKind::Dm,
+                            is_command: false,
+                            pf: (frame.control & 0x10) != 0,
+                            expedited: false,
+                        });
+                        let dgram = axudp::encode_datagram(&dm);
+                        if let Err(e) = socket.send_to(&dgram, meta.endpoint).await {
+                            defmt::warn!("axudp: DM send error {:?}", e);
+                        }
+                        continue;
+                    }
+
                     let Some(event) = classify_incoming(&frame) else {
                         continue;
                     };
-                    let peer = frame.source.callsign;
                     let Some(i) = peer_slot(&mut peers, peer, my_call, meta.endpoint) else {
                         defmt::warn!("axudp: peer table full, dropping session frame");
                         continue;
@@ -339,6 +430,11 @@ pub async fn task(
                         &heard,
                         beacon_ep,
                         my_call,
+                        &mut L4 {
+                            connector: &mut connector,
+                            netrom: &netrom,
+                            circuits: &mut circuits,
+                        },
                         i,
                         event,
                         &console_id,
@@ -368,6 +464,11 @@ pub async fn task(
                             &heard,
                             beacon_ep,
                             my_call,
+                            &mut L4 {
+                                connector: &mut connector,
+                                netrom: &netrom,
+                                circuits: &mut circuits,
+                            },
                             i,
                             session::expiry_event(id),
                             &console_id,
@@ -398,6 +499,11 @@ pub async fn task(
                                 &heard,
                                 beacon_ep,
                                 my_call,
+                                &mut L4 {
+                                    connector: &mut connector,
+                                    netrom: &netrom,
+                                    circuits: &mut circuits,
+                                },
                                 i,
                                 Event::DlConnectRequest,
                                 &console_id,
@@ -417,6 +523,11 @@ pub async fn task(
                             &heard,
                             beacon_ep,
                             my_call,
+                            &mut L4 {
+                                connector: &mut connector,
+                                netrom: &netrom,
+                                circuits: &mut circuits,
+                            },
                             i,
                             Event::DlDataRequest(PID_NO_LAYER3, buf[..n].to_vec()),
                             &console_id,
@@ -435,6 +546,11 @@ pub async fn task(
                             &heard,
                             beacon_ep,
                             my_call,
+                            &mut L4 {
+                                connector: &mut connector,
+                                netrom: &netrom,
+                                circuits: &mut circuits,
+                            },
                             i,
                             Event::DlDisconnectRequest,
                             &console_id,
@@ -446,6 +562,12 @@ pub async fn task(
             },
         }
     }
+}
+
+/// A node-console session attached to an inbound NET/ROM L4 circuit.
+struct CircuitConsole {
+    conn: NetRomConnection,
+    asm: LineAssembler,
 }
 
 /// What the telnet-relay select-arm produced.
@@ -468,6 +590,7 @@ async fn drive(
     heard: &[Option<(Callsign, IpEndpoint)>; 8],
     beacon_ep: Option<IpEndpoint>,
     my_call: Callsign,
+    l4: &mut L4<'_>,
     start: usize,
     event: Event,
     console_id: &Identity,
@@ -486,7 +609,11 @@ async fn drive(
         let Some(ps) = peers[i].as_mut() else {
             continue;
         };
-        let (frames, followups) = post_one(sessions, ps, ev, console_id, prompt);
+        let peer_is_node = {
+            let t = l4.netrom.table();
+            t.neighbour(&ps.peer).is_some() || t.destination(&ps.peer).is_some()
+        };
+        let (frames, followups) = post_one(sessions, ps, ev, console_id, prompt, peer_is_node);
         let ep = ps.endpoint;
         send_all(socket, ep, frames).await;
         if REBOOT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
@@ -548,6 +675,17 @@ async fn drive(
                         queue.push_back((ti, Event::DlDataRequest(PID_NO_LAYER3, data)));
                     }
                 }
+                FollowUp::NetRom {
+                    neighbour,
+                    datagram,
+                } => {
+                    l4.connector.on_interlink_data(
+                        l4.netrom.table(),
+                        neighbour,
+                        &datagram,
+                        now_ms(),
+                    );
+                }
                 FollowUp::BridgeEnded { survivor } => {
                     if let Some(si) = find_peer(peers, &survivor) {
                         let sp = peers[si].as_mut().expect("present");
@@ -572,6 +710,124 @@ async fn drive(
                     }
                 }
             }
+        }
+
+        // L4 housekeeping every round: attach consoles to fresh circuits,
+        // service circuit events, and ship the connector's outbound interlink
+        // datagrams over the right L2 sessions.
+        service_l4(l4, peers, &mut queue, console_id, prompt);
+    }
+}
+
+/// Millisecond monotonic tick for the sans-io NET/ROM layers.
+fn now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+/// The L4 connector bundle threaded through [`drive`].
+struct L4<'a> {
+    connector: &'a mut NetRomConnector,
+    netrom: &'a session::NetRom,
+    circuits: &'a mut [Option<CircuitConsole>; 4],
+}
+
+/// Drain the connector: new inbound circuits get the node console + banner;
+/// circuit data runs the console dispatcher; closes detach; outbound interlink
+/// datagrams are queued as PID-0xCF I-frames to the neighbour's L2 session.
+fn service_l4(
+    l4: &mut L4<'_>,
+    peers: &[Option<PeerState>],
+    queue: &mut VecDeque<(usize, Event)>,
+    console_id: &Identity,
+    prompt: &str,
+) {
+    let table = l4.netrom.table();
+
+    for conn in l4.connector.take_incoming_connections() {
+        let mut name = [0u8; 16];
+        defmt::info!(
+            "axudp: NET/ROM circuit up from {=str} — attaching console",
+            call_str(&conn.peer, &mut name)
+        );
+        if let Some(slot) = l4.circuits.iter_mut().find(|c| c.is_none()) {
+            *slot = Some(CircuitConsole {
+                conn,
+                asm: LineAssembler::default(),
+            });
+            let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
+            l4.connector.write(table, &conn, &banner, now_ms());
+        } else {
+            defmt::warn!("axudp: circuit table full, disconnecting");
+            l4.connector.disconnect(table, &conn, now_ms());
+        }
+    }
+
+    for (key, event) in l4.connector.take_events() {
+        match event {
+            CircuitEvent::Connected => {} // outbound circuits only; none yet
+            CircuitEvent::DataReceived(data) => {
+                let Some(slot) = l4.circuits.iter_mut().flatten().find(|c| c.conn.key == key)
+                else {
+                    continue;
+                };
+                let conn = slot.conn;
+                for line in slot.asm.push(&data) {
+                    let cmd = parse_bytes(&line);
+                    let resp = dispatch(&cmd, console_id, TransportKind::Ax25);
+                    let mut reply = resp.body;
+                    let mut disconnect = false;
+                    match resp.outcome {
+                        DispatchOutcome::Continue => {}
+                        DispatchOutcome::Disconnect => disconnect = true,
+                        DispatchOutcome::ConfigOp(op) => {
+                            let (text, reboot) = crate::config_store::handle_op(&op);
+                            reply.extend_from_slice(
+                                &ax25_node_core::console::service::render_line(
+                                    &text,
+                                    TransportKind::Ax25,
+                                ),
+                            );
+                            if reboot {
+                                REBOOT_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        DispatchOutcome::ConnectThenRelay(_call) => {
+                            reply.extend_from_slice(
+                                b"...onward connects from a NET/ROM circuit aren't wired yet\r",
+                            );
+                        }
+                    }
+                    if !disconnect {
+                        reply.extend_from_slice(prompt.as_bytes());
+                    }
+                    if !reply.is_empty() {
+                        l4.connector.write(table, &conn, &reply, now_ms());
+                    }
+                    if disconnect {
+                        l4.connector.disconnect(table, &conn, now_ms());
+                    }
+                }
+            }
+            CircuitEvent::Closed(_reason) => {
+                defmt::info!("axudp: NET/ROM circuit closed");
+                for slot in l4.circuits.iter_mut() {
+                    if matches!(slot, Some(c) if c.conn.key == key) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+    }
+
+    for send in l4.connector.take_interlink_sends() {
+        if let Some(i) = find_peer(peers, &send.neighbour) {
+            queue.push_back((i, Event::DlDataRequest(PID_NETROM, send.datagram)));
+        } else {
+            let mut name = [0u8; 16];
+            defmt::warn!(
+                "axudp: no L2 session to interlink neighbour {=str}, dropping datagram",
+                call_str(&send.neighbour, &mut name)
+            );
         }
     }
 }
@@ -703,6 +959,7 @@ fn post_one(
     event: Event,
     console_id: &Identity,
     prompt: &str,
+    peer_is_node: bool,
 ) -> (Vec<Vec<u8>>, Vec<FollowUp>) {
     let peer = ps.peer;
     let local = ps.local;
@@ -720,18 +977,29 @@ fn post_one(
             match sig {
                 DataLinkSignal::ConnectIndication => {
                     let mut name = [0u8; 16];
-                    defmt::info!(
-                        "axudp: AX.25 session up from {=str} — attaching console",
-                        call_str(&peer, &mut name)
-                    );
-                    ps.role = Role::Console(LineAssembler::default());
-                    let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
-                    to_send.extend(sessions.post_with_local(
-                        local,
-                        peer,
-                        Event::DlDataRequest(PID_NO_LAYER3, banner),
-                        &mut ps.timers,
-                    ));
+                    if peer_is_node {
+                        // A known NET/ROM node connecting = an interlink (it
+                        // will speak PID 0xCF). No console, no banner — a 0xF0
+                        // banner at a node's interlink is garbage to it.
+                        defmt::info!(
+                            "axudp: interlink L2 up from node {=str}",
+                            call_str(&peer, &mut name)
+                        );
+                        ps.role = Role::None;
+                    } else {
+                        defmt::info!(
+                            "axudp: AX.25 session up from {=str} — attaching console",
+                            call_str(&peer, &mut name)
+                        );
+                        ps.role = Role::Console(LineAssembler::default());
+                        let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
+                        to_send.extend(sessions.post_with_local(
+                            local,
+                            peer,
+                            Event::DlDataRequest(PID_NO_LAYER3, banner),
+                            &mut ps.timers,
+                        ));
+                    }
                 }
                 DataLinkSignal::ConnectConfirm => match ps.role {
                     Role::TelnetRelay => {
@@ -748,6 +1016,14 @@ fn post_one(
                     }
                     _ => {}
                 },
+                DataLinkSignal::DataIndication(pid, info) if pid == PID_NETROM => {
+                    // An interlink datagram (NET/ROM L3/L4) — never console
+                    // text. Routed to the connector by drive().
+                    followups.push(FollowUp::NetRom {
+                        neighbour: peer,
+                        datagram: info,
+                    });
+                }
                 DataLinkSignal::DataIndication(_pid, info) => match &mut ps.role {
                     Role::Console(asm) => {
                         let lines = asm.push(&info);
