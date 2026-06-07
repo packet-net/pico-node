@@ -95,6 +95,18 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
             match resp.outcome {
                 DispatchOutcome::Continue => {}
                 DispatchOutcome::Disconnect => return,
+                DispatchOutcome::ConfigOp(op) => {
+                    let (text, reboot) = crate::config_store::handle_op(&op);
+                    let rendered = ax25_node_core::console::service::render_line(&text, KIND);
+                    if !write_all(socket, &rendered).await {
+                        return;
+                    }
+                    if reboot {
+                        // Flush the farewell, then reset — never returns.
+                        let _ = socket.flush().await;
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
+                }
                 DispatchOutcome::ConnectThenRelay(call) => {
                     match relay::begin(call) {
                         Ok(()) => {

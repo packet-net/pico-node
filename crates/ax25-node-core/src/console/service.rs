@@ -29,7 +29,7 @@ pub struct Identity {
 }
 
 /// What the loop should do after handling a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOutcome {
     /// Stay connected; write [`Response::body`] then re-prompt.
     Continue,
@@ -39,6 +39,29 @@ pub enum DispatchOutcome {
     /// relay (it's I/O), then resume the loop. [`Response::body`] is the
     /// "Connecting to …" line to write first.
     ConnectThenRelay(crate::ax25::Callsign),
+    /// A configuration operation (`SHOW`/`SET`/`SAVE`/`REBOOT`) — executed by
+    /// the embedder, which owns the config schema, the flash store and the
+    /// reset vector. [`Response::body`] is empty; the embedder writes its own
+    /// rendered output (then re-prompts, except after a reboot).
+    ConfigOp(ConfigOp),
+}
+
+/// The configuration operations the console can request of the embedder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigOp {
+    /// Display effective + pending configuration.
+    Show,
+    /// Stage `key = value` into the pending configuration.
+    Set {
+        /// Upper-cased key.
+        key: String,
+        /// Raw value text.
+        value: String,
+    },
+    /// Persist the pending configuration to flash.
+    Save,
+    /// Restart the node.
+    Reboot,
 }
 
 /// The result of dispatching one command: bytes to write (already newline-
@@ -135,7 +158,22 @@ pub fn dispatch(cmd: &Command, id: &Identity, kind: TransportKind) -> Response {
             "Connect needs a valid callsign, e.g. C M0LTE-1",
             kind,
         ),
+        Command::ShowConfig => config_op(ConfigOp::Show),
+        Command::Set { key, value } => config_op(ConfigOp::Set {
+            key: key.clone(),
+            value: value.clone(),
+        }),
+        Command::MalformedSet => line("Usage: SET <KEY> <VALUE>  (SHOW lists keys)", kind),
+        Command::Save => config_op(ConfigOp::Save),
+        Command::Reboot => config_op(ConfigOp::Reboot),
         Command::Unknown => line("Unknown command  (type H for help)", kind),
+    }
+}
+
+fn config_op(op: ConfigOp) -> Response {
+    Response {
+        body: Vec::new(),
+        outcome: DispatchOutcome::ConfigOp(op),
     }
 }
 
@@ -152,7 +190,11 @@ fn help_text() -> &'static str {
      \x20 N[odes]            list this node and its ports\n\
      \x20 I[nfo]             node info and version\n\
      \x20 B[ye] / D          disconnect\n\
-     \x20 H[elp] / ?         this help"
+     \x20 H[elp] / ?         this help\n\
+     \x20 SHOW               show configuration\n\
+     \x20 SET <key> <value>  stage a config change\n\
+     \x20 SAVE               persist staged config\n\
+     \x20 REBOOT             restart (applies saved config)"
 }
 
 fn info_text(id: &Identity) -> String {

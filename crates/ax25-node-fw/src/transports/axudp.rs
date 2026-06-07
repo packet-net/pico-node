@@ -57,6 +57,10 @@ use crate::transports::{call_str, parse_endpoint, ui_frame};
 /// Seconds between beacon UI frames when a beacon target is configured.
 const BEACON_INTERVAL_SECS: u64 = 10;
 
+/// Set by a console REBOOT on the AX.25 path; honoured by [`drive`] after the
+/// response frames have been transmitted (so the farewell reaches the user).
+static REBOOT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Where a connected peer's DL signals are routed.
 enum Role {
     /// Connected, no upper attachment (e.g. an outbound link mid-handshake or
@@ -485,6 +489,11 @@ async fn drive(
         let (frames, followups) = post_one(sessions, ps, ev, console_id, prompt);
         let ep = ps.endpoint;
         send_all(socket, ep, frames).await;
+        if REBOOT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
+            // Console REBOOT: give the wire a beat to drain, then reset.
+            Timer::after_millis(250).await;
+            cortex_m::peripheral::SCB::sys_reset();
+        }
         reap(sessions, peers, i);
 
         for f in followups {
@@ -751,6 +760,21 @@ fn post_one(
                             match resp.outcome {
                                 DispatchOutcome::Continue => {}
                                 DispatchOutcome::Disconnect => disconnect = true,
+                                DispatchOutcome::ConfigOp(op) => {
+                                    let (text, reboot) = crate::config_store::handle_op(&op);
+                                    reply.extend_from_slice(
+                                        &ax25_node_core::console::service::render_line(
+                                            &text,
+                                            TransportKind::Ax25,
+                                        ),
+                                    );
+                                    if reboot {
+                                        // The reset fires after this batch of
+                                        // frames is sent (drive() checks).
+                                        REBOOT_PENDING
+                                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                                 DispatchOutcome::ConnectThenRelay(call) => {
                                     // "Connecting to X..." is already in reply;
                                     // the bridge proper is cross-peer work.

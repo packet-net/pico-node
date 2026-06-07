@@ -124,6 +124,53 @@ pub fn load() -> NodeConfig {
     }
 }
 
+/// Overlay a flash-stored config onto the compiled defaults. Strings are
+/// leaked to `&'static str` — boot-once config, the whole node captures it at
+/// startup (REBOOT applies changes), so the leak is the lifetime model.
+pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig) {
+    fn leak<const N: usize>(s: &heapless::String<N>) -> &'static str {
+        alloc::boxed::Box::leak(alloc::string::String::from(s.as_str()).into_boxed_str())
+    }
+    if let Some(v) = &st.callsign {
+        if let Some(call) = Callsign::parse(v.as_str()) {
+            cfg.identity.callsign = call;
+        }
+    }
+    if let Some(v) = &st.alias {
+        cfg.identity.alias = leak(v);
+    }
+    if let Some(v) = &st.grid {
+        cfg.identity.grid = leak(v);
+    }
+    if let Some(v) = &st.hostname {
+        cfg.hostname = leak(v);
+    }
+    if let Some(v) = &st.wifi_ssid {
+        cfg.wifi.ssid = leak(v);
+    }
+    if let Some(v) = &st.wifi_pass {
+        cfg.wifi.password = leak(v);
+    }
+    if let Some(v) = &st.beacon_target {
+        cfg.axudp.beacon_target = Some(leak(v));
+    }
+    if let Some(v) = &st.kiss_tcp_target {
+        cfg.kiss_tcp.target = Some(leak(v));
+    }
+    if let Some(v) = st.axudp_port {
+        cfg.axudp.listen_port = v;
+    }
+    if let Some(v) = st.telnet_port {
+        cfg.telnet.port = v;
+    }
+    if let Some(v) = st.nodes_interval_secs {
+        cfg.netrom.nodes_interval_secs = v;
+    }
+    if let Some(v) = st.originate {
+        cfg.netrom.originate = v;
+    }
+}
+
 /// Parse an optional build-env decimal, falling back on absence or garbage.
 fn parse_u32(s: Option<&str>, default: u32) -> u32 {
     match s {

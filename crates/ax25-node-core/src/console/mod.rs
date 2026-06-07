@@ -26,4 +26,4 @@ pub mod service;
 pub use command::{parse, Command};
 pub use connection::{NodeConnection, TransportKind};
 pub use line::LineAssembler;
-pub use service::{render_line, DispatchOutcome, Identity, Response};
+pub use service::{render_line, ConfigOp, DispatchOutcome, Identity, Response};
