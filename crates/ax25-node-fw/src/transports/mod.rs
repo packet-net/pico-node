@@ -3,10 +3,12 @@
 //!
 //! Each is an Embassy task that owns its socket/UART, frames bytes with the
 //! portable codecs in [`ax25_node_core`], and exchanges AX.25 frames with the
-//! [`crate::session`] layer. STUBS — the I/O bodies are filled in once the
-//! embassy-net/embassy-rp APIs are available against the pinned versions.
+//! [`crate::session`] layer.
 
 pub mod axudp;
-pub mod kiss_serial;
-pub mod kiss_tcp;
-pub mod telnet;
+// GATE 4–6 (HW-BRINGUP.md §4): the remaining transports return gate by gate —
+// telnet (Gate 4), kiss_tcp (Gate 5), kiss_serial (Gate 6; its UART generics
+// also don't compile against embassy-rp 0.10 yet).
+// pub mod kiss_serial;
+// pub mod kiss_tcp;
+// pub mod telnet;

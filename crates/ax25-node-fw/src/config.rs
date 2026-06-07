@@ -45,6 +45,10 @@ pub struct WifiConfig {
 pub struct AxudpConfig {
     pub listen_port: u16,
     pub include_fcs: bool, // XRouter AXIP-with-CRC variant
+    /// Optional `"a.b.c.d:port"` endpoint to beacon UI frames at (the Gate-3
+    /// host harness). From the build env (`AXUDP_BEACON_TARGET`) — a LAN
+    /// detail, never a committed default (HW-BRINGUP §5).
+    pub beacon_target: Option<&'static str>,
 }
 
 /// KISS-over-TCP to net-sim (capability 2).
@@ -85,6 +89,7 @@ pub fn load() -> NodeConfig {
         axudp: AxudpConfig {
             listen_port: 10093,
             include_fcs: false,
+            beacon_target: option_env!("AXUDP_BEACON_TARGET"),
         },
         kiss_tcp: KissTcpConfig {
             host: "192.168.1.10",
