@@ -1,0 +1,51 @@
+; LinBPQ config for the pico-node AXUDP interop container (HW-BRINGUP §6 peer).
+; Runs with --network host: AXUDP on udp/10093, sysop telnet on tcp/8011.
+
+SIMPLE
+NODECALL=M0LTE-9
+NODEALIAS=BPQ
+LOCATOR=NONE
+
+IDMSG:
+pico-node interop test container (LinBPQ)
+***
+
+BTEXT:
+LinBPQ docker container beacon
+***
+
+; Aggressive timers for the demo: NODES + ID every minute.
+NODESINTERVAL=1
+IDINTERVAL=1
+BTINTERVAL=1
+
+PORT
+ PORTNUM=1
+ ID=AXUDP
+ TYPE=EXTERNAL
+ DRIVER=BPQAXIP
+ QUALITY=192
+ MAXFRAME=4
+ FRACK=5000
+ PACLEN=236
+ CONFIG
+  UDP 10093
+  BROADCAST NODES
+  BROADCAST ID
+  AUTOADDMAP
+  MAP M0LTE-1 PICO_IP UDP 10093 B
+ENDPORT
+
+PORT
+ PORTNUM=2
+ ID=Telnet
+ DRIVER=Telnet
+ CONFIG
+  CMS=0
+  LOGINPROMPT=user:
+  PASSWORDPROMPT=password:
+  MAXSESSIONS=5
+  CTEXT=LinBPQ interop container\n
+  USER=tom,p,tom,"",SYSOP
+  TCPPORT=8011
+ENDPORT
