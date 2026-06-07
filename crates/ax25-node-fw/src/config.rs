@@ -33,7 +33,16 @@ pub struct NodeConfig {
 
 #[derive(Clone)]
 pub struct Identity {
+    /// The node's on-air callsign. When [`callsign_configured`](Self::callsign_configured)
+    /// is `false` this holds the inert placeholder `N0CALL` and the node runs
+    /// **config-only** — it refuses to operate any on-air service (no beacons,
+    /// NODES, AX.25 sessions, interlinks) because transmitting without a
+    /// licensed callsign is illegal. Set a callsign via the captive portal or
+    /// the console `SET CALLSIGN` to bring the node up.
     pub callsign: Callsign,
+    /// `true` once a real callsign has been configured (flash or build env).
+    /// `false` on a fresh node ⇒ provisioning-required mode.
+    pub callsign_configured: bool,
     pub alias: &'static str,
     pub grid: &'static str,
 }
@@ -95,15 +104,18 @@ pub struct NetRomConfig {
 pub fn load() -> NodeConfig {
     NodeConfig {
         hostname: "pico-node",
-        identity: Identity {
-            // The node's on-air identity. It is now reachable (indirectly) from
-            // a live RF network via the lab's BPQ nodes, so this must be a
-            // legally assigned callsign-SSID for THIS station — set per Tom,
-            // 2026-06-07. (The provisioning work, docs/PROVISIONING.md, moves
-            // this to flash config; until then it's a compile-time default.)
-            callsign: Callsign::parse("M9YYY-9").expect("valid default callsign"),
-            alias: "PICO",
-            grid: "IO91wm",
+        identity: {
+            // NO compiled-in callsign by default: the node must be told its
+            // callsign (captive portal / console SET) before it does anything on
+            // the air. A build-env NODE_CALLSIGN is honoured for dev/CI rigs.
+            let env_call = option_env!("NODE_CALLSIGN").and_then(Callsign::parse);
+            Identity {
+                callsign: env_call
+                    .unwrap_or_else(|| Callsign::parse("N0CALL").expect("placeholder")),
+                callsign_configured: env_call.is_some(),
+                alias: option_env!("NODE_ALIAS").unwrap_or("PICO"),
+                grid: option_env!("NODE_GRID").unwrap_or(""),
+            }
         },
         // §5 secrets policy (HW-BRINGUP.md): WiFi credentials are read from the
         // BUILD environment, never committed. Missing creds still build (CI has
@@ -139,6 +151,7 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     if let Some(v) = &st.callsign {
         if let Some(call) = Callsign::parse(v.as_str()) {
             cfg.identity.callsign = call;
+            cfg.identity.callsign_configured = true;
         }
     }
     if let Some(v) = &st.alias {

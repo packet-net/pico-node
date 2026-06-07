@@ -148,8 +148,20 @@ mod firmware {
         // joinable, else the config AP. STA join is bounded (not forever) so a
         // node with no reachable home WiFi falls back to offering its AP. ---
         let call_text = core::str::from_utf8(&call_buf[..call_len]).unwrap_or("?");
-        let sta_ok = if cfg.wifi.ssid.is_empty() {
-            defmt::info!("mode: no WiFi configured — AP mode");
+
+        // A node with no configured callsign MUST NOT operate on the air (illegal
+        // to transmit without a licensed call). It comes up config-only: the AP +
+        // captive portal, nothing else, until a callsign is set. So force AP mode
+        // regardless of any WiFi config.
+        let configured = cfg.identity.callsign_configured;
+        if !configured {
+            defmt::warn!("mode: NO CALLSIGN CONFIGURED — config-only AP mode (set a callsign to operate)");
+        }
+
+        let sta_ok = if !configured || cfg.wifi.ssid.is_empty() {
+            if configured {
+                defmt::info!("mode: no WiFi configured — AP mode");
+            }
             false
         } else {
             net::try_join(&mut control, &cfg.wifi, 3).await
@@ -171,9 +183,9 @@ mod firmware {
             }
         } else {
             // AP mode: become the gateway, serve DHCP (captive portal = step 4).
-            // SSID is "pico-<callsign>" — unique + meaningful in a WiFi list.
+            // SSID is "pico-<callsign>" once configured, "pico-setup" before.
             let mut ssid_buf = String::from("pico-");
-            ssid_buf.push_str(call_text);
+            ssid_buf.push_str(if configured { call_text } else { "setup" });
             net::start_ap(&mut control, &ssid_buf, cfg.wifi.ap_passphrase).await;
             stack = net::start_stack_static(net_device, &spawner).await;
             spawner.spawn(defmt::unwrap!(provisioning::dhcp_server(stack)));
@@ -196,11 +208,24 @@ mod firmware {
                 sta: sta_ok,
                 ..Default::default()
             };
-            let n = call_text.len().min(12);
-            st.callsign[..n].copy_from_slice(&call_text.as_bytes()[..n]);
+            let disp = if configured { call_text } else { "NO CALL" };
+            let n = disp.len().min(12);
+            st.callsign[..n].copy_from_slice(&disp.as_bytes()[..n]);
             oled::set(st);
         }
         spawner.spawn(defmt::unwrap!(oled::task(p.I2C0, p.PIN_4, p.PIN_5, stack)));
+
+        // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
+        // portal are up (so you can set a callsign), but NO on-air transport is
+        // started. Park until reconfigured + rebooted.
+        if !configured {
+            defmt::info!("config-only: set a callsign via the portal (http://192.168.4.1/), then it reboots into service");
+            let mut ticker = Ticker::every(Duration::from_secs(30));
+            loop {
+                ticker.next().await;
+                defmt::info!("awaiting callsign configuration (uptime {=u64}s)", Instant::now().as_secs());
+            }
+        }
 
         // The node console identity + prompt — shared by every console-bearing
         // transport (telnet now, AX.25 sessions on the AXUDP port too).
