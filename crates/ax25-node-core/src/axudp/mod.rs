@@ -1,78 +1,71 @@
 //! AXUDP framing helpers — AX.25-over-UDP for node↔node connectivity over WiFi.
 //!
 //! Ports the framing logic of `Packet.Axudp.AxudpSocket`. AXUDP is the simplest
-//! BPQ-compatible encapsulation: **the UDP datagram payload *is* the AX.25 frame
-//! body** — no opening/closing HDLC flag, and traditionally no FCS (UDP is
-//! reliable enough that the receiver needn't verify one). The one variant is
-//! XRouter's AXIP-with-CRC, which appends the CRC-16/X.25 FCS (low byte first);
-//! `Packet.Axudp` exposes that as the `includeFcs` flag.
+//! BPQ-compatible encapsulation: **the UDP datagram payload is the AX.25 frame
+//! body followed by the CRC-16/X.25 FCS (low byte first)** — no opening/closing
+//! HDLC flag. The FCS is *not* optional: LinBPQ (the de-facto reference)
+//! transmits it on every datagram and silently ignores datagrams without it
+//! (verified on the wire against LinBPQ 6.0.25 during hardware bring-up,
+//! 2026-06-07 — the earlier "FCS-less default" reading of the C# layer did not
+//! survive contact with reality).
 //!
 //! This module is the *pure framing* half. The socket I/O (binding a UDP port,
 //! `send`/`recv`, the peer `IpEndpoint`) lives in the firmware crate over
 //! `embassy_net::udp::UdpSocket` — which maps 1:1 onto this, per the research
-//! note. Here we provide encode (frame → datagram payload) and a best-effort
-//! decode (datagram payload → frame), both host-tested.
+//! note. Here we provide encode (frame → datagram payload) and decode (datagram
+//! payload → FCS-checked frame), both host-tested.
 
 use crate::ax25::Frame;
 use crate::crc;
 use alloc::vec::Vec;
 
-/// Build the AXUDP datagram payload for `frame`.
-///
-/// With `include_fcs == false` (the LinBPQ-accepted default) the payload is just
-/// the AX.25 frame body. With `include_fcs == true` (XRouter / AXIP-with-CRC) the
-/// CRC-16/X.25 FCS is appended, low byte first — matching
-/// `AxudpSocket.SendAsync(..., includeFcs: true)`.
-pub fn encode_datagram(frame: &Frame, include_fcs: bool) -> Vec<u8> {
-    let mut body = frame.encode();
-    if include_fcs {
-        let fcs = crc::compute(&body);
-        body.push((fcs & 0xFF) as u8); // low byte first on the wire
-        body.push((fcs >> 8) as u8);
-    }
+/// Build the AXUDP datagram payload for `frame`: the encoded AX.25 body with
+/// the CRC-16/X.25 FCS appended, low byte first — matching `AxudpSocket.SendAsync`.
+pub fn encode_datagram(frame: &Frame) -> Vec<u8> {
+    append_fcs(frame.encode())
+}
+
+/// Append the AXUDP trailing FCS to already-encoded AX.25 wire octets (the path
+/// for frames emitted by the session runtime, which produces raw wire bytes).
+pub fn append_fcs(mut body: Vec<u8>) -> Vec<u8> {
+    let fcs = crc::compute(&body);
+    body.push((fcs & 0xFF) as u8); // low byte first on the wire
+    body.push((fcs >> 8) as u8);
     body
 }
 
 /// Outcome of decoding a received AXUDP datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedDatagram {
-    /// The decoded frame, or `None` if the bytes didn't parse as AX.25 (the raw
-    /// bytes are still available for monitor/forwarding).
+    /// The decoded frame. `None` if the FCS was missing/invalid or the body
+    /// didn't parse as AX.25 — either way the datagram must not be processed.
     pub frame: Option<Frame>,
-    /// `Some(true)` if a trailing CRC FCS was present and valid, `Some(false)` if
-    /// present but invalid, `None` if no FCS was checked (FCS-less form assumed).
-    pub fcs_valid: Option<bool>,
+    /// Whether a trailing CRC FCS was present and valid. When `false`, `frame`
+    /// is always `None` (a failed integrity check poisons the whole datagram).
+    pub fcs_valid: bool,
 }
 
-/// Best-effort decode of a received AXUDP datagram payload.
-///
-/// AXUDP has no length/type header, so we cannot know for certain whether the
-/// last two octets are an FCS or frame data. Strategy (matching the C# layer's
-/// "best-effort decode, raw bytes retained" contract): first try to parse the
-/// payload as-is; if `check_fcs` is set and the payload is long enough, also test
-/// whether stripping a trailing 2-byte CRC-16/X.25 leaves a frame whose FCS
-/// matches — if so, report it as the validated form.
-pub fn decode_datagram(payload: &[u8], check_fcs: bool) -> ReceivedDatagram {
-    // FCS-less interpretation: the whole payload is the frame.
-    let plain = Frame::decode(payload).ok();
-
-    if check_fcs && payload.len() >= 2 {
-        let (body, fcs_bytes) = payload.split_at(payload.len() - 2);
-        let stored = (fcs_bytes[0] as u16) | ((fcs_bytes[1] as u16) << 8);
-        let computed = crc::compute(body);
-        if stored == computed {
-            if let Ok(frame) = Frame::decode(body) {
-                return ReceivedDatagram {
-                    frame: Some(frame),
-                    fcs_valid: Some(true),
-                };
-            }
-        }
+/// Decode a received AXUDP datagram payload: split off the trailing 2-byte FCS,
+/// verify it over the body, and parse the body as AX.25. Total — arbitrary
+/// bytes yield `frame: None`, never a panic.
+pub fn decode_datagram(payload: &[u8]) -> ReceivedDatagram {
+    if payload.len() < 2 {
+        return ReceivedDatagram {
+            frame: None,
+            fcs_valid: false,
+        };
     }
-
+    let (body, fcs_bytes) = payload.split_at(payload.len() - 2);
+    let stored = (fcs_bytes[0] as u16) | ((fcs_bytes[1] as u16) << 8);
+    if stored != crc::compute(body) {
+        return ReceivedDatagram {
+            frame: None,
+            fcs_valid: false,
+        };
+    }
     ReceivedDatagram {
-        frame: plain,
-        fcs_valid: None,
+        frame: Frame::decode(body).ok(),
+        fcs_valid: true,
     }
 }
 
@@ -101,24 +94,13 @@ mod tests {
     }
 
     #[test]
-    fn fcsless_round_trip() {
+    fn round_trip_validates_fcs() {
         let f = frame();
-        let dgram = encode_datagram(&f, false);
-        // No FCS appended: datagram length == frame length.
-        assert_eq!(dgram.len(), f.encoded_len());
-        let r = decode_datagram(&dgram, false);
-        assert_eq!(r.frame, Some(f));
-        assert_eq!(r.fcs_valid, None);
-    }
-
-    #[test]
-    fn with_fcs_round_trip_validates() {
-        let f = frame();
-        let dgram = encode_datagram(&f, true);
+        let dgram = encode_datagram(&f);
         assert_eq!(dgram.len(), f.encoded_len() + 2);
-        let r = decode_datagram(&dgram, true);
+        let r = decode_datagram(&dgram);
         assert_eq!(r.frame, Some(f));
-        assert_eq!(r.fcs_valid, Some(true));
+        assert!(r.fcs_valid);
     }
 
     #[test]
@@ -126,21 +108,55 @@ mod tests {
         let f = frame();
         let body = f.encode();
         let fcs = crc::compute(&body);
-        let dgram = encode_datagram(&f, true);
+        let dgram = encode_datagram(&f);
         let n = dgram.len();
         assert_eq!(dgram[n - 2], (fcs & 0xFF) as u8);
         assert_eq!(dgram[n - 1], (fcs >> 8) as u8);
     }
 
     #[test]
-    fn corrupted_fcs_not_reported_valid() {
+    fn append_fcs_matches_encode_datagram() {
         let f = frame();
-        let mut dgram = encode_datagram(&f, true);
+        assert_eq!(append_fcs(f.encode()), encode_datagram(&f));
+    }
+
+    #[test]
+    fn corrupted_fcs_rejects_the_datagram() {
+        let f = frame();
+        let mut dgram = encode_datagram(&f);
         let n = dgram.len();
         dgram[n - 1] ^= 0xFF; // smash the FCS high byte
-        let r = decode_datagram(&dgram, true);
-        // It won't validate as the FCS form; falls back to the plain interpretation
-        // (which decodes the whole payload incl. the bogus 2 bytes as frame data).
-        assert_eq!(r.fcs_valid, None);
+        let r = decode_datagram(&dgram);
+        assert_eq!(r.frame, None);
+        assert!(!r.fcs_valid);
+    }
+
+    #[test]
+    fn corrupted_body_rejects_the_datagram() {
+        let f = frame();
+        let mut dgram = encode_datagram(&f);
+        dgram[0] ^= 0x80; // flip a bit in the destination address
+        let r = decode_datagram(&dgram);
+        assert_eq!(r.frame, None);
+        assert!(!r.fcs_valid);
+    }
+
+    #[test]
+    fn fcsless_datagram_is_rejected() {
+        // The body alone (no FCS appended) must not be accepted: the last two
+        // body octets are interpreted as the FCS and won't verify.
+        let f = frame();
+        let r = decode_datagram(&f.encode());
+        assert_eq!(r.frame, None);
+        assert!(!r.fcs_valid);
+    }
+
+    #[test]
+    fn short_datagrams_are_rejected() {
+        for payload in [&[][..], &[0x01][..]] {
+            let r = decode_datagram(payload);
+            assert_eq!(r.frame, None);
+            assert!(!r.fcs_valid);
+        }
     }
 }

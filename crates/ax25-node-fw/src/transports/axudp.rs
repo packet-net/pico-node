@@ -59,11 +59,7 @@ pub async fn task(
     console_id: Identity,
     prompt: String,
 ) {
-    defmt::info!(
-        "axudp: listen udp/{} fcs={}",
-        cfg.listen_port,
-        cfg.include_fcs
-    );
+    defmt::info!("axudp: listen udp/{}", cfg.listen_port);
 
     let mut rx_meta = [PacketMetadata::EMPTY; 4];
     let mut tx_meta = [PacketMetadata::EMPTY; 4];
@@ -104,7 +100,7 @@ pub async fn task(
                         "IDENT",
                         b"pico-node AXUDP beacon (HW-BRINGUP Gate 3)",
                     );
-                    let dgram = axudp::encode_datagram(&beacon, cfg.include_fcs);
+                    let dgram = axudp::encode_datagram(&beacon);
                     match socket.send_to(&dgram, ep).await {
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
@@ -112,12 +108,13 @@ pub async fn task(
                 }
             }
             Either::Second(Ok((n, meta))) => {
-                let rx = axudp::decode_datagram(&dgram_buf[..n], cfg.include_fcs);
+                let rx = axudp::decode_datagram(&dgram_buf[..n]);
                 let Some(frame) = rx.frame else {
                     defmt::warn!(
-                        "axudp: {=usize} bytes from {:?} did not decode as AX.25",
+                        "axudp: {=usize} bytes from {:?} rejected (fcs_valid={=bool})",
                         n,
-                        meta.endpoint
+                        meta.endpoint,
+                        rx.fcs_valid
                     );
                     continue;
                 };
@@ -133,12 +130,11 @@ pub async fn task(
                 }
 
                 defmt::info!(
-                    "axudp: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B fcs_valid={:?} from {:?}",
+                    "axudp: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B from {:?}",
                     call_str(&frame.source.callsign, &mut src_buf),
                     call_str(&frame.destination.callsign, &mut dst_buf),
                     frame.control,
                     frame.info.len(),
-                    rx.fcs_valid,
                     meta.endpoint
                 );
                 if frame.is_ui() && !frame.info.is_empty() {
@@ -163,7 +159,7 @@ pub async fn task(
                         &prompt,
                     );
                     for wire in to_send {
-                        let dgram = with_fcs(wire, cfg.include_fcs);
+                        let dgram = axudp::append_fcs(wire);
                         if let Err(e) = socket.send_to(&dgram, meta.endpoint).await {
                             defmt::warn!("axudp: session tx error {:?}", e);
                         }
@@ -175,17 +171,6 @@ pub async fn task(
             }
         }
     }
-}
-
-/// Append the AXUDP trailing CRC (XRouter / BPQ AXIP-with-CRC form) to raw wire
-/// octets when the port is configured for it.
-fn with_fcs(mut wire: Vec<u8>, include_fcs: bool) -> Vec<u8> {
-    if include_fcs {
-        let fcs = ax25_node_core::crc::compute(&wire);
-        wire.push((fcs & 0xFF) as u8);
-        wire.push((fcs >> 8) as u8);
-    }
-    wire
 }
 
 /// Post one classified event into `peer`'s session and service every DL signal
