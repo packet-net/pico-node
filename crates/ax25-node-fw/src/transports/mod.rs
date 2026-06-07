@@ -14,7 +14,7 @@ pub mod telnet;
 // pub mod kiss_serial;
 
 use ax25_node_core::ax25::frame::CONTROL_UI;
-use ax25_node_core::ax25::{Address, Callsign, Frame, PID_NO_LAYER3};
+use ax25_node_core::ax25::{Address, Callsign, Frame};
 
 use alloc::vec::Vec;
 
@@ -27,12 +27,12 @@ pub fn call_str<'b>(call: &Callsign, buf: &'b mut [u8; 16]) -> &'b str {
     core::str::from_utf8(&buf[..n]).unwrap_or("?")
 }
 
-/// Build a UI frame `my_call → dest` with the given info text (the bring-up
-/// beacon shape; standard 0xF0 no-L3 PID).
-pub fn ui_frame(my_call: Callsign, dest: &str, info: &[u8]) -> Frame {
+/// Build a UI frame `my_call → dest` with the given PID + info (beacons use
+/// 0xF0 no-L3; NODES broadcasts use the NET/ROM 0xCF).
+pub fn ui_frame(my_call: Callsign, dest: Callsign, pid: u8, info: &[u8]) -> Frame {
     Frame {
         destination: Address {
-            callsign: Callsign::parse(dest).expect("static callsign"),
+            callsign: dest,
             crh: true,
             extension: false,
         },
@@ -43,7 +43,7 @@ pub fn ui_frame(my_call: Callsign, dest: &str, info: &[u8]) -> Frame {
         },
         digipeaters: Vec::new(),
         control: CONTROL_UI,
-        pid: Some(PID_NO_LAYER3),
+        pid: Some(pid),
         info: info.to_vec(),
     }
 }

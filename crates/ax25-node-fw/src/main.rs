@@ -152,6 +152,7 @@ mod firmware {
         spawner.spawn(defmt::unwrap!(transports::axudp::task(
             stack,
             cfg.axudp.clone(),
+            cfg.netrom.clone(),
             cfg.identity.callsign,
             console_id.clone(),
             prompt.clone(),

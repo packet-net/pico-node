@@ -35,6 +35,8 @@ use ax25_node_core::axudp;
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
 use ax25_node_core::console::{DispatchOutcome, LineAssembler, TransportKind};
+use ax25_node_core::netrom::wire::Alias;
+use ax25_node_core::netrom::{NetRomOriginator, NetRomOriginatorOptions};
 use ax25_node_core::netrom::{ObserveOutcome, PortId};
 use ax25_node_core::sdl::{classify_incoming, DataLinkSignal, Event};
 
@@ -47,7 +49,7 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Stack};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
-use crate::config::AxudpConfig;
+use crate::config::{AxudpConfig, NetRomConfig};
 use crate::session;
 use crate::transports::relay::{self, RelayStatus};
 use crate::transports::{call_str, parse_endpoint, ui_frame};
@@ -109,6 +111,7 @@ enum FollowUp {
 pub async fn task(
     stack: Stack<'static>,
     cfg: AxudpConfig,
+    netrom_cfg: NetRomConfig,
     my_call: Callsign,
     console_id: Identity,
     prompt: String,
@@ -133,6 +136,26 @@ pub async fn task(
     // equivalent): fed every decoded inbound frame BEFORE address filtering.
     let mut netrom = session::new_netrom();
     let port_id = PortId::from_str_lossy("axudp");
+
+    // NODES origination: our own broadcasts, built from the live routing table
+    // (header alias + an entry per advertisable route, OBSMIN-gated) — the node
+    // becomes *visible* in peers' nodes tables. The interval follows the BPQ
+    // convention; the first broadcast goes out on the first beacon tick so a
+    // fresh boot announces promptly.
+    let originator = NetRomOriginator::new(NetRomOriginatorOptions {
+        enabled: netrom_cfg.originate,
+        alias: Some(Alias::from_str_lossy(&console_id.node_name)),
+        node_call: Some(my_call),
+        obsolete_minimum: None,
+    });
+    let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
+    let mut next_nodes_at = Instant::now(); // announce on the first tick
+    if netrom_cfg.originate {
+        defmt::info!(
+            "axudp: NODES origination on, every {=u32}s",
+            netrom_cfg.nodes_interval_secs
+        );
+    }
 
     // The connected-mode session layer for this port + per-peer link state.
     let mut sessions = session::new_sessions(my_call);
@@ -192,7 +215,8 @@ pub async fn task(
                 if let Some(ep) = beacon_ep {
                     let beacon = ui_frame(
                         my_call,
-                        "IDENT",
+                        Callsign::parse("IDENT").expect("static"),
+                        PID_NO_LAYER3,
                         b"pico-node AXUDP beacon (HW-BRINGUP Gate 3)",
                     );
                     let dgram = axudp::encode_datagram(&beacon);
@@ -200,6 +224,43 @@ pub async fn task(
                         Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
                         Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
                     }
+                }
+
+                // NODES origination rides the beacon tick (10 s granularity is
+                // plenty against minutes-scale intervals).
+                if netrom_cfg.originate && Instant::now() >= next_nodes_at {
+                    next_nodes_at = Instant::now() + nodes_interval;
+                    let payloads = originator.broadcast_nodes(netrom.table());
+                    // BPQ semantics: NODES go to every B-flagged map. Our
+                    // analogue: the beacon target + every distinct endpoint in
+                    // the heard table (the LAN peers we actually know).
+                    let mut targets: [Option<IpEndpoint>; 9] = [None; 9];
+                    let mut n_targets = 0usize;
+                    for ep in beacon_ep
+                        .iter()
+                        .copied()
+                        .chain(heard.iter().flatten().map(|(_, ep)| *ep))
+                    {
+                        if !targets[..n_targets].iter().flatten().any(|t| *t == ep) {
+                            targets[n_targets] = Some(ep);
+                            n_targets += 1;
+                        }
+                    }
+                    let dest = NetRomOriginator::nodes_destination();
+                    for payload in &payloads {
+                        let frame = ui_frame(my_call, dest, NetRomOriginator::PID, payload);
+                        let dgram = axudp::encode_datagram(&frame);
+                        for ep in targets[..n_targets].iter().flatten() {
+                            if let Err(e) = socket.send_to(&dgram, *ep).await {
+                                defmt::warn!("axudp: NODES send error {:?}", e);
+                            }
+                        }
+                    }
+                    defmt::info!(
+                        "axudp: NODES broadcast sent ({=usize} frame(s) to {=usize} endpoint(s))",
+                        payloads.len(),
+                        n_targets
+                    );
                 }
             }
             Either4::Second(Ok((n, meta))) => {
