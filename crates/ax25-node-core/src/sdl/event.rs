@@ -122,6 +122,14 @@ pub enum Event {
     T2Expiry,
     /// T3 (inactive-link timer) expiry.
     T3Expiry,
+
+    // ─── Link multiplexer ───────────────────────────────────────────────
+    /// LM-SEIZE confirm — the link multiplexer granted the channel the SDL
+    /// asked for via `LMSeizeRequest`. On a full-duplex transport (AXUDP,
+    /// KISS-TCP) the channel is always free, so the session driver confirms
+    /// immediately; the figc4 `AckPending` transition then emits the delayed
+    /// RR acknowledgement.
+    LmSeizeConfirm,
 }
 
 impl Event {
@@ -164,6 +172,8 @@ impl Event {
             Event::T1Expiry => Sdl::T1Expiry,
             Event::T2Expiry => Sdl::T2Expiry,
             Event::T3Expiry => Sdl::T3Expiry,
+
+            Event::LmSeizeConfirm => Sdl::LMSEIZEConfirm,
         }
     }
 

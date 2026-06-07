@@ -6,6 +6,7 @@
 //! [`crate::session`] layer.
 
 pub mod axudp;
+pub mod relay;
 pub mod kiss_tcp;
 pub mod telnet;
 // GATE 6 (HW-BRINGUP.md §4): kiss_serial returns if/when a NinoTNC is present at

@@ -21,6 +21,13 @@
 //! and dead-peer link failure (N2 retries exhausted → teardown) run exactly as
 //! the SDL tables specify, against the peer's *last heard* UDP endpoint.
 //!
+//! **Outbound connects** (`C <call>` from the telnet console) arrive over the
+//! [`super::relay`] statics: this task resolves the target's UDP endpoint from
+//! its heard-table (every decoded frame records `source → endpoint`; the
+//! beacon target is the fallback), posts `DlConnectRequest`, and while the
+//! relay is up routes that peer's `DataIndication`s into the relay pipe
+//! instead of the console dispatcher.
+//!
 //! Single-transport ownership (this task owns `Sessions` exclusively) keeps the
 //! `&mut` story trivial; when a second connected-mode transport arrives the
 //! manager moves behind the supervisor seam `session.rs` documents.
@@ -36,13 +43,14 @@ use ax25_node_core::sdl::{classify_incoming, DataLinkSignal, Event};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Stack};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
 use crate::config::AxudpConfig;
 use crate::session;
+use crate::transports::relay::{self, RelayStatus};
 use crate::transports::{call_str, parse_endpoint, ui_frame};
 
 /// Seconds between beacon UI frames when a beacon target is configured.
@@ -92,6 +100,12 @@ pub async fn task(
     let mut peers: [Option<PeerState>; session::MAX_SESSIONS] =
         [const { None }; session::MAX_SESSIONS];
 
+    // Callsign → last-heard UDP endpoint (the outbound-connect route table;
+    // LinBPQ's periodic ID/NODES broadcasts keep it warm).
+    let mut heard: [Option<(Callsign, IpEndpoint)>; 8] = [None; 8];
+    // The single active console relay, if any (see transports::relay).
+    let mut relay_peer: Option<Callsign> = None;
+
     let mut dgram_buf = [0u8; 2048];
     let mut ticker = Ticker::every(Duration::from_secs(BEACON_INTERVAL_SECS));
     let mut src_buf = [0u8; 16];
@@ -111,8 +125,31 @@ pub async fn task(
             }
         };
 
-        match select3(ticker.next(), socket.recv_from(&mut dgram_buf), timer_wait).await {
-            Either3::First(()) => {
+        // Relay arm: a pending connect request when idle; user bytes / hangup
+        // while a relay is active.
+        let relay_fut = async {
+            match relay_peer {
+                None => RelayEvent::Connect(relay::CONNECT_REQ.receive().await),
+                Some(_) => {
+                    let mut buf = [0u8; 128];
+                    match select(relay::USER_TO_AX.read(&mut buf), relay::USER_HANGUP.wait()).await
+                    {
+                        Either::First(n) => RelayEvent::UserData(buf, n),
+                        Either::Second(()) => RelayEvent::Hangup,
+                    }
+                }
+            }
+        };
+
+        match select4(
+            ticker.next(),
+            socket.recv_from(&mut dgram_buf),
+            timer_wait,
+            relay_fut,
+        )
+        .await
+        {
+            Either4::First(()) => {
                 if let Some(ep) = beacon_ep {
                     let beacon = ui_frame(
                         my_call,
@@ -126,7 +163,7 @@ pub async fn task(
                     }
                 }
             }
-            Either3::Second(Ok((n, meta))) => {
+            Either4::Second(Ok((n, meta))) => {
                 let rx = axudp::decode_datagram(&dgram_buf[..n]);
                 let Some(frame) = rx.frame else {
                     defmt::warn!(
@@ -162,6 +199,8 @@ pub async fn task(
                     }
                 }
 
+                heard_update(&mut heard, frame.source.callsign, meta.endpoint);
+
                 // Address filter → the connected-mode session layer.
                 if frame.destination.callsign == my_call && !frame.is_ui() {
                     let Some(event) = classify_incoming(&frame) else {
@@ -174,15 +213,22 @@ pub async fn task(
                     };
                     let ps = peers[i].as_mut().expect("slot just ensured");
                     ps.endpoint = meta.endpoint; // frames go to the last-heard endpoint
-                    let to_send = run_session(&mut sessions, ps, event, &console_id, &prompt);
+                    let to_send = run_session(
+                        &mut sessions,
+                        ps,
+                        event,
+                        &console_id,
+                        &prompt,
+                        &mut relay_peer,
+                    );
                     send_all(&socket, ps.endpoint, to_send).await;
                     reap(&mut sessions, &mut peers, i);
                 }
             }
-            Either3::Second(Err(e)) => {
+            Either4::Second(Err(e)) => {
                 defmt::warn!("axudp: recv error {:?}", e);
             }
-            Either3::Third(()) => {
+            Either4::Third(()) => {
                 // One or more peer timers hit their deadline: post the expiry
                 // events into the owning sessions and flush what they emit.
                 let now = Instant::now();
@@ -203,6 +249,7 @@ pub async fn task(
                             session::expiry_event(id),
                             &console_id,
                             &prompt,
+                            &mut relay_peer,
                         ));
                     }
                     let ep = ps.endpoint;
@@ -210,8 +257,120 @@ pub async fn task(
                     reap(&mut sessions, &mut peers, i);
                 }
             }
+            Either4::Fourth(ev) => match ev {
+                RelayEvent::Connect(target) => {
+                    let mut name = [0u8; 16];
+                    let ep = heard_lookup(&heard, &target).or(beacon_ep);
+                    let Some(ep) = ep else {
+                        defmt::warn!(
+                            "axudp: relay connect to {=str}: no known endpoint",
+                            call_str(&target, &mut name)
+                        );
+                        relay::STATUS.signal(RelayStatus::Failed("no known endpoint"));
+                        continue;
+                    };
+                    let Some(i) = peer_slot(&mut peers, target, ep) else {
+                        relay::STATUS.signal(RelayStatus::Failed("no free session slot"));
+                        continue;
+                    };
+                    defmt::info!(
+                        "axudp: relay connecting to {=str} at {:?}",
+                        call_str(&target, &mut name),
+                        ep
+                    );
+                    relay_peer = Some(target);
+                    let ps = peers[i].as_mut().expect("slot just ensured");
+                    let to_send = run_session(
+                        &mut sessions,
+                        ps,
+                        Event::DlConnectRequest,
+                        &console_id,
+                        &prompt,
+                        &mut relay_peer,
+                    );
+                    send_all(&socket, ep, to_send).await;
+                    reap(&mut sessions, &mut peers, i);
+                }
+                RelayEvent::UserData(buf, n) => {
+                    if let Some(peer) = relay_peer {
+                        if let Some(i) = peers
+                            .iter()
+                            .position(|p| matches!(p, Some(ps) if ps.peer == peer))
+                        {
+                            let ps = peers[i].as_mut().expect("present");
+                            let to_send = run_session(
+                                &mut sessions,
+                                ps,
+                                Event::DlDataRequest(PID_NO_LAYER3, buf[..n].to_vec()),
+                                &console_id,
+                                &prompt,
+                                &mut relay_peer,
+                            );
+                            let ep = ps.endpoint;
+                            send_all(&socket, ep, to_send).await;
+                            reap(&mut sessions, &mut peers, i);
+                        }
+                    }
+                }
+                RelayEvent::Hangup => {
+                    if let Some(peer) = relay_peer.take() {
+                        if let Some(i) = peers
+                            .iter()
+                            .position(|p| matches!(p, Some(ps) if ps.peer == peer))
+                        {
+                            let ps = peers[i].as_mut().expect("present");
+                            let mut rp = None; // relay already over from our side
+                            let to_send = run_session(
+                                &mut sessions,
+                                ps,
+                                Event::DlDisconnectRequest,
+                                &console_id,
+                                &prompt,
+                                &mut rp,
+                            );
+                            let ep = ps.endpoint;
+                            send_all(&socket, ep, to_send).await;
+                            reap(&mut sessions, &mut peers, i);
+                        }
+                    }
+                }
+            },
         }
     }
+}
+
+/// What the relay select-arm produced.
+enum RelayEvent {
+    /// A console asked to connect to this callsign.
+    Connect(Callsign),
+    /// Console-user bytes for the relay peer.
+    UserData([u8; 128], usize),
+    /// The console user went away — disconnect the relay link.
+    Hangup,
+}
+
+/// Record `call → endpoint` in the heard table (update in place, else first
+/// free slot, else overwrite the oldest by rotation).
+fn heard_update(heard: &mut [Option<(Callsign, IpEndpoint)>; 8], call: Callsign, ep: IpEndpoint) {
+    if let Some(e) = heard
+        .iter_mut()
+        .flatten()
+        .find(|(c, _)| *c == call)
+    {
+        e.1 = ep;
+        return;
+    }
+    if let Some(slot) = heard.iter_mut().find(|s| s.is_none()) {
+        *slot = Some((call, ep));
+        return;
+    }
+    heard.rotate_left(1);
+    heard[7] = Some((call, ep));
+}
+
+/// Resolve a callsign to its last-heard endpoint.
+fn heard_lookup(heard: &[Option<(Callsign, IpEndpoint)>; 8], call: &Callsign) -> Option<IpEndpoint> {
+    heard.iter().flatten().find(|(c, _)| c == call).map(|(_, ep)| *ep)
 }
 
 /// Find or create the [`PeerState`] slot for `peer`. Returns its index.
@@ -257,14 +416,17 @@ async fn send_all(socket: &UdpSocket<'_>, ep: IpEndpoint, frames: Vec<Vec<u8>>) 
 }
 
 /// Post one event into `ps.peer`'s session and service every DL signal it
-/// raises — the AX.25 console loop. Returns all wire frames to transmit.
+/// raises — the AX.25 console loop, or the relay pipes when `ps.peer` is the
+/// active relay target. Returns all wire frames to transmit.
 fn run_session(
     sessions: &mut session::Sessions,
     ps: &mut PeerState,
     event: Event,
     console_id: &Identity,
     prompt: &str,
+    relay_peer: &mut Option<Callsign>,
 ) -> Vec<Vec<u8>> {
+    let is_relay = *relay_peer == Some(ps.peer);
     let peer = ps.peer;
     let mut to_send = sessions.post(peer, event, &mut ps.timers);
 
@@ -277,6 +439,32 @@ fn run_session(
         }
         for sig in ups {
             match sig {
+                DataLinkSignal::ConnectConfirm if is_relay => {
+                    let mut name = [0u8; 16];
+                    defmt::info!(
+                        "axudp: relay link to {=str} is up",
+                        call_str(&peer, &mut name)
+                    );
+                    relay::STATUS.signal(RelayStatus::Connected);
+                }
+                DataLinkSignal::DataIndication(_pid, info) if is_relay => {
+                    // Peer → console user. try_write: the console side drains
+                    // promptly at human speeds; overflow is logged, not fatal.
+                    if relay::AX_TO_USER.try_write(&info).is_err() {
+                        defmt::warn!("axudp: relay pipe full, dropping {=usize}B", info.len());
+                    }
+                }
+                DataLinkSignal::DisconnectIndication | DataLinkSignal::DisconnectConfirm
+                    if is_relay =>
+                {
+                    let mut name = [0u8; 16];
+                    defmt::info!(
+                        "axudp: relay link to {=str} ended",
+                        call_str(&peer, &mut name)
+                    );
+                    *relay_peer = None;
+                    relay::STATUS.signal(RelayStatus::Disconnected);
+                }
                 DataLinkSignal::ConnectIndication => {
                     let mut name = [0u8; 16];
                     defmt::info!(

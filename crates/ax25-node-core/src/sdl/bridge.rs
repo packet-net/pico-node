@@ -74,6 +74,10 @@ pub struct WireSink {
     pub sent: Vec<Vec<u8>>,
     /// DL signals raised upward, in order.
     pub upward: Vec<DataLinkSignal>,
+    /// The SDL asked the link multiplexer for the channel (`LMSeizeRequest`)
+    /// and awaits an [`super::Event::LmSeizeConfirm`]. Set by `send_link_mux`,
+    /// cleared by the driver when it grants the seize.
+    pub seize_pending: bool,
 }
 
 impl WireSink {
@@ -85,6 +89,7 @@ impl WireSink {
             digipeaters,
             sent: Vec::new(),
             upward: Vec::new(),
+            seize_pending: false,
         }
     }
 
@@ -190,7 +195,14 @@ impl SessionSink for WireSink {
     fn send_upward(&mut self, signal: DataLinkSignal) {
         self.upward.push(signal);
     }
-    fn send_link_mux(&mut self, _signal: LinkMultiplexerSignal) {}
+    fn send_link_mux(&mut self, signal: LinkMultiplexerSignal) {
+        // Record seize requests so the driver can grant them (immediately, on a
+        // full-duplex wire transport) by posting [`Event::LmSeizeConfirm`] —
+        // the figc4 delayed-ack path depends on the confirm coming back.
+        if signal == LinkMultiplexerSignal::SeizeRequest {
+            self.seize_pending = true;
+        }
+    }
     fn send_internal(&mut self, _signal: InternalSignal) {}
 }
 
