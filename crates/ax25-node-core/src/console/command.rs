@@ -12,6 +12,8 @@
 
 use crate::ax25::Callsign;
 
+use alloc::string::{String, ToString};
+
 /// The longest input line the parser considers; longer input is truncated first
 /// so a hostile peer can't drive unbounded work. Mirrors
 /// `NodeCommandParser.MaxLineLength`.
@@ -35,6 +37,25 @@ pub enum Command {
     /// A recognised `CONNECT` the parser could not complete (missing/bad call).
     /// Carries the offending raw input.
     MalformedConnect,
+    /// `SHOW` — display the node's effective + pending configuration. Executed
+    /// by the embedder (the config lives firmware-side); the parser only
+    /// recognises the verb.
+    ShowConfig,
+    /// `SET <KEY> <VALUE…>` — stage a configuration change (applied to the
+    /// pending config; `SAVE` persists, reboot applies). Key/value are passed
+    /// through verbatim; validation is the embedder's (it owns the schema).
+    Set {
+        /// The configuration key, upper-cased.
+        key: String,
+        /// The raw value text (may contain spaces, e.g. WiFi passphrases).
+        value: String,
+    },
+    /// `SET` with no/incomplete arguments — the embedder prints usage.
+    MalformedSet,
+    /// `SAVE` — persist the pending configuration to flash.
+    Save,
+    /// `REBOOT` — restart the node (how pending config takes effect).
+    Reboot,
     /// An input line that matched no known verb.
     Unknown,
 }
@@ -107,6 +128,20 @@ pub fn parse(line: &str) -> Command {
     if matches_prefix(upper, b"HELP") {
         return Command::Help;
     }
+    if matches_prefix(upper, b"SHOW") {
+        return Command::ShowConfig;
+    }
+    // SET is exact (not a prefix): "S" alone is too easy to fat-finger for a
+    // config mutation, and SAVE shares the S prefix.
+    if upper == b"SET" {
+        return parse_set(rest);
+    }
+    if upper == b"SAVE" {
+        return Command::Save;
+    }
+    if upper == b"REBOOT" {
+        return Command::Reboot;
+    }
 
     Command::Unknown
 }
@@ -123,6 +158,21 @@ fn parse_connect(rest: &str) -> Command {
     match Callsign::parse(target) {
         Some(call) => Command::Connect(call),
         None => Command::MalformedConnect,
+    }
+}
+
+fn parse_set(rest: &str) -> Command {
+    let rest = rest.trim();
+    let (key, value) = match rest.find(char::is_whitespace) {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+        None => (rest, ""),
+    };
+    if key.is_empty() || value.is_empty() {
+        return Command::MalformedSet;
+    }
+    Command::Set {
+        key: key.to_ascii_uppercase(),
+        value: value.to_string(),
     }
 }
 
@@ -213,5 +263,48 @@ mod tests {
         // Bytes 2.. are 'A's; the first token after "C " is a long run of 'A's,
         // which is not a valid callsign => malformed, not a panic or hang.
         assert_eq!(parse_bytes(&huge), Command::MalformedConnect);
+    }
+}
+
+#[cfg(test)]
+mod config_command_tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    #[test]
+    fn show_parses_with_prefix_matching() {
+        assert_eq!(parse("SHOW"), Command::ShowConfig);
+        assert_eq!(parse("show config"), Command::ShowConfig);
+        assert_eq!(parse("sh"), Command::ShowConfig);
+    }
+
+    #[test]
+    fn set_requires_exact_verb_key_and_value() {
+        assert_eq!(
+            parse("SET ALIAS HILL1"),
+            Command::Set {
+                key: "ALIAS".to_string(),
+                value: "HILL1".to_string()
+            }
+        );
+        // Keys upper-case; values keep their case and interior spaces.
+        assert_eq!(
+            parse("set wifi_pass correct horse battery"),
+            Command::Set {
+                key: "WIFI_PASS".to_string(),
+                value: "correct horse battery".to_string()
+            }
+        );
+        assert_eq!(parse("SET"), Command::MalformedSet);
+        assert_eq!(parse("SET ALIAS"), Command::MalformedSet);
+        // "SE" is NOT a SET prefix (mutations don't prefix-match)…
+        assert_eq!(parse("SE ALIAS X"), Command::Unknown);
+    }
+
+    #[test]
+    fn save_and_reboot_are_exact_words() {
+        assert_eq!(parse("SAVE"), Command::Save);
+        assert_eq!(parse("save"), Command::Save);
+        assert_eq!(parse("REBOOT"), Command::Reboot);
     }
 }

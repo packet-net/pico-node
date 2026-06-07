@@ -15,8 +15,11 @@ MEMORY {
     BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
 
     /* FLASH: the program, immediately after BOOT2. 2 MB on the stock Pico W,
-       minus the 256 bytes of BOOT2. */
-    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100
+       minus the 256 bytes of BOOT2 and minus the top 8 KiB reserved for the
+       persisted node config (two 4 KiB sectors, A/B generations — see
+       src/config_store.rs + docs/PROVISIONING.md; keeping them out of the
+       linker's FLASH region guarantees the program can never overlap them). */
+    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100 - 8K
 
     /* RAM: 264 KB of SRAM (the RP2040's 6 banks, contiguous for the linker). */
     RAM   : ORIGIN = 0x20000000, LENGTH = 264K

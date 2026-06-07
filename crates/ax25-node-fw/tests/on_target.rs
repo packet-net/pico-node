@@ -19,6 +19,13 @@ use defmt_rtt as _;
 
 use embedded_alloc::LlffHeap;
 
+// The flash config store under test: a bin-crate module, pulled in by source
+// inclusion (integration tests can't reach a binary's internals; the module
+// only depends on crates this test also links).
+#[allow(dead_code)]
+#[path = "../src/config_store.rs"]
+mod config_store;
+
 #[global_allocator]
 static HEAP: LlffHeap = LlffHeap::empty();
 
@@ -83,7 +90,7 @@ mod tests {
     }
 
     #[init]
-    fn init() {
+    fn init() -> embassy_rp::Peripherals {
         // Heap arena for ax25-node-core's alloc use. The device resets between
         // test cases, so this runs once per case on a fresh chip.
         {
@@ -93,13 +100,50 @@ mod tests {
                 HEAP.init(ARENA.as_ptr() as usize, HEAP_SIZE)
             }
         }
-        let _p = embassy_rp::init(Default::default());
+        embassy_rp::init(Default::default())
     }
 
     /// The codec fundamentals execute on the M0+: callsign parse/display, frame
     /// encode/decode round trip, CRC-16/X.25 over a known vector.
+    /// The flash config store round-trips on real flash: encode → save (A/B
+    /// generations) → reload picks the newest record, fields intact. Runs on
+    /// the reserved sectors, so it exercises the true erase/program path.
     #[test]
-    fn core_codec_runs_on_target() {
+    fn config_store_round_trips_on_flash(p: embassy_rp::Peripherals) {
+        use crate::config_store::{ConfigService, FLASH_SIZE};
+        let flash = embassy_rp::flash::Flash::<_, _, FLASH_SIZE>::new_blocking(p.FLASH);
+        let (mut svc, _stored) = ConfigService::new(flash);
+
+        svc.pending.alias = Some(heapless::String::try_from("TSTNOD").unwrap());
+        svc.pending.telnet_port = Some(2323);
+        svc.pending.originate = Some(false);
+        svc.save().expect("first save");
+
+        // Second save bumps the generation onto the other sector.
+        svc.pending.telnet_port = Some(2424);
+        svc.save().expect("second save");
+
+        // A fresh service (fresh read) must see the second generation.
+        let flash = svc.into_flash();
+        let (mut svc2, stored) = ConfigService::new(flash);
+        let stored = stored.expect("record present");
+        assert_eq!(stored.alias.as_deref(), Some("TSTNOD"));
+        assert_eq!(stored.telnet_port, Some(2424));
+        assert_eq!(stored.originate, Some(false));
+
+        // Leave the device as we found it (factory) — test fixtures must not
+        // become the node's real config.
+        svc2.factory_reset().expect("factory reset");
+        let flash = svc2.into_flash();
+        let (_, stored) = ConfigService::new(flash);
+        assert!(
+            stored.is_none(),
+            "store should be empty after factory reset"
+        );
+    }
+
+    #[test]
+    fn core_codec_runs_on_target(_p: embassy_rp::Peripherals) {
         let call = Callsign::parse("M0LTE-7").unwrap();
         let mut buf = [0u8; 16];
         let n = call.write_display(&mut buf).unwrap();
@@ -127,7 +171,7 @@ mod tests {
     /// The full connected-mode lifecycle on the physical M0+: SABM/UA connect,
     /// I-frame + ack exchange, DISC/UA teardown — every frame as wire octets.
     #[test]
-    fn sdl_connect_iframe_disconnect_on_target() {
+    fn sdl_connect_iframe_disconnect_on_target(_p: embassy_rp::Peripherals) {
         let mut a = Station::new("M0LTE-1", "M0LTE-2");
         let mut b = Station::new("M0LTE-2", "M0LTE-1");
 
@@ -169,7 +213,7 @@ mod tests {
     /// The NET/ROM tap ingests a NODES broadcast on-target (fixed-capacity
     /// routing table, integer quality maths — the no-FPU path on real silicon).
     #[test]
-    fn netrom_nodes_ingest_on_target() {
+    fn netrom_nodes_ingest_on_target(_p: embassy_rp::Peripherals) {
         use ax25_node_core::ax25::{frame::CONTROL_UI, Address, PID_NETROM};
         use ax25_node_core::netrom::wire::nodes_broadcast_builder::{
             write_nodes_frame, NodesAdvertisementEntry, MAX_NODES_FRAME_LEN,

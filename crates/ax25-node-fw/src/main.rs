@@ -40,6 +40,8 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 mod config;
 #[cfg(target_os = "none")]
+mod config_store;
+#[cfg(target_os = "none")]
 mod mdns;
 #[cfg(target_os = "none")]
 mod net;
@@ -74,6 +76,7 @@ mod firmware {
     use embassy_time::{Duration, Instant, Ticker};
 
     use crate::config;
+    use crate::config_store;
     use crate::mdns;
     use crate::net;
     use crate::transports;
@@ -94,7 +97,23 @@ mod firmware {
         }
 
         let p = embassy_rp::init(Default::default());
-        let cfg = config::load();
+
+        // Compiled factory defaults, then the flash store on top (provisioning
+        // steps 1–2 — docs/PROVISIONING.md). The store also feeds the console
+        // SET/SHOW/SAVE executor via the CONFIG static.
+        let mut cfg = config::load();
+        let flash =
+            embassy_rp::flash::Flash::<_, _, { crate::config_store::FLASH_SIZE }>::new_blocking(
+                p.FLASH,
+            );
+        let (service, stored) = config_store::ConfigService::new(flash);
+        config_store::CONFIG.lock(|cell| cell.borrow_mut().replace(service));
+        if let Some(stored) = stored {
+            defmt::info!("config: stored record loaded (overrides factory defaults)");
+            config::apply_stored(&mut cfg, &stored);
+        } else {
+            defmt::info!("config: no stored record — factory defaults");
+        }
 
         // The config load + callsign log is deliberate, not decoration: it
         // exercises ax25-node-core (Callsign::parse + write_display) on the real M0+.
