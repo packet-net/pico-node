@@ -92,7 +92,12 @@ pub fn load() -> NodeConfig {
     NodeConfig {
         hostname: "pico-node",
         identity: Identity {
-            callsign: Callsign::parse("M0LTE-1").expect("valid default callsign"),
+            // The node's on-air identity. It is now reachable (indirectly) from
+            // a live RF network via the lab's BPQ nodes, so this must be a
+            // legally assigned callsign-SSID for THIS station — set per Tom,
+            // 2026-06-07. (The provisioning work, docs/PROVISIONING.md, moves
+            // this to flash config; until then it's a compile-time default.)
+            callsign: Callsign::parse("M9YYY-9").expect("valid default callsign"),
             alias: "PICO",
             grid: "IO91wm",
         },
