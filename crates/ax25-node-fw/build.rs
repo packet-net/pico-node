@@ -40,6 +40,7 @@ fn main() {
         "MQTT_HOST",
         "OTA_BUILD_TAG",
         "OTA_FORCE_BRICK",
+        "DISABLE_OLED",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

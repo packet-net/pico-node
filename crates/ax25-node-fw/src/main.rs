@@ -235,7 +235,12 @@ mod firmware {
             st.callsign[..n].copy_from_slice(&disp.as_bytes()[..n]);
             oled::set(st);
         }
-        spawner.spawn(defmt::unwrap!(oled::task(p.I2C0, p.PIN_4, p.PIN_5, stack)));
+        // DISABLE_OLED build env skips the OLED task — a diagnostic/escape hatch
+        // for boards where the (blocking-I2C) panel path misbehaves and starves
+        // the executor.
+        if option_env!("DISABLE_OLED").is_none() {
+            spawner.spawn(defmt::unwrap!(oled::task(p.I2C0, p.PIN_4, p.PIN_5, stack)));
+        }
 
         // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
         // portal are up (so you can set a callsign), but NO on-air transport is
