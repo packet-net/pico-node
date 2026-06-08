@@ -68,6 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Guard the frozen A/B flash layout: the bootloader and app memory.x must
+      # agree, or the swap bricks + OTA deltas break (docs/OTA.md, OTA-RADIO.md).
+      # Toolchain-free, so it runs first and fails fast.
+      - name: Flash-layout drift check (bootloader vs app)
+        run: ./scripts/check-layout.sh
+
       # Same sibling-clone dance as the check job (fw → core → ax25sdl).
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
