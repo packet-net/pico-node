@@ -94,8 +94,9 @@ pub async fn http_task(stack: Stack<'static>) {
 /// DFU, mark, reset.
 async fn serve_conn(socket: &mut TcpSocket<'_>) {
     // Read until the end of the request headers (carrying any body bytes that
-    // arrive in the same segment).
-    let mut hdr = [0u8; 1024];
+    // arrive in the same segment). 2 KiB holds the headers plus a small config
+    // POST body (firmware bodies are streamed separately, not buffered here).
+    let mut hdr = [0u8; 2048];
     let mut hlen = 0usize;
     let header_end;
     loop {
@@ -122,6 +123,40 @@ async fn serve_conn(socket: &mut TcpSocket<'_>) {
     if headers.starts_with(b"GET /version") {
         let _ = http_send(socket, "text/plain", BUILD_TAG.as_bytes()).await;
         let _ = socket.flush().await;
+        return;
+    }
+
+    // In-place configuration: the captive-portal form, served on the live node's
+    // web server (STA mode) so a deployed node can be reconfigured WITHOUT
+    // re-onboarding/BOOTSEL. `GET /config` shows the form; `POST /save` applies
+    // it (same handler as the AP portal) and reboots to take effect.
+    if headers.starts_with(b"GET /config") {
+        let _ = http_send(socket, "text/html", crate::provisioning::FORM_PAGE.as_bytes()).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    if headers.starts_with(b"POST /save") {
+        let content_len = parse_content_length(headers).unwrap_or(0);
+        // Pull the rest of the (small) urlencoded body into the buffer.
+        while hlen < header_end + content_len && hlen < hdr.len() {
+            match socket.read(&mut hdr[hlen..]).await {
+                Ok(0) => break,
+                Ok(n) => hlen += n,
+                Err(_) => break,
+            }
+        }
+        if crate::provisioning::apply_config_form(&hdr[..hlen]) {
+            let _ = http_send(socket, "text/html", CONFIG_SAVED_PAGE.as_bytes()).await;
+            let _ = socket.flush().await;
+            defmt::info!("config saved via web; rebooting to apply");
+            crate::nlog!("config saved (web), rebooting");
+            Timer::after_millis(800).await;
+            cortex_m::peripheral::SCB::sys_reset();
+        } else {
+            // Nothing set (all blank) — just re-show the form.
+            let _ = http_send(socket, "text/html", crate::provisioning::FORM_PAGE.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
         return;
     }
 
@@ -275,6 +310,7 @@ fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-const UPLOAD_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node OTA</title><style>body{font-family:sans-serif;max-width:34em;margin:2em auto;padding:0 1em}input,button{font-size:1em;padding:.4em;margin:.3em 0}button{padding:.6em 1.2em}#log{white-space:pre-wrap;background:#f4f4f4;padding:.6em;margin-top:1em;min-height:2em}</style></head><body><h2>pico-node firmware update</h2><p>Select the raw firmware image (<code>pico-node-app.bin</code>, NOT the .uf2) and upload. The node writes it to the spare partition, then reboots into it on trial. If the new image fails to come up, the next reboot rolls back automatically.</p><input type=file id=f accept=\".bin,application/octet-stream\"><br><button onclick=up()>Upload &amp; reboot</button><div id=log></div><script>function log(m){document.getElementById('log').textContent=m}async function up(){var f=document.getElementById('f').files[0];if(!f){log('Pick a .bin file first.');return}log('Uploading '+f.size+' bytes... do not power off.');try{var r=await fetch('/firmware',{method:'POST',body:f});log('Server: '+r.status+' '+(await r.text())+'\\nThe node is rebooting; reconnect in ~30s.')}catch(e){log('Upload sent; if the node accepted it, it is now rebooting. Reconnect in ~30s.')}}</script></body></html>";
+const UPLOAD_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node OTA</title><style>body{font-family:sans-serif;max-width:34em;margin:2em auto;padding:0 1em}input,button{font-size:1em;padding:.4em;margin:.3em 0}button{padding:.6em 1.2em}#log{white-space:pre-wrap;background:#f4f4f4;padding:.6em;margin-top:1em;min-height:2em}</style></head><body><h2>pico-node firmware update</h2><p>Select the raw firmware image (<code>pico-node-app.bin</code>, NOT the .uf2) and upload. The node writes it to the spare partition, then reboots into it on trial. If the new image fails to come up, the next reboot rolls back automatically.</p><input type=file id=f accept=\".bin,application/octet-stream\"><br><button onclick=up()>Upload &amp; reboot</button><div id=log></div><script>function log(m){document.getElementById('log').textContent=m}async function up(){var f=document.getElementById('f').files[0];if(!f){log('Pick a .bin file first.');return}log('Uploading '+f.size+' bytes... do not power off.');try{var r=await fetch('/firmware',{method:'POST',body:f});log('Server: '+r.status+' '+(await r.text())+'\\nThe node is rebooting; reconnect in ~30s.')}catch(e){log('Upload sent; if the node accepted it, it is now rebooting. Reconnect in ~30s.')}}</script><p style=\"margin-top:1.5em\"><a href=/config>&#9881; Configure this node &rarr;</a></p></body></html>";
 
 const DONE_PAGE: &str = "firmware staged; rebooting to swap. Reconnect in ~30s. If the new image misbehaves it will roll back automatically on the following reboot.";
+const CONFIG_SAVED_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>saved</title></head><body style=\"font-family:sans-serif;max-width:30em;margin:2em auto;padding:0 1em\"><h2>Saved &mdash; rebooting</h2><p>The node is applying the new configuration and restarting. If you changed its WiFi it will join that now (and falls back to the <code>pico-setup</code> AP if it can't); reconnect in ~20s.</p></body></html>";

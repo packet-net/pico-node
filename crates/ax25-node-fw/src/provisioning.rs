@@ -329,6 +329,15 @@ async fn http_write(socket: &mut TcpSocket<'_>, body: &str) -> bool {
 
 /// Parse the urlencoded POST body, apply each field to the pending config via
 /// the console ConfigOp path, then SAVE. Returns whether anything was saved.
+/// Apply a urlencoded config POST body and persist it — shared by the AP captive
+/// portal and the STA-mode `/config` page (`crate::ota`). Returns whether
+/// anything was saved. The caller reboots to apply (boot-time config is
+/// immutable while running).
+pub fn apply_config_form(request: &[u8]) -> bool {
+    let mut scratch = [0u8; 1024];
+    apply_form(request, &mut scratch)
+}
+
 fn apply_form(request: &[u8], scratch: &mut [u8; 1024]) -> bool {
     let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
@@ -404,7 +413,7 @@ fn hex(b: u8) -> Option<u8> {
 // full-width controls so nothing overflows; autocomplete/autocorrect/spellcheck
 // off everywhere (callsign/SSID/MQTT-host are not dictionary words — let the user
 // type), with callsign/alias/grid auto-uppercased since those are conventionally
-// upper case.
-const FORM_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node config</title><style>*{box-sizing:border-box}html{overflow-x:hidden}body{font-family:sans-serif;max-width:30em;margin:0 auto;padding:1em}label{display:block;margin:.8em 0 .2em}input{width:100%;padding:.5em;font-size:16px}button{margin-top:1.2em;padding:.7em;font-size:16px;width:100%}</style></head><body><h2>pico-node configuration</h2><form method=post action=/save autocomplete=off><label>Callsign</label><input name=callsign placeholder=M0ABC-1 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Alias</label><input name=alias placeholder=NODE autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Grid</label><input name=grid placeholder=IO91 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>WiFi network (SSID)</label><input name=wifi_ssid autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>WiFi password</label><input name=wifi_pass type=password autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>MQTT host (optional, host:port for logs)</label><input name=mqtt_host placeholder=10.0.0.5:1883 inputmode=url autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><button type=submit>Save &amp; reboot</button></form><p>Leave a field blank to keep its current value. Set a WiFi network to join it on the next boot; the node returns to this AP if it can't.</p></body></html>";
+// upper case. Shared by the AP captive portal and the STA-mode /config page.
+pub const FORM_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node config</title><style>*{box-sizing:border-box}html{overflow-x:hidden}body{font-family:sans-serif;max-width:30em;margin:0 auto;padding:1em}label{display:block;margin:.8em 0 .2em}input{width:100%;padding:.5em;font-size:16px}button{margin-top:1.2em;padding:.7em;font-size:16px;width:100%}</style></head><body><h2>pico-node configuration</h2><form method=post action=/save autocomplete=off><label>Callsign</label><input name=callsign placeholder=M0ABC-1 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Alias</label><input name=alias placeholder=NODE autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Grid</label><input name=grid placeholder=IO91 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>WiFi network (SSID)</label><input name=wifi_ssid autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>WiFi password</label><input name=wifi_pass type=password autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>MQTT host (optional, host:port for logs)</label><input name=mqtt_host placeholder=10.0.0.5:1883 inputmode=url autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><button type=submit>Save &amp; reboot</button></form><p>Leave a field blank to keep its current value. Set a WiFi network to join it on the next boot; the node returns to this AP if it can't.</p></body></html>";
 
 const SAVED_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>saved</title></head><body style=\"font-family:sans-serif;max-width:30em;margin:2em auto\"><h2>Saved &mdash; rebooting</h2><p>The node is restarting. If you set a WiFi network it will join that now; otherwise it returns to this configuration AP.</p></body></html>";

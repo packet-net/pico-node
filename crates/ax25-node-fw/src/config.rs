@@ -127,7 +127,7 @@ pub fn load() -> NodeConfig {
         wifi: WifiConfig {
             ssid: option_env!("WIFI_SSID").unwrap_or(""),
             password: option_env!("WIFI_PASSWORD").unwrap_or(""),
-            ap_passphrase: option_env!("AP_PASSPHRASE").unwrap_or("pico-node-config"),
+            ap_passphrase: option_env!("AP_PASSPHRASE").unwrap_or("packetradio"),
         },
         axudp: AxudpConfig {
             listen_port: 10093,
