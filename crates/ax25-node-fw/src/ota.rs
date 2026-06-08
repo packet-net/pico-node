@@ -72,12 +72,14 @@ pub fn mark_booted_early(flash: ConfigFlash) -> ConfigFlash {
     shared.into_inner().into_inner()
 }
 
-/// The firmware-upload HTTP server. STA mode only (see [`OTA_PORT`]).
+/// The node's web panel + firmware-upload HTTP server. STA mode only (see
+/// [`OTA_PORT`]). `hostname` is the node's mDNS/DHCP name, shown in the status
+/// header (as `<hostname>.local`).
 #[embassy_executor::task]
-pub async fn http_task(stack: Stack<'static>) {
+pub async fn http_task(stack: Stack<'static>, hostname: &'static str) {
     let mut rx_buf = [0u8; 4096];
     let mut tx_buf = [0u8; 1024];
-    defmt::info!("ota: firmware-upload server up on :{}", OTA_PORT);
+    defmt::info!("ota: node web panel up on :{}", OTA_PORT);
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_timeout(Some(Duration::from_secs(30)));
@@ -85,14 +87,15 @@ pub async fn http_task(stack: Stack<'static>) {
             socket.close();
             continue;
         }
-        serve_conn(&mut socket).await;
+        serve_conn(&mut socket, stack, hostname).await;
         socket.close();
     }
 }
 
-/// Handle one connection: GET → the upload page; `POST /firmware` → stream into
-/// DFU, mark, reset.
-async fn serve_conn(socket: &mut TcpSocket<'_>) {
+/// Handle one connection. `GET /` → the node panel; `GET /version` → build tag;
+/// `POST /save` → apply config + reboot; `POST /apmode` → reboot into setup AP;
+/// `POST /firmware` → stream into DFU, mark, reset.
+async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname: &str) {
     // Read until the end of the request headers (carrying any body bytes that
     // arrive in the same segment). 2 KiB holds the headers plus a small config
     // POST body (firmware bodies are streamed separately, not buffered here).
@@ -126,15 +129,8 @@ async fn serve_conn(socket: &mut TcpSocket<'_>) {
         return;
     }
 
-    // In-place configuration: the captive-portal form, served on the live node's
-    // web server (STA mode) so a deployed node can be reconfigured WITHOUT
-    // re-onboarding/BOOTSEL. `GET /config` shows the form; `POST /save` applies
-    // it (same handler as the AP portal) and reboots to take effect.
-    if headers.starts_with(b"GET /config") {
-        let _ = http_send(socket, "text/html", crate::provisioning::FORM_PAGE.as_bytes()).await;
-        let _ = socket.flush().await;
-        return;
-    }
+    // In-place configuration: `POST /save` applies the panel's config form (same
+    // handler as the AP captive portal) and reboots to take effect.
     if headers.starts_with(b"POST /save") {
         let content_len = parse_content_length(headers).unwrap_or(0);
         // Pull the rest of the (small) urlencoded body into the buffer.
@@ -146,22 +142,55 @@ async fn serve_conn(socket: &mut TcpSocket<'_>) {
             }
         }
         if crate::provisioning::apply_config_form(&hdr[..hlen]) {
-            let _ = http_send(socket, "text/html", CONFIG_SAVED_PAGE.as_bytes()).await;
+            let page = crate::webui::notice(
+                "Saved — rebooting",
+                "Applying the new configuration and restarting. If you changed its \
+WiFi it will join that now (and falls back to the setup AP if it can't); \
+reconnect in ~20s.",
+            );
+            let _ = http_send(socket, "text/html", page.as_bytes()).await;
             let _ = socket.flush().await;
             defmt::info!("config saved via web; rebooting to apply");
             crate::nlog!("config saved (web), rebooting");
             Timer::after_millis(800).await;
             cortex_m::peripheral::SCB::sys_reset();
         } else {
-            // Nothing set (all blank) — just re-show the form.
-            let _ = http_send(socket, "text/html", crate::provisioning::FORM_PAGE.as_bytes()).await;
+            // Nothing set (all blank) — just re-show the panel.
+            let page = node_panel(stack, hostname);
+            let _ = http_send(socket, "text/html", page.as_bytes()).await;
             let _ = socket.flush().await;
         }
         return;
     }
 
+    // Maintenance: "Switch to setup AP" — set the sticky FORCE_AP flag via the
+    // console config path, persist, and reboot. The node comes up as its config
+    // AP (`pico-<callsign>`) until a config save clears the flag.
+    if headers.starts_with(b"POST /apmode") {
+        use ax25_node_core::console::ConfigOp;
+        let _ = config_store::handle_op(&ConfigOp::Set {
+            key: alloc::string::String::from("FORCE_AP"),
+            value: alloc::string::String::from("true"),
+        });
+        let (_t, _) = config_store::handle_op(&ConfigOp::Save);
+        let page = crate::webui::notice(
+            "Switching to setup AP",
+            "Rebooting into the <code>pico-…</code> configuration access point. \
+Join that WiFi network and browse to <code>192.168.4.1</code> to move this node \
+to a different network. It stays in setup mode until you save a new config.",
+        );
+        let _ = http_send(socket, "text/html", page.as_bytes()).await;
+        let _ = socket.flush().await;
+        defmt::info!("FORCE_AP set via web; rebooting into setup AP");
+        crate::nlog!("switch to setup AP (web), rebooting");
+        Timer::after_millis(800).await;
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+
     if !headers.starts_with(b"POST /firmware") {
-        let _ = http_send(socket, "text/html", UPLOAD_PAGE.as_bytes()).await;
+        // Any other GET → the node panel (status + config + firmware + maint).
+        let page = node_panel(stack, hostname);
+        let _ = http_send(socket, "text/html", page.as_bytes()).await;
         let _ = socket.flush().await;
         return;
     }
@@ -188,7 +217,12 @@ async fn serve_conn(socket: &mut TcpSocket<'_>) {
     // (untouched, unmarked) current image cleanly — config_store is gone, so a
     // reset is the right way back to a working node.
     if ok {
-        let _ = http_send(socket, "text/html", DONE_PAGE.as_bytes()).await;
+        let page = crate::webui::notice(
+            "Firmware staged — rebooting",
+            "Rebooting to swap in the new image (on trial). Reconnect in ~30s. If \
+it misbehaves the node rolls back automatically on the following reboot.",
+        );
+        let _ = http_send(socket, "text/html", page.as_bytes()).await;
         let _ = socket.flush().await;
         defmt::info!("ota: image staged + marked; rebooting to swap");
         crate::nlog!("OTA: staged OK, rebooting to swap");
@@ -310,7 +344,77 @@ fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-const UPLOAD_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node OTA</title><style>body{font-family:sans-serif;max-width:34em;margin:2em auto;padding:0 1em}input,button{font-size:1em;padding:.4em;margin:.3em 0}button{padding:.6em 1.2em}#log{white-space:pre-wrap;background:#f4f4f4;padding:.6em;margin-top:1em;min-height:2em}</style></head><body><h2>pico-node firmware update</h2><p>Select the raw firmware image (<code>pico-node-app.bin</code>, NOT the .uf2) and upload. The node writes it to the spare partition, then reboots into it on trial. If the new image fails to come up, the next reboot rolls back automatically.</p><input type=file id=f accept=\".bin,application/octet-stream\"><br><button onclick=up()>Upload &amp; reboot</button><div id=log></div><script>function log(m){document.getElementById('log').textContent=m}async function up(){var f=document.getElementById('f').files[0];if(!f){log('Pick a .bin file first.');return}log('Uploading '+f.size+' bytes... do not power off.');try{var r=await fetch('/firmware',{method:'POST',body:f});log('Server: '+r.status+' '+(await r.text())+'\\nThe node is rebooting; reconnect in ~30s.')}catch(e){log('Upload sent; if the node accepted it, it is now rebooting. Reconnect in ~30s.')}}</script><p style=\"margin-top:1.5em\"><a href=/config>&#9881; Configure this node &rarr;</a></p></body></html>";
+/// Render the node panel: a status header, the pre-filled config form, the
+/// firmware-update section, and the "Switch to setup AP" maintenance action.
+fn node_panel(stack: Stack<'static>, hostname: &str) -> alloc::string::String {
+    use crate::webui::esc;
+    use alloc::format;
 
-const DONE_PAGE: &str = "firmware staged; rebooting to swap. Reconnect in ~30s. If the new image misbehaves it will roll back automatically on the following reboot.";
-const CONFIG_SAVED_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>saved</title></head><body style=\"font-family:sans-serif;max-width:30em;margin:2em auto;padding:0 1em\"><h2>Saved &mdash; rebooting</h2><p>The node is applying the new configuration and restarting. If you changed its WiFi it will join that now (and falls back to the <code>pico-setup</code> AP if it can't); reconnect in ~20s.</p></body></html>";
+    let p = config_store::current_pending();
+    let call = p.callsign.as_deref().unwrap_or("(unconfigured)");
+    let alias = p.alias.as_deref().unwrap_or("");
+    let grid = p.grid.as_deref().unwrap_or("");
+
+    // Identity sub-line: "ALIAS · GRID" (whichever are set).
+    let mut idline = alloc::string::String::new();
+    if !alias.is_empty() {
+        idline += &esc(alias);
+    }
+    if !grid.is_empty() {
+        if !idline.is_empty() {
+            idline += " · ";
+        }
+        idline += &esc(grid);
+    }
+
+    // Machine line: "<hostname>.local · <ip> · <version>".
+    let ip = stack
+        .config_v4()
+        .map(|c| format!("{}", c.address.address()))
+        .unwrap_or_else(|| alloc::string::String::from("—"));
+
+    let header = format!(
+        "<div class=spread><h1 class=mono>{}</h1><span class=sub><span class=dot>●</span> online</span></div>\
+{}\
+<p class=\"sub mono\">{}.local · {} · {}</p>",
+        esc(call),
+        if idline.is_empty() {
+            alloc::string::String::new()
+        } else {
+            format!("<p class=sub>{idline}</p>")
+        },
+        esc(hostname),
+        esc(&ip),
+        esc(BUILD_TAG),
+    );
+
+    let body = format!(
+        "{header}{}{FIRMWARE_SECTION}{MAINTENANCE_SECTION}",
+        crate::webui::config_form(&p)
+    );
+    crate::webui::page("pico-node", &body)
+}
+
+/// The firmware-update section (static): file picker + a tiny uploader that
+/// POSTs the raw image to `/firmware` and shows the server's reply.
+const FIRMWARE_SECTION: &str = "<section><h2>Firmware</h2>\
+<p class=hint>Upload the raw <code>pico-node-app.bin</code> (not the .uf2). The node \
+writes it to the spare partition, reboots on trial, and rolls back automatically if it \
+fails to come up.</p>\
+<div class=row><input type=file id=f accept=\".bin,application/octet-stream\">\
+<button class=ghost onclick=up()>Upload</button></div>\
+<div id=log></div></section>\
+<script>function log(m){document.getElementById('log').textContent=m}\
+async function up(){var f=document.getElementById('f').files[0];\
+if(!f){log('Pick a .bin file first.');return}\
+log('Uploading '+f.size+' bytes… do not power off.');\
+try{var r=await fetch('/firmware',{method:'POST',body:f});\
+log(await r.text())}catch(e){log('Upload sent; if the node accepted it, it is now \
+rebooting. Reconnect in ~30s.')}}</script>";
+
+/// The maintenance section (static): the "Switch to setup AP" action.
+const MAINTENANCE_SECTION: &str = "<section><h2>Maintenance</h2>\
+<p class=hint>Reboot into the <code>pico-…</code> setup access point to move this node \
+to a different WiFi network. It stays in setup mode until you save a new config.</p>\
+<form method=post action=/apmode><button type=submit class=ghost>Switch to setup AP</button></form>\
+</section>";

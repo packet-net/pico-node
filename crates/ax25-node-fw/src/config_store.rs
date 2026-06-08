@@ -58,6 +58,10 @@ const TAG_TELNET_PORT: u8 = 10;
 const TAG_NODES_INTERVAL: u8 = 11;
 const TAG_ORIGINATE: u8 = 12;
 const TAG_MQTT_HOST: u8 = 13;
+/// One-shot-ish "boot into the setup AP instead of STA" flag (the web panel's
+/// "Switch to setup AP" maintenance action). Sticky: stays set across reboots
+/// until a config save clears it.
+const TAG_FORCE_AP: u8 = 14;
 
 /// The persisted fields. Every field optional: only explicitly-set values are
 /// stored, everything else falls back to the compiled factory defaults.
@@ -76,6 +80,9 @@ pub struct StoredConfig {
     pub nodes_interval_secs: Option<u32>,
     pub originate: Option<bool>,
     pub mqtt_host: Option<heapless::String<32>>,
+    /// When `Some(true)`, boot into the config AP instead of joining WiFi (the
+    /// "Switch to setup AP" maintenance action). Sticky until a config save.
+    pub force_ap: Option<bool>,
 }
 
 impl StoredConfig {
@@ -120,6 +127,9 @@ impl StoredConfig {
         if let Some(s) = &self.mqtt_host {
             put(TAG_MQTT_HOST, s.as_bytes());
         }
+        if let Some(v) = self.force_ap {
+            put(TAG_FORCE_AP, &[v as u8]);
+        }
         at
     }
 
@@ -163,6 +173,7 @@ impl StoredConfig {
                 }
                 TAG_ORIGINATE if len == 1 => out.originate = Some(data[0] != 0),
                 TAG_MQTT_HOST => out.mqtt_host = s(data),
+                TAG_FORCE_AP if len == 1 => out.force_ap = Some(data[0] != 0),
                 _ => {} // unknown/short tag: skip (forward compatibility)
             }
         }
@@ -370,6 +381,18 @@ pub fn take_flash_for_ota() -> Option<ConfigFlash> {
     CONFIG.lock(|cell| cell.borrow_mut().take().map(|svc| svc.into_flash()))
 }
 
+/// Snapshot the current pending config (what the console/portal would SAVE) —
+/// used by the web panel to pre-fill the config form. Returns defaults if the
+/// store is unavailable (e.g. taken for an in-flight OTA).
+pub fn current_pending() -> StoredConfig {
+    CONFIG.lock(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|svc| svc.pending.clone())
+            .unwrap_or_default()
+    })
+}
+
 /// Execute one console [`ConfigOp`]: returns the response text (newline-
 /// separated; the caller renders per transport) and whether a reboot was
 /// requested (the caller flushes output first, then resets).
@@ -440,8 +463,12 @@ fn render_show(p: &StoredConfig) -> String {
         None => String::from("  ORIGINATE      (default: true)\n"),
     };
     out += &match &p.mqtt_host {
-        Some(v) => format!("  MQTT_HOST      {}", v.as_str()),
-        None => String::from("  MQTT_HOST      (unset)"),
+        Some(v) => format!("  MQTT_HOST      {}\n", v.as_str()),
+        None => String::from("  MQTT_HOST      (unset)\n"),
+    };
+    out += &match p.force_ap {
+        Some(true) => String::from("  FORCE_AP       true (boots into setup AP)"),
+        _ => String::from("  FORCE_AP       false"),
     };
     out
 }
@@ -502,6 +529,17 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
             "false" | "FALSE" | "0" | "off" | "OFF" => {
                 p.originate = Some(false);
                 String::from("ORIGINATE staged. SAVE to persist.")
+            }
+            _ => String::from("expected true/false"),
+        },
+        "FORCE_AP" => match value {
+            "true" | "TRUE" | "1" | "on" | "ON" => {
+                p.force_ap = Some(true);
+                String::from("FORCE_AP staged. SAVE to persist.")
+            }
+            "false" | "FALSE" | "0" | "off" | "OFF" => {
+                p.force_ap = Some(false);
+                String::from("FORCE_AP staged. SAVE to persist.")
             }
             _ => String::from("expected true/false"),
         },

@@ -12,3 +12,6 @@ Cargo.lock
 # (The cyw43 firmware blobs under crates/ax25-node-fw/cyw43-firmware/ ARE
 # committed: licence-checked at Gate 2 — Infineon Permissive Binary License,
 # redistribution permitted with the notice, which travels in that directory.)
+
+# OTA release artifacts (build output of scripts/package-ota.sh) — not tracked.
+dist/

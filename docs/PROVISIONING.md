@@ -121,6 +121,15 @@ and de-risk 3–5, which are UX.
   192.168.4.10, the DNS resolved captive.apple.com -> 192.168.4.1 (the iOS
   portal-pop probe), GET / served the config form, and POST /save wrote the
   submitted config to flash + rebooted — the change (alias) survived and applied.
+- **In-place reconfiguration DONE** (web-panel PR): a deployed STA-mode node
+  serves the same config form (pre-filled with its current values) on its web
+  panel at `http://<node-ip>/` (`POST /save`), so you can change callsign / WiFi /
+  alias / MQTT without re-onboarding or BOOTSEL. The node also offers a **"Switch
+  to setup AP"** action (`POST /apmode`) that reboots it into the
+  `pico-<callsign>` config AP to move it to a different WiFi — a **sticky** flag
+  (`FORCE_AP`, `src/config_store.rs`) keeps it in setup mode across reboots until
+  a config save clears it. This is the STA→AP return path that previously
+  required a probe/erase.
 - **Step 5 (polish) remaining**: WiFi scan-and-pick in the portal, AP passphrase
   change, factory-reset gesture, config export/import.
 
