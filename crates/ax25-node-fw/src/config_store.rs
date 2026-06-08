@@ -488,11 +488,30 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
         }
     }
     match key {
+        // Validate + canonicalize: 1–6 base chars, optional -SSID 0–15 (SSID 0 ==
+        // no SSID, so it's dropped), and the whole thing upper-cased. We store the
+        // canonical text (`write_display`), not the raw input, so "m0lte-0" lands
+        // as "M0LTE".
         "CALLSIGN" => match Callsign::parse(value) {
-            Some(_) => put(&mut p.callsign, value, "CALLSIGN"),
-            None => String::from("not a valid callsign"),
+            Some(c) => {
+                let mut buf = [0u8; 12];
+                let n = c.write_display(&mut buf).unwrap_or(0);
+                match core::str::from_utf8(&buf[..n]) {
+                    Ok(canon) => put(&mut p.callsign, canon, "CALLSIGN"),
+                    Err(_) => String::from("callsign encode error"),
+                }
+            }
+            None => String::from("not a valid callsign (max 6 chars + optional -SSID 0-15)"),
         },
-        "ALIAS" => put(&mut p.alias, value, "ALIAS"),
+        // Max 6 chars, upper-cased.
+        "ALIAS" => {
+            let up = value.trim().to_ascii_uppercase();
+            if up.chars().count() > 6 {
+                String::from("ALIAS too long (max 6)")
+            } else {
+                put(&mut p.alias, &up, "ALIAS")
+            }
+        }
         "GRID" => put(&mut p.grid, value, "GRID"),
         "HOSTNAME" => put(&mut p.hostname, value, "HOSTNAME"),
         "WIFI_SSID" => put(&mut p.wifi_ssid, value, "WIFI_SSID"),

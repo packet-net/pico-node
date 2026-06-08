@@ -250,21 +250,21 @@ mod firmware {
 
         // --- OLED status display (NinoBLE Rev5, I2C0 GP4/GP5; optional —
         // the task self-disables if no SSD1306 ACKs at 0x3C). ---
-        {
-            let mut st = oled::Status {
-                sta: sta_ok,
-                ..Default::default()
-            };
-            let disp = if configured { call_text } else { "NO CALL" };
-            let n = disp.len().min(12);
-            st.callsign[..n].copy_from_slice(&disp.as_bytes()[..n]);
-            oled::set(st);
-        }
+        oled::set(oled::Status {
+            sta: sta_ok,
+            ..Default::default()
+        });
         // DISABLE_OLED build env skips the OLED task — a diagnostic/escape hatch
         // for boards where the (blocking-I2C) panel path misbehaves and starves
-        // the executor.
+        // the executor. Line 1 shows the mDNS name `<hostname>.local`.
         if option_env!("DISABLE_OLED").is_none() {
-            spawner.spawn(defmt::unwrap!(oled::task(p.I2C0, p.PIN_4, p.PIN_5, stack)));
+            spawner.spawn(defmt::unwrap!(oled::task(
+                p.I2C0,
+                p.PIN_4,
+                p.PIN_5,
+                stack,
+                cfg.hostname
+            )));
         }
 
         // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
