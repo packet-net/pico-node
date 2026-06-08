@@ -8,6 +8,8 @@
 //! Read-only by construction and `no_std`/allocation-free (a `[Option<…>; N]` of
 //! fixed-sized arrays, not heap maps). Nothing here transmits.
 
+pub mod inp3_route_selector;
+pub mod inp3_sntt;
 pub mod model;
 pub mod options;
 pub mod quality;
@@ -47,6 +49,18 @@ pub trait NetRomRoutingView {
         exclude: &Callsign,
         flow_hash: u32,
     ) -> Option<Callsign>;
+    /// The lowest-target-time INP3 route to `dest` whose neighbour is not `exclude` (the
+    /// way a transit datagram arrived) — the time-space mirror of [`Self::best_route_excluding`],
+    /// used by [`crate::netrom::forwarding::decide_forward`] when `prefer_inp3_routes` is
+    /// set. Ties: lowest hop count, then neighbour callsign ordinal. `None` when the
+    /// destination holds no usable INP3 time-route, at which point the caller falls back
+    /// to the quality next-hop. Defaults to `None` (a view that surfaces no INP3 routes),
+    /// so forwarding degenerates byte-for-byte to today's quality path unless a view
+    /// overrides it (the production [`NetRomRoutingTable`] does).
+    fn inp3_next_hop_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
+        let _ = (dest, exclude);
+        None
+    }
 }
 
 impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> NetRomRoutingView
@@ -71,6 +85,9 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize> Net
         flow_hash: u32,
     ) -> Option<Callsign> {
         NetRomRoutingTable::select_route_excluding(self, dest, exclude, flow_hash)
+    }
+    fn inp3_next_hop_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
+        NetRomRoutingTable::inp3_next_hop_excluding(self, dest, exclude)
     }
 }
 

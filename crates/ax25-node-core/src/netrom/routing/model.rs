@@ -14,6 +14,21 @@ use crate::ax25::Callsign;
 
 use crate::netrom::wire::Alias;
 
+/// The INP3 measured-time metric carried alongside a route's quality (slice I-3):
+/// the local target time to the destination via this route (Σ SNTT along the path,
+/// in ms) and the hop count. A route may hold this in addition to its NODES quality,
+/// so a destination coexists in both metric spaces. `None` on a pure quality (NODES)
+/// route.
+///
+/// Mirrors `Packet.NetRom.Routing.Inp3RouteMetric` on the C# side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inp3RouteMetric {
+    /// Local target time to the destination via this route, in ms (≤ 600000 = horizon).
+    pub target_time_ms: u32,
+    /// Hop count to the destination via this route.
+    pub hop_count: u8,
+}
+
 /// One learned route to a NET/ROM destination: the next-hop neighbour to forward
 /// through, the quality we derived for it, and its obsolescence count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +39,11 @@ pub struct NetRomRoute {
     pub quality: u8,
     /// Obsolescence count; decremented each sweep, purged at 0.
     pub obsolescence: u8,
+    /// The INP3 measured-time metric for this route, when one has been learned via a
+    /// RIF (slice I-3). `None` on a pure NODES quality route. A route holding this
+    /// participates in the INP3 time-space (selection / forwarding-by-time / RIF
+    /// re-advertisement) as well as the quality space.
+    pub inp3: Option<Inp3RouteMetric>,
 }
 
 /// A destination known to the table — its callsign + alias and a copy of its best

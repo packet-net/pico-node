@@ -10,6 +10,8 @@ pub mod circuit;
 pub mod circuit_manager;
 pub mod circuit_options;
 pub mod circuit_state;
+pub mod inp3_engine;
+pub mod inp3_update_scheduler;
 
 pub use circuit::{CircuitEvent, NetRomCircuit, OutboundPacket};
 pub use circuit_manager::{CircuitKey, CircuitManager, IncomingCircuit};
