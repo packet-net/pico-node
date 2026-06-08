@@ -156,8 +156,7 @@ reconnect in ~20s.",
             cortex_m::peripheral::SCB::sys_reset();
         } else {
             // Nothing set (all blank) — just re-show the panel.
-            let page = node_panel(stack, hostname);
-            let _ = http_send(socket, "text/html", page.as_bytes()).await;
+            let _ = write_panel(socket, stack, hostname).await;
             let _ = socket.flush().await;
         }
         return;
@@ -189,8 +188,7 @@ to a different network. It stays in setup mode until you save a new config.",
 
     if !headers.starts_with(b"POST /firmware") {
         // Any other GET → the node panel (status + config + firmware + maint).
-        let page = node_panel(stack, hostname);
-        let _ = http_send(socket, "text/html", page.as_bytes()).await;
+        let _ = write_panel(socket, stack, hostname).await;
         let _ = socket.flush().await;
         return;
     }
@@ -344,18 +342,41 @@ fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-/// Render the node panel: a status header, the pre-filled config form, the
+// Static page fragments around the two small dynamic pieces (status header +
+// config form). Split out so the panel can be sent with a correct
+// `Content-Length` without ever holding the whole page on the heap.
+const PANEL_HEAD: &str = "<!DOCTYPE html><html lang=en><head><meta charset=utf-8>\
+<meta name=viewport content=\"width=device-width,initial-scale=1\">\
+<title>pico-node</title><style>";
+const PANEL_STYLE_MID: &str = "</style></head><body>";
+const PANEL_TAIL: &str = "</body></html>";
+
+/// Send the node panel — a status header, the pre-filled config form, the
 /// firmware-update section, and the "Switch to setup AP" maintenance action.
-fn node_panel(stack: Stack<'static>, hostname: &str) -> alloc::string::String {
-    use crate::webui::esc;
+///
+/// **Heap discipline:** the heap is only 16 KiB and shared with the
+/// session/codec allocations; building the whole ~4.5 KiB page (plus its
+/// `format!` temporaries) peaked well past that and the alloc-error handler
+/// halts the node. So only the two *small* dynamic pieces are allocated (status
+/// header ~0.3 KiB + config form ~1.2 KiB); everything else is written from
+/// `&str` constants. Peak heap ≈ 1.5 KiB. Both are measured so the response
+/// carries a real `Content-Length` (no close-delimited body → the client and
+/// the single-socket server don't wait on the FIN).
+async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname: &str) -> bool {
+    use crate::webui::{config_form, esc, CSS};
     use alloc::format;
+    use core::fmt::Write;
 
     let p = config_store::current_pending();
+
+    // Status header (small dynamic String).
     let call = p.callsign.as_deref().unwrap_or("(unconfigured)");
     let alias = p.alias.as_deref().unwrap_or("");
     let grid = p.grid.as_deref().unwrap_or("");
-
-    // Identity sub-line: "ALIAS · GRID" (whichever are set).
+    let ip = stack
+        .config_v4()
+        .map(|c| format!("{}", c.address.address()))
+        .unwrap_or_else(|| alloc::string::String::from("—"));
     let mut idline = alloc::string::String::new();
     if !alias.is_empty() {
         idline += &esc(alias);
@@ -366,16 +387,9 @@ fn node_panel(stack: Stack<'static>, hostname: &str) -> alloc::string::String {
         }
         idline += &esc(grid);
     }
-
-    // Machine line: "<hostname>.local · <ip> · <version>".
-    let ip = stack
-        .config_v4()
-        .map(|c| format!("{}", c.address.address()))
-        .unwrap_or_else(|| alloc::string::String::from("—"));
-
     let header = format!(
-        "<div class=spread><h1 class=mono>{}</h1><span class=sub><span class=dot>●</span> online</span></div>\
-{}\
+        "<div class=spread><h1 class=mono>{}</h1>\
+<span class=sub><span class=dot>●</span> online</span></div>{}\
 <p class=\"sub mono\">{}.local · {} · {}</p>",
         esc(call),
         if idline.is_empty() {
@@ -388,11 +402,35 @@ fn node_panel(stack: Stack<'static>, hostname: &str) -> alloc::string::String {
         esc(BUILD_TAG),
     );
 
-    let body = format!(
-        "{header}{}{FIRMWARE_SECTION}{MAINTENANCE_SECTION}",
-        crate::webui::config_form(&p)
+    // Pre-filled config form (~1.2 KiB String). Held alongside `header` only —
+    // peak heap stays ~1.5 KiB.
+    let form = config_form(&p);
+
+    let body_len = PANEL_HEAD.len()
+        + CSS.len()
+        + PANEL_STYLE_MID.len()
+        + header.len()
+        + form.len()
+        + FIRMWARE_SECTION.len()
+        + MAINTENANCE_SECTION.len()
+        + PANEL_TAIL.len();
+
+    let mut head = heapless::String::<96>::new();
+    let _ = write!(
+        head,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_len
     );
-    crate::webui::page("pico-node", &body)
+
+    write_all(socket, head.as_bytes()).await
+        && write_all(socket, PANEL_HEAD.as_bytes()).await
+        && write_all(socket, CSS.as_bytes()).await
+        && write_all(socket, PANEL_STYLE_MID.as_bytes()).await
+        && write_all(socket, header.as_bytes()).await
+        && write_all(socket, form.as_bytes()).await
+        && write_all(socket, FIRMWARE_SECTION.as_bytes()).await
+        && write_all(socket, MAINTENANCE_SECTION.as_bytes()).await
+        && write_all(socket, PANEL_TAIL.as_bytes()).await
 }
 
 /// The firmware-update section (static): file picker + a tiny uploader that
