@@ -1,7 +1,12 @@
 # CYW43439 firmware blobs (vendored)
 
-WiFi firmware, CLM, and NVRAM blobs for the Pico W's CYW43439, loaded by
-`src/net.rs` via `cyw43::aligned_bytes!`.
+WiFi firmware, CLM, and NVRAM blobs for the Pico W's CYW43439. These are NO
+LONGER linked into the app image (`include_bytes!`): since OTA (docs/OTA.md) the
+~226 KB firmware would otherwise sit in BOTH A/B partitions. Instead
+`scripts/build-blobs.py` packs them (with a `PBLB` manifest) into the dedicated
+**BLOBS** flash region, flashed once with the combined image, and `src/net.rs`
+reads them from there at the fixed XIP address. They remain build inputs (the
+packaging step), so this directory stays.
 
 **Provenance:** copied verbatim from the embassy repo at tag `cyw43-v0.7.0`
 (`embassy-rs/embassy/cyw43-firmware/`), which in turn obtains them from

@@ -48,6 +48,42 @@ async fn net_task(mut runner: embassy_net::Runner<'static, NetDriver<'static>>) 
     runner.run().await
 }
 
+/// Read the cyw43 firmware/CLM/NVRAM blobs from the fixed BLOBS flash region
+/// (docs/OTA.md). The region holds a `PBLB` manifest + the three blobs, written
+/// by scripts/build-blobs.py and flashed with the combined image; the firmware
+/// and NVRAM need 4-byte alignment (`Aligned<A4, [u8]>`), which the manifest's
+/// 4-aligned offsets + the 4 KiB-aligned region base guarantee.
+///
+/// # Safety
+/// Reads raw flash at `__blobs_start`. A missing/garbage region (e.g. the app
+/// flashed without the blobs) is caught by the magic check and panics with a
+/// clear message rather than feeding junk to the radio.
+/// 4-byte-aligned firmware/NVRAM blob, as `cyw43::new` requires.
+type AlignedBlob = cyw43::Aligned<cyw43::A4, [u8]>;
+
+unsafe fn load_blobs() -> (&'static AlignedBlob, &'static [u8], &'static AlignedBlob) {
+    extern "C" {
+        static __blobs_start: u8;
+    }
+    let base = &__blobs_start as *const u8 as usize;
+    let hdr = core::slice::from_raw_parts(base as *const u8, 32);
+    if &hdr[0..4] != b"PBLB" {
+        defmt::panic!(
+            "BLOBS region not flashed (no PBLB manifest at {=usize:#x}) — flash blobs.bin / the combined UF2",
+            base
+        );
+    }
+    let rd = |o: usize| u32::from_le_bytes([hdr[o], hdr[o + 1], hdr[o + 2], hdr[o + 3]]) as usize;
+    let aligned = |off: usize, len: usize| -> &'static AlignedBlob {
+        // base+off is 4-aligned (4 KiB region base + 4-aligned manifest offset).
+        &*(core::ptr::slice_from_raw_parts((base + off) as *const u8, len) as *const AlignedBlob)
+    };
+    let fw = aligned(rd(8), rd(12));
+    let clm = core::slice::from_raw_parts((base + rd(16)) as *const u8, rd(20));
+    let nvram = aligned(rd(24), rd(28));
+    (fw, clm, nvram)
+}
+
 /// Bring up the CYW43439 over PIO-SPI and spawn its runner task; returns the
 /// net device (for [`start_stack`]) and the control handle (join, LED GPIO).
 ///
@@ -62,11 +98,11 @@ pub async fn init_wifi(
     clk_pin: Peri<'static, PIN_29>,
     dma_ch0: Peri<'static, DMA_CH0>,
 ) -> (NetDriver<'static>, Control<'static>) {
-    // Firmware + NVRAM + CLM blobs, linked from flash (vendored under
-    // ../cyw43-firmware/ with their licence — see the README there + PLAN §5).
-    let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
-    let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
-    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    // Firmware + NVRAM + CLM blobs. These are NOT linked into this image: the
+    // ~226 KB firmware would otherwise sit in BOTH A/B partitions (docs/OTA.md).
+    // They live once in the BLOBS flash region (flashed with the combined image
+    // via scripts/build-blobs.py) and are read here at the fixed XIP address.
+    let (fw, clm, nvram) = unsafe { load_blobs() };
 
     let pwr = Output::new(pwr_pin, Level::Low);
     let cs = Output::new(cs_pin, Level::High);

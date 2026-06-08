@@ -36,19 +36,35 @@ echo "flash-layout drift check (bootloader vs app):"
 check "ACTIVE (app FLASH)"     "$(field "$BL" ACTIVE)"           "$(field "$APP" FLASH)"
 check "DFU"                    "$(field "$BL" DFU)"              "$(field "$APP" DFU)"
 check "BOOTLOADER_STATE"       "$(field "$BL" BOOTLOADER_STATE)" "$(field "$APP" BOOTLOADER_STATE)"
+check "BLOBS"                  "$(field "$BL" BLOBS)"            "$(field "$APP" BLOBS)"
+check "APPDATA"                "$(field "$BL" APPDATA)"          "$(field "$APP" APPDATA)"
 
-# DFU must end at or below 0x101FC000 — the persisted config + NET/ROM stores
-# (top 16 KiB) live there and must never be overlapped by an OTA write.
-dfu="$(field "$BL" DFU)"            # e.g. 0x100E9000|900K
-dfu_org=$(( $(echo "$dfu" | cut -d'|' -f1) ))
-dfu_len_raw=$(echo "$dfu" | cut -d'|' -f2 | sed -E 's/K$/*1024/; s/M$/*1024*1024/')
-dfu_len=$(( dfu_len_raw ))
-dfu_end=$(( dfu_org + dfu_len ))
-store_top=$(( 0x101FC000 ))
-if [ "$dfu_end" -gt "$store_top" ]; then
-  printf "  MISMATCH DFU end 0x%X overruns the config/routing store at 0x%X\n" "$dfu_end" "$store_top"; fail=1
+# Resolve a "ORIGIN|LENGTH" pair into start/end byte addresses.
+addr() { echo "$1" | cut -d'|' -f1; }
+len()  { echo "$1" | cut -d'|' -f2 | sed -E 's/K$/*1024/; s/M$/*1024*1024/'; }
+end_of() { local f; f="$(field "$BL" "$1")"; echo $(( $(addr "$f") + $(len "$f") )); }
+org_of() { addr "$(field "$BL" "$1")"; }
+
+store_top=$(( 0x101FC000 ))     # base of the persisted config + NET/ROM stores
+
+# The map must be contiguous with no gaps/overlaps, in order, up to the store:
+#   DFU end == BLOBS start, BLOBS end == APPDATA start, APPDATA end == store.
+# Any drift means an OTA write (or the blob load) could land in the wrong place.
+contig() { # label end-region start-region
+  local e o; e="$(end_of "$2")"; o="$(( $(org_of "$3") ))"
+  if [ "$e" -ne "$o" ]; then
+    printf "  MISMATCH %s: 0x%X != 0x%X (gap/overlap)\n" "$1" "$e" "$o"; fail=1
+  else
+    printf "  ok  %s 0x%X\n" "$1" "$e"
+  fi
+}
+contig "DFU end == BLOBS start"     DFU     BLOBS
+contig "BLOBS end == APPDATA start" BLOBS   APPDATA
+ad_end="$(end_of APPDATA)"
+if [ "$ad_end" -ne "$store_top" ]; then
+  printf "  MISMATCH APPDATA end 0x%X != config/routing store 0x%X\n" "$ad_end" "$store_top"; fail=1
 else
-  printf "  ok  DFU end 0x%X <= config/routing store 0x%X\n" "$dfu_end" "$store_top"
+  printf "  ok  APPDATA end 0x%X == config/routing store\n" "$ad_end"
 fi
 
 if [ "$fail" = 0 ]; then

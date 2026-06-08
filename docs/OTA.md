@@ -16,8 +16,9 @@ requirement for users to have or use a debug probe."*
    firmware-upload page at **`http://<node-ip>/`**; drop in the raw app image and
    it writes it to a spare flash partition, reboots into it on **trial**, and
    **rolls back automatically** if the new image fails to confirm itself. The
-   real image is **~510 KB**, so two copies (A/B) fit comfortably in the Pico W's
-   2 MB flash. Verified on hardware (see "Verification" below).
+   app image is **~284 KB** (the cyw43 blob is stored separately — see BLOBS
+   below), so two copies (A/B) fit comfortably in the Pico W's 2 MB flash with a
+   large reserve left over. Verified on hardware (see "Verification" below).
 
 ## Architecture
 
@@ -44,22 +45,47 @@ WiFi-join boot and the large OTA erases.
 ## Flash layout (2 MB Pico W)
 
 Must match between `crates/ax25-node-bootloader/memory.x` and
-`crates/ax25-node-fw/memory.x`:
+`crates/ax25-node-fw/memory.x` (`scripts/check-layout.sh` enforces this in CI;
+the layout is **frozen** — changing it needs a coordinated bootloader reflash of
+every node, and it breaks binary-delta OTA):
 
 | Region | Offset | Size |
 |---|---|---|
-| BOOT2 | 0x10000000 | 256 B |
-| Bootloader | 0x10000100 | 32 KB (uses ~9.5 KB) |
-| Bootloader state | 0x10008000 | 4 KB |
-| **ACTIVE** (running app) | 0x10009000 | **896 KB** |
-| **DFU** (staged update) | 0x100E9000 | **900 KB** (= ACTIVE + 1 scratch page) |
-| *(free gap)* | 0x101CA000 | ~200 KB |
+| BOOT2 + bootloader | 0x10000000 | 24 KB (uses ~9.5 KB) |
+| Bootloader state | 0x10006000 | 4 KB |
+| **ACTIVE** (running app) | 0x10007000 | **512 KB** |
+| **DFU** (staged update) | 0x10087000 | **516 KB** (= ACTIVE + 1 scratch page) |
+| **BLOBS** (cyw43 firmware) | 0x10108000 | **256 KB** (flash-once) |
+| **APPDATA** (reserved) | 0x10148000 | **720 KB** |
 | Config + routing store | 0x101FC000 | 16 KB |
 
-The ~510 KB image leaves ~386 KB of headroom in ACTIVE. The config + NET/ROM
-routing sectors (top 16 KB, `src/config_store.rs` + `src/netrom_store.rs`) are at
-absolute offsets in the full-chip Flash driver — untouched by OTA and by the
-relink (they sit in the gap above DFU, outside the app's FLASH region).
+Every byte is allocated — no gaps. The ~284 KB app leaves ~228 KB of headroom in
+ACTIVE. The config + NET/ROM routing sectors (top 16 KB, `src/config_store.rs` +
+`src/netrom_store.rs`) and APPDATA are at absolute offsets in the full-chip Flash
+driver — untouched by OTA, outside the app's FLASH (ACTIVE) region.
+
+### The cyw43 blob lives once (BLOBS), not in A/B
+
+The CYW43439 WiFi firmware (~226 KB) is **not** linked into the app image. If it
+were, it would sit in **both** ACTIVE and DFU (a full image is staged into DFU on
+every update) — ~452 KB of flash for a byte-identical, rarely-changing blob. So
+it lives once in the **BLOBS** region: `scripts/build-blobs.py` lays out a `PBLB`
+manifest + the firmware/CLM/NVRAM, flashed with the combined image, and
+`src/net.rs` reads them at the fixed XIP address `__blobs_start`. Result: the app
+image is **~284 KB** (was ~510 KB), OTA payloads are smaller, and the upstream
+firmware is rare to change (it changed ~twice in 3 years, and we pin it). A blob
+update is therefore a deliberate **BOOTSEL** event (the combined UF2), not a
+routine OTA — routine OTA updates code only.
+
+### Clean state on flash (important for upgrades)
+
+The combined UF2 includes a **STATE-clear** (a 0xFF page at the bootloader-state
+sector). embassy-boot reads that sector to decide whether a swap is pending; a
+chip carrying *stale* bytes there (e.g. upgrading from a previous layout where
+that address held bootloader code) would corrupt the first swap. Writing a clean
+page guarantees "no pending swap" on every BOOTSEL flash. On the bench, always
+**full-erase** (`probe-rs download --chip-erase`) when changing the layout, for
+the same reason.
 
 **Flash sharing:** there is one `FLASH` peripheral, owned by `config_store`. The
 OTA path *takes* it (`config_store::take_flash_for_ota`) and never returns it —
@@ -82,45 +108,56 @@ exposing a node to an untrusted network.
 
 ## Building the artifacts
 
-- **Bootloader:** `cd crates/ax25-node-bootloader && cargo build --release`
-- **App:** `cd crates/ax25-node-fw && cargo build --release` → ELF; the raw
-  OTA image is `rust-objcopy -O binary <elf> pico-node-app.bin`.
-- **Combined first-flash UF2** (bootloader + app, for BOOTSEL):
-  ```
-  picotool uf2 convert <bootloader-elf> -t elf bootloader.uf2
-  picotool uf2 convert <app-elf>        -t elf app.uf2
-  cat bootloader.uf2 app.uf2 > pico-node-combined.uf2
-  ```
+`scripts/package-ota.sh [outdir]` builds everything (credential-free,
+reproducible): `pico-node-app.bin` (the ~284 KB blobless OTA payload),
+`pico-node-combined.uf2` (the first-flash image), `pico-node-app.elf`, and
+`SHA256SUMS`. Internally:
+
+- **Bootloader** (`ax25-node-bootloader`) and **app** (`ax25-node-fw`) build to
+  ELFs; the raw OTA payload is `rust-objcopy -O binary <app-elf> pico-node-app.bin`.
+- **BLOBS image:** `scripts/build-blobs.py` → the `PBLB` manifest + cyw43 blobs.
+- **Combined UF2** = concatenation of four UF2 segments — bootloader, a
+  **STATE-clear** 0xFF page (at the bootloader-state sector), the BLOBS image
+  (at `0x10108000`), and the app — each converted with `picotool uf2 convert`.
   UF2 blocks are independent (each carries its own target address + the RP2040
-  family id), so concatenation is a valid combined image. `scripts/package-ota.sh`
-  automates this.
+  family id), so concatenation is a valid combined image.
 
 ## Bench notes
 
-Because the app is now bootloader-chained, the dev loop and on-target tests need
-the **bootloader pre-flashed once**:
-`probe-rs download --chip RP2040 <bootloader-elf>`. Thereafter `cargo run` /
-`cargo test` flash only the app/test to ACTIVE and the resident bootloader chains
-them. (CI is unaffected — it only link-checks.)
+Because the app is bootloader-chained AND reads the cyw43 blob from the BLOBS
+region, the dev loop needs the **bootloader + BLOBS flashed once**:
+`probe-rs download --chip RP2040 <bootloader-elf>` then
+`probe-rs download --chip RP2040 --binary-format bin --base-address 0x10108000 blobs.bin`.
+Thereafter `cargo run` flashes only the app to ACTIVE. **When changing the
+layout, full-erase first** (`--chip-erase`) so the embassy-boot state sector is
+clean — stale bytes there corrupt the first swap. (CI is unaffected — it only
+link-checks.)
 
-## Verification (on hardware, 2026-06-07)
+## Verification (on hardware, 2026-06-08)
 
-Proven end-to-end on the bench Pico W (probe used only to flash the bootloader +
-the initial app; the updates themselves went over WiFi):
+Proven end-to-end on the bench Pico W — **full chip-erase, all segments flashed +
+verified, clean state** (probe used only for the initial flash; updates went over
+WiFi):
 
-- **Chained boot:** bootloader → relinked app at ACTIVE → `mark_booted` → full
-  service (telnet `M9YYY-9}`, AXUDP, OTA server), with the stored flash config
-  (callsign/WiFi) preserved through the relink.
-- **Swap:** `/version` = `base`; `POST /firmware` of a `v2`-tagged image →
-  reboot → bootloader swap → `/version` = `v2`. The new image booted and ran.
+- **Chained boot:** bootloader → app at ACTIVE → `mark_booted` → full service
+  (telnet `M9YYY-9}`, AXUDP, OTA server), **WiFi initialised from the BLOBS
+  region** (the de-duplicated cyw43 firmware).
+- **Swap:** `/version` = `0.1.0`; `POST /firmware` of a `v2`-tagged image →
+  reboot → bootloader swap → `/version` = `v2`, WiFi rejoined, the swapped image
+  read BLOBS correctly.
 - **Rollback:** from `v2`, OTA'd a deliberately-broken image (resets before
   marking good). The bootloader swapped it in, it self-reset, the bootloader
-  detected the unconfirmed trial and reverted — `/version` back to `v2`, with no
-  human intervention.
-- **Combined UF2:** structurally validated (2078 blocks, RP2040 family, segments
-  at 0x10000000 and 0x10009000, state sector left erased) and byte-identical to
-  the probe-flashed images that booted. The literal BOOTSEL drag-drop wasn't
-  exercised on the remote bench (no physical button access).
+  reverted — `/version` back to `v2`, no human intervention.
+- **Combined UF2:** structurally validated (RP2040 family; segments at
+  0x10000000 (bootloader), 0x10006000 (STATE-clear + app), 0x10108000 (BLOBS))
+  and byte-identical to the proven probe-flashed images. The literal BOOTSEL
+  drag-drop wasn't exercised on the remote bench (no physical button access).
+
+> **Hard-won lesson:** a first attempt iterated three immutable layout changes on
+> one chip without erasing between them; stale embassy-boot state + flaky-SWD
+> flash corruption made the swap appear broken. Re-tested cleanly (full erase,
+> verified flashes), it works. Hence the STATE-clear in the UF2 and the
+> full-erase bench rule above.
 
 ## Risk + recovery
 
@@ -137,4 +174,4 @@ the initial app; the updates themselves went over WiFi):
 `docs/OTA-RADIO.md` — feasibility + design for delivering updates **over packet
 radio** (AX.25 / NET/ROM) instead of WiFi, reusing this same DFU/swap/rollback
 machinery. Includes measured binary-delta sizes (a typical update is ~10 KB, not
-510 KB).
+the full image).

@@ -50,7 +50,7 @@ const OTA_PORT: u16 = 80;
 
 /// DFU partition capacity (must match memory.x DFU LENGTH). Uploads larger than
 /// this are rejected up front.
-const DFU_CAPACITY: usize = 900 * 1024;
+const DFU_CAPACITY: usize = 516 * 1024;
 
 type SharedFlash = BlockingMutex<NoopRawMutex, RefCell<ConfigFlash>>;
 
