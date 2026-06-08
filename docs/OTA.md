@@ -8,9 +8,10 @@ requirement for users to have or use a debug probe."*
 
 **Two separate things, both now true:**
 
-1. **No debug probe is needed to flash.** The released `.uf2` flashes by
-   **BOOTSEL + drag-and-drop over USB** — hold BOOTSEL, plug the Pico's USB, drag
-   the UF2 onto the `RPI-RP2` drive. No probe, no soldering.
+1. **No debug probe is needed to flash.** The released `.uf2`s flash by
+   **BOOTSEL + drag-and-drop over USB** — no probe, no soldering. (First flash is
+   *two* small files in sequence, for a layout reason explained under "First
+   flash" below; on Linux `sudo picotool load` is the easier route.)
 
 2. **Over-the-air (network) update works.** A configured, networked node serves a
    firmware-upload page at **`http://<node-ip>/`**; drop in the raw app image and
@@ -70,17 +71,17 @@ The CYW43439 WiFi firmware (~226 KB) is **not** linked into the app image. If it
 were, it would sit in **both** ACTIVE and DFU (a full image is staged into DFU on
 every update) — ~452 KB of flash for a byte-identical, rarely-changing blob. So
 it lives once in the **BLOBS** region: `scripts/build-blobs.py` lays out a `PBLB`
-manifest + the firmware/CLM/NVRAM, flashed with the combined image, and
+manifest + the firmware/CLM/NVRAM, flashed once via `pico-node-blobs.uf2`, and
 `src/net.rs` reads them at the fixed XIP address `__blobs_start`. Result: the app
 image is **~284 KB** (was ~510 KB), OTA payloads are smaller, and the upstream
 firmware is rare to change (it changed ~twice in 3 years, and we pin it). A blob
-update is therefore a deliberate **BOOTSEL** event (the combined UF2), not a
-routine OTA — routine OTA updates code only.
+update is therefore a deliberate **BOOTSEL** event (re-flash `pico-node-blobs.uf2`),
+not a routine OTA — routine OTA updates code only.
 
 ### Clean state on flash (important for upgrades)
 
-The combined UF2 includes a **STATE-clear** (a 0xFF page at the bootloader-state
-sector). embassy-boot reads that sector to decide whether a swap is pending; a
+The `pico-node-firmware.uf2` includes a **STATE-clear** (a 0xFF page at the
+bootloader-state sector). embassy-boot reads that sector to decide whether a swap is pending; a
 chip carrying *stale* bytes there (e.g. upgrading from a previous layout where
 that address held bootloader code) would corrupt the first swap. Writing a clean
 page guarantees "no pending swap" on every BOOTSEL flash. On the bench, always
@@ -106,21 +107,48 @@ the node's LAN can push firmware. Fine for a hobby node on a trusted LAN; gate i
 (a token, or signed images via embassy-boot's `_verify` ed25519 support) before
 exposing a node to an untrusted network.
 
+## First flash (no probe): two UF2 files
+
+The de-dup puts the cyw43 BLOBS 1 MB above the app (the DFU region sits between
+them), and this defeats a *single* combined UF2 for BOOTSEL drag-drop:
+
+- A **multi-region** UF2 (app + blobs far apart) **does not flash** — the RP2040
+  BOOTSEL bootrom writes contiguously and **stops at the big address jump**,
+  flashing only the part before the gap (the board then boots a bootloader with
+  an un-flashed app → no WiFi, blank display). Verified by reading the flash back
+  over a probe: everything after the jump was the *old* firmware.
+- A **single gap-filled contiguous** UF2 *would* flash, but filling the ~750 KB
+  app→blobs gap makes it ~2.6 MB, which **exceeds the RPI-RP2 drive's advertised
+  size** — the OS refuses the copy.
+
+So the first flash is **two small, single-run (contiguous) UF2s**, dragged in
+sequence — each avoids any address jump and stays well under the size limit:
+
+1. **`pico-node-firmware.uf2`** (~700 KB) — bootloader + a 0xFF STATE-clear +
+   app. (The 0xFF fill spans the bootloader-state sector, so an upgrade from a
+   different layout can't inherit a stale swap state.)
+2. **`pico-node-blobs.uf2`** (~470 KB) — the cyw43 firmware/CLM/NVRAM.
+
+BOOTSEL → drag #1, let `RPI-RP2` vanish → BOOTSEL again → drag #2. The board
+won't boot fully until both are on (in between it sits dead — expected). Order
+doesn't matter. On **Linux**, `sudo picotool load <uf2>` is the more reliable
+path (it writes blocks directly, sidestepping both the drag-drop quirk and the
+common "RPI-RP2 mounts read-only" file-manager issue); `picotool load` doesn't
+reboot between files, so you can load both then `picotool reboot`.
+
+OTA-over-WiFi is unaffected by all of this — it only ever ships the single
+`pico-node-app.bin`.
+
 ## Building the artifacts
 
 `scripts/package-ota.sh [outdir]` builds everything (credential-free,
-reproducible): `pico-node-app.bin` (the ~284 KB blobless OTA payload),
-`pico-node-combined.uf2` (the first-flash image), `pico-node-app.elf`, and
-`SHA256SUMS`. Internally:
-
-- **Bootloader** (`ax25-node-bootloader`) and **app** (`ax25-node-fw`) build to
-  ELFs; the raw OTA payload is `rust-objcopy -O binary <app-elf> pico-node-app.bin`.
-- **BLOBS image:** `scripts/build-blobs.py` → the `PBLB` manifest + cyw43 blobs.
-- **Combined UF2** = concatenation of four UF2 segments — bootloader, a
-  **STATE-clear** 0xFF page (at the bootloader-state sector), the BLOBS image
-  (at `0x10108000`), and the app — each converted with `picotool uf2 convert`.
-  UF2 blocks are independent (each carries its own target address + the RP2040
-  family id), so concatenation is a valid combined image.
+reproducible): `pico-node-app.bin` (the blobless OTA payload),
+`pico-node-firmware.uf2` + `pico-node-blobs.uf2` (the two first-flash files),
+`pico-node-app.elf`, and `SHA256SUMS`. Internally each UF2 is a single
+contiguous region built with `picotool uf2 convert` from a packed `.bin`:
+`firmware` = bootloader at the flash base, 0xFF up through the state sector, then
+the app at ACTIVE; `blobs` = the `PBLB` manifest + cyw43 firmware
+(`scripts/build-blobs.py`) at `0x10108000`.
 
 ## Bench notes
 
@@ -166,7 +194,7 @@ WiFi):
   swaps.
 - A bad-but-self-resetting image rolls back automatically; a hard-hung image
   rolls back on the next manual reset.
-- A catastrophic image is always recoverable with BOOTSEL + the combined UF2 —
+- A catastrophic image is always recoverable with BOOTSEL + the two UF2 files —
   the same no-probe path users already have.
 
 ## See also
