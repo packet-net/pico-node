@@ -131,3 +131,10 @@ the initial app; the updates themselves went over WiFi):
   rolls back on the next manual reset.
 - A catastrophic image is always recoverable with BOOTSEL + the combined UF2 —
   the same no-probe path users already have.
+
+## See also
+
+`docs/OTA-RADIO.md` — feasibility + design for delivering updates **over packet
+radio** (AX.25 / NET/ROM) instead of WiFi, reusing this same DFU/swap/rollback
+machinery. Includes measured binary-delta sizes (a typical update is ~10 KB, not
+510 KB).
