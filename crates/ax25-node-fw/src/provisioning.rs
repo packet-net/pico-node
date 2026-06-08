@@ -176,11 +176,8 @@ fn build_reply(out: &mut [u8], req: &Request, yiaddr: Ipv4Addr, msg_type: u8) ->
 // ─────────────────────────────────────────────────────────────────────────────
 
 use ax25_node_core::console::service::ConfigOp;
-use embassy_net::tcp::TcpSocket;
-use embassy_time::Duration;
 
 const DNS_PORT: u16 = 53;
-const HTTP_PORT: u16 = 80;
 
 /// DNS catch-all: every A query → the AP gateway. Minimal — copies the question
 /// into the answer with a fixed A record; non-A / malformed queries are ignored.
@@ -235,118 +232,60 @@ pub async fn dns_catch_all(stack: Stack<'static>) {
     }
 }
 
-/// HTTP config form: GET serves the form (so any OS probe pops the portal),
-/// POST /save applies the fields + reboots into STA mode.
-#[embassy_executor::task]
-pub async fn http_portal(stack: Stack<'static>) {
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 2048];
-    let mut body_buf = [0u8; 1024];
-    defmt::info!("http: captive portal up on :80");
-    loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(10)));
-        if socket.accept(HTTP_PORT).await.is_err() {
-            continue;
-        }
-        // Read the request (headers + any body) into one buffer.
-        let mut req = [0u8; 2048];
-        let mut len = 0;
-        loop {
-            match socket.read(&mut req[len..]).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    len += n;
-                    // Stop once we have the headers (and a short body fits).
-                    if len >= 4 && req[..len].windows(4).any(|w| w == b"\r\n\r\n") {
-                        // Drain a little more for the form body if it's a POST.
-                        if req[..len].starts_with(b"POST") && len < req.len() {
-                            if let Ok(m) = socket.read(&mut req[len..]).await {
-                                len += m;
-                            }
-                        }
-                        break;
-                    }
-                    if len == req.len() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let request = &req[..len];
+// The HTTP server itself lives in `crate::ota` — one mode-aware web server for
+// both AP and STA (it serves the captive-portal config form here in AP mode and
+// the node panel in STA mode, plus firmware upload in both). This module keeps
+// only the AP-specific link layer (DHCP + DNS catch-all above) and the form-apply
+// helpers below, which that server calls.
 
-        let response = if request.starts_with(b"POST /save") {
-            let saved = apply_form(request, &mut body_buf);
-            if saved {
-                // Reboot shortly after the page is sent (into STA mode).
-                REBOOT_AFTER_HTTP.store(true, core::sync::atomic::Ordering::Relaxed);
-                crate::webui::notice(
-                    "Saved — rebooting",
-                    "The node is restarting. If you set a WiFi network it will join \
-that now; otherwise it returns to this configuration AP.",
-                )
-            } else {
-                setup_page()
-            }
-        } else {
-            setup_page()
-        };
-
-        let _ = http_write(&mut socket, &response).await;
-        let _ = socket.flush().await;
-        socket.close();
-        if REBOOT_AFTER_HTTP.load(core::sync::atomic::Ordering::Relaxed) {
-            embassy_time::Timer::after_millis(500).await;
-            cortex_m::peripheral::SCB::sys_reset();
-        }
-    }
-}
-
-static REBOOT_AFTER_HTTP: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-async fn http_write(socket: &mut TcpSocket<'_>, body: &str) -> bool {
-    use core::fmt::Write;
-    let mut head = heapless::String::<128>::new();
-    let _ = write!(
-        head,
-        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let mut bytes = head.as_bytes();
-    while !bytes.is_empty() {
-        match socket.write(bytes).await {
-            Ok(0) | Err(_) => return false,
-            Ok(n) => bytes = &bytes[n..],
-        }
-    }
-    let mut b = body.as_bytes();
-    while !b.is_empty() {
-        match socket.write(b).await {
-            Ok(0) | Err(_) => return false,
-            Ok(n) => b = &b[n..],
-        }
-    }
-    true
-}
-
-/// Parse the urlencoded POST body, apply each field to the pending config via
-/// the console ConfigOp path, then SAVE. Returns whether anything was saved.
-/// Apply a urlencoded config POST body and persist it — shared by the AP captive
-/// portal and the STA-mode panel's `POST /save` (`crate::ota`). Returns whether
-/// anything was saved. The caller reboots to apply (boot-time config is
+/// Apply a urlencoded config POST body (identity/WiFi/MQTT fields) and persist
+/// it — used by the web server's `POST /save` in both modes. Returns whether
+/// anything was saved. Does NOT touch the sticky AP flag (an identity save in AP
+/// mode must keep the node in AP); the conscious join flow clears it instead —
+/// see [`apply_join_form`]. The caller reboots to apply (boot-time config is
 /// immutable while running).
 pub fn apply_config_form(request: &[u8]) -> bool {
     let mut scratch = [0u8; 1024];
     apply_form(request, &mut scratch)
 }
 
+/// Apply a "Join a WiFi network" POST (the conscious AP→LAN path): stage the
+/// submitted WiFi fields, **clear the sticky `FORCE_AP` flag**, and persist —
+/// so the node leaves AP mode and tries STA on the next boot. Returns whether a
+/// network was actually supplied.
+pub fn apply_join_form(request: &[u8]) -> bool {
+    let mut scratch = [0u8; 1024];
+    let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let any = stage_fields(&request[pos + 4..], &mut scratch);
+    if any {
+        // Leave AP mode: the join is the only thing that clears the flag.
+        let (_t, _) = crate::config_store::handle_op(&ConfigOp::Set {
+            key: alloc::string::String::from("FORCE_AP"),
+            value: alloc::string::String::from("false"),
+        });
+        let (_t, _) = crate::config_store::handle_op(&ConfigOp::Save);
+    }
+    any
+}
+
 fn apply_form(request: &[u8], scratch: &mut [u8; 1024]) -> bool {
     let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
-    let body = &request[pos + 4..];
+    let any = stage_fields(&request[pos + 4..], scratch);
+    if any {
+        let (_text, _) = crate::config_store::handle_op(&ConfigOp::Save);
+    }
+    any
+}
+
+/// Stage each `key=value` field of a urlencoded body into the pending config
+/// (via the console `ConfigOp::Set` path, which validates/canonicalizes). Does
+/// NOT save. Blank values are skipped (so "leave blank = keep"). Returns whether
+/// anything was staged.
+fn stage_fields(body: &[u8], scratch: &mut [u8; 1024]) -> bool {
     let n = body.len().min(scratch.len());
     scratch[..n].copy_from_slice(&body[..n]);
     let body = &scratch[..n];
@@ -364,22 +303,12 @@ fn apply_form(request: &[u8], scratch: &mut [u8; 1024]) -> bool {
         if val.is_empty() {
             continue;
         }
-        // Map form names to config keys (uppercased) and stage them.
         let op = ConfigOp::Set {
             key: key.to_ascii_uppercase(),
             value: val,
         };
         let (_text, _reboot) = crate::config_store::handle_op(&op);
         any = true;
-    }
-    if any {
-        // A successful config save clears the sticky "setup AP" flag, so a node
-        // that was parked in the config AP returns to STA once reconfigured.
-        let (_t, _) = crate::config_store::handle_op(&ConfigOp::Set {
-            key: alloc::string::String::from("FORCE_AP"),
-            value: alloc::string::String::from("false"),
-        });
-        let (_text, _) = crate::config_store::handle_op(&ConfigOp::Save);
     }
     any
 }
@@ -418,26 +347,3 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// The AP-mode setup page: the shared node header + the pre-filled config form
-/// (re-onboarding shows the current values). Same look as the STA-mode panel,
-/// but config-only — no firmware/maintenance during onboarding.
-fn setup_page() -> alloc::string::String {
-    use alloc::string::String;
-    let p = crate::config_store::current_pending();
-    let call = p.callsign.as_deref().unwrap_or("");
-    let header = if call.is_empty() {
-        String::from(
-            "<h1>pico-node setup</h1><p class=sub>Enter a callsign and your WiFi to bring this node online.</p>",
-        )
-    } else {
-        alloc::format!(
-            "<div class=spread><h1 class=mono>{}</h1><span class=sub>setup AP</span></div>\
-<p class=sub>Update this node, then save to rejoin WiFi.</p>",
-            crate::webui::esc(call)
-        )
-    };
-    crate::webui::page(
-        "pico-node setup",
-        &alloc::format!("{header}{}", crate::webui::config_form(&p)),
-    )
-}

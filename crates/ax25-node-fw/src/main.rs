@@ -200,15 +200,24 @@ mod firmware {
             }
         }
 
+        // The node's own AP SSID — `pico-<callsign>` once configured, else
+        // `pico-setup`. Computed once (leaked to `&'static`) and shared by the AP
+        // bring-up, the OLED (line 1 in AP mode), and the web server header.
+        let ap_ssid: &'static str = {
+            let mut s = String::from("pico-");
+            s.push_str(if configured { call_text } else { "setup" });
+            alloc::boxed::Box::leak(s.into_boxed_str())
+        };
+
         let sta_ok = if !configured || cfg.wifi.ssid.is_empty() {
             if configured {
                 defmt::info!("mode: no WiFi configured — AP mode");
             }
             false
         } else if cfg.force_ap {
-            // "Switch to setup AP" maintenance action: come up as the config AP
-            // even though WiFi is configured. Sticky — a config save clears it.
-            defmt::info!("mode: FORCE_AP set — setup AP (clear by saving config)");
+            // "Switch to AP mode": a first-class operating mode (portable/hilltop),
+            // not just setup. Sticky — only the conscious "join WiFi" flow clears it.
+            defmt::info!("mode: FORCE_AP set — AP mode (join a network to return to STA)");
             false
         } else {
             net::try_join(&mut control, &cfg.wifi, 3).await
@@ -229,20 +238,17 @@ mod firmware {
                 defmt::info!("IP address: {} (STA mode)", v4.address);
             }
         } else {
-            // AP mode: become the gateway, serve DHCP (captive portal = step 4).
-            // SSID is "pico-<callsign>" once configured, "pico-setup" before.
-            let mut ssid_buf = String::from("pico-");
-            ssid_buf.push_str(if configured { call_text } else { "setup" });
-            net::start_ap(&mut control, &ssid_buf, cfg.wifi.ap_passphrase).await;
+            // AP mode: become the gateway, serve DHCP + the captive-portal DNS.
+            // The HTTP server itself is the shared one spawned below (it renders
+            // the AP portal here). SSID is `pico-<callsign>` / `pico-setup`.
+            net::start_ap(&mut control, ap_ssid, cfg.wifi.ap_passphrase).await;
             stack = net::start_stack_static(net_device, &spawner).await;
             spawner.spawn(defmt::unwrap!(provisioning::dhcp_server(stack)));
-            // Captive portal: DNS catch-all (every name -> us, pops the portal)
-            // + the HTTP config form (PROVISIONING.md step 4).
+            // DNS catch-all (every name -> us, pops the captive portal).
             spawner.spawn(defmt::unwrap!(provisioning::dns_catch_all(stack)));
-            spawner.spawn(defmt::unwrap!(provisioning::http_portal(stack)));
             defmt::info!(
                 "AP mode up: SSID {=str}, gateway 192.168.4.1 (connect to configure)",
-                ssid_buf.as_str()
+                ap_ssid
             );
             // Keep the control handle alive for the AP's lifetime.
             core::mem::forget(control);
@@ -263,9 +269,24 @@ mod firmware {
                 p.PIN_4,
                 p.PIN_5,
                 stack,
-                cfg.hostname
+                cfg.hostname,
+                ap_ssid
             )));
         }
+
+        // --- The node web server (config panel + firmware upload), on :80 in
+        // BOTH modes (docs/OTA.md, docs/PROVISIONING.md). Spawned before the
+        // config-only gate so an unconfigured node can be set up over its AP, and
+        // so firmware can be updated in AP mode (a hilltop node has no USB). ---
+        spawner.spawn(defmt::unwrap!(ota::http_task(
+            stack,
+            ota::WebCtx {
+                sta: sta_ok,
+                hostname: cfg.hostname,
+                ap_ssid,
+                ap_pass: cfg.wifi.ap_passphrase,
+            },
+        )));
 
         // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
         // portal are up (so you can set a callsign), but NO on-air transport is
@@ -330,13 +351,8 @@ mod firmware {
             prompt,
         )));
 
-        // --- OTA firmware update over HTTP (docs/OTA.md) — STA mode only: in
-        // AP mode the captive portal owns :80 and you're physically present
-        // (BOOTSEL). A configured, networked node serves the upload page +
-        // POST /firmware at http://<ip>/. ---
-        if sta_ok {
-            spawner.spawn(defmt::unwrap!(ota::http_task(stack, cfg.hostname)));
-        }
+        // (The web server — config panel + OTA firmware upload — is spawned
+        // earlier, before the config-only gate, so it runs in both AP and STA.)
 
         // --- GATE 5 (HW-BRINGUP.md §4): KISS-over-TCP (capability 2) ---
         // Disabled unless KISS_TCP_TARGET is set in the build env (§5).

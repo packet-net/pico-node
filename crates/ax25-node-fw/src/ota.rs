@@ -8,10 +8,11 @@
 //!    hangs/panics before this point), the next reset reverts to the previous
 //!    image. A normal boot (magic already set) writes nothing.
 //!
-//! 2. [`http_task`] — an HTTP server (STA mode, port 80) that accepts a raw
-//!    firmware image (`POST /firmware`), streams it straight into the DFU
-//!    partition via `FirmwareUpdater`, marks it for swap, and resets. The
-//!    bootloader then swaps DFU↔ACTIVE and boots the new image on trial.
+//! 2. [`http_task`] — the node's single web server (port 80, **both** AP and STA
+//!    modes; see [`WebCtx`]). It renders the mode-appropriate config panel and
+//!    accepts a raw firmware image (`POST /firmware`), streaming it straight into
+//!    the DFU partition via `FirmwareUpdater`, marking it for swap, and resetting.
+//!    The bootloader then swaps DFU↔ACTIVE and boots the new image on trial.
 //!
 //! Flash sharing: there is one `FLASH` peripheral, owned by `config_store`. The
 //! OTA path *takes* it ([`config_store::take_flash_for_ota`]) and never gives it
@@ -44,8 +45,8 @@ pub const BUILD_TAG: &str = match option_env!("OTA_BUILD_TAG") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
-/// The OTA HTTP server port (STA mode). In AP mode the captive portal owns :80,
-/// so OTA isn't offered there (you're physically present → BOOTSEL).
+/// The web server port — :80 in both AP and STA mode (the same server renders
+/// the captive-portal config form in AP and the node panel in STA).
 const OTA_PORT: u16 = 80;
 
 /// DFU partition capacity (must match memory.x DFU LENGTH). Uploads larger than
@@ -72,14 +73,33 @@ pub fn mark_booted_early(flash: ConfigFlash) -> ConfigFlash {
     shared.into_inner().into_inner()
 }
 
-/// The node's web panel + firmware-upload HTTP server. STA mode only (see
-/// [`OTA_PORT`]). `hostname` is the node's mDNS/DHCP name, shown in the status
-/// header (as `<hostname>.local`).
+/// What the web server needs to render the mode-appropriate panel. Fixed at
+/// boot, so cheap `Copy` static strings.
+#[derive(Clone, Copy)]
+pub struct WebCtx {
+    /// `true` = STA (LAN) mode, `false` = AP mode.
+    pub sta: bool,
+    /// mDNS/DHCP name, shown as `<hostname>.local` in STA mode.
+    pub hostname: &'static str,
+    /// This node's own AP SSID (`pico-<callsign>`), shown in AP mode.
+    pub ap_ssid: &'static str,
+    /// The AP's WPA2 passphrase, shown in AP mode for reference.
+    pub ap_pass: &'static str,
+}
+
+/// The node's single web server — config panel + firmware upload — on :80 in
+/// **both** modes (the AP captive-portal form and the STA panel are the same
+/// server, rendered per [`WebCtx::sta`]). The AP-only DHCP + DNS catch-all live
+/// in `crate::provisioning`.
 #[embassy_executor::task]
-pub async fn http_task(stack: Stack<'static>, hostname: &'static str) {
+pub async fn http_task(stack: Stack<'static>, ctx: WebCtx) {
     let mut rx_buf = [0u8; 4096];
     let mut tx_buf = [0u8; 1024];
-    defmt::info!("ota: node web panel up on :{}", OTA_PORT);
+    defmt::info!(
+        "web: server up on :{} ({=str} mode)",
+        OTA_PORT,
+        if ctx.sta { "STA" } else { "AP" }
+    );
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_timeout(Some(Duration::from_secs(30)));
@@ -87,15 +107,16 @@ pub async fn http_task(stack: Stack<'static>, hostname: &'static str) {
             socket.close();
             continue;
         }
-        serve_conn(&mut socket, stack, hostname).await;
+        serve_conn(&mut socket, stack, ctx).await;
         socket.close();
     }
 }
 
-/// Handle one connection. `GET /` → the node panel; `GET /version` → build tag;
-/// `POST /save` → apply config + reboot; `POST /apmode` → reboot into setup AP;
-/// `POST /firmware` → stream into DFU, mark, reset.
-async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname: &str) {
+/// Handle one connection. `GET /` → the mode-aware panel; `GET /version` → build
+/// tag; `POST /save` → apply config + reboot; `POST /join` → join WiFi + reboot
+/// to STA (AP mode); `POST /apmode` → reboot into AP (STA mode); `POST /firmware`
+/// → stream into DFU, mark, reset.
+async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebCtx) {
     // Read until the end of the request headers (carrying any body bytes that
     // arrive in the same segment). 2 KiB holds the headers plus a small config
     // POST body (firmware bodies are streamed separately, not buffered here).
@@ -129,11 +150,9 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname:
         return;
     }
 
-    // In-place configuration: `POST /save` applies the panel's config form (same
-    // handler as the AP captive portal) and reboots to take effect.
+    // `POST /save` — apply the identity/config form and reboot to take effect.
     if headers.starts_with(b"POST /save") {
         let content_len = parse_content_length(headers).unwrap_or(0);
-        // Pull the rest of the (small) urlencoded body into the buffer.
         while hlen < header_end + content_len && hlen < hdr.len() {
             match socket.read(&mut hdr[hlen..]).await {
                 Ok(0) => break,
@@ -142,17 +161,24 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname:
             }
         }
         if crate::provisioning::apply_config_form(&hdr[..hlen]) {
-            // Auto-returns to the panel once the node is back — safe here because
-            // a STA-mode save rejoins the *same* WiFi at the same address. (If
-            // the WiFi was changed it may not come back on this network; the
-            // poller just keeps waiting and the manual link still works.)
-            let page = crate::webui::notice_reconnect(
-                "Saved — rebooting",
-                "Applying the new configuration and restarting. If you changed its \
-WiFi it will join that now (and falls back to the setup AP if it can't); \
-reconnect in ~20s.",
-            );
-            let _ = http_send(socket, "text/html", page.as_bytes()).await;
+            // In STA mode the node rejoins the *same* WiFi at the same address, so
+            // we can auto-return to the panel once it's back. In AP mode the SSID
+            // may change (if the callsign changed) and the client must reconnect
+            // to the AP, so a plain notice is correct there.
+            if ctx.sta {
+                let page = crate::webui::notice_reconnect(
+                    "Saved — rebooting",
+                    "Applying the new configuration and restarting; reconnect in ~20s.",
+                );
+                let _ = http_send(socket, "text/html", page.as_bytes()).await;
+            } else {
+                let page = crate::webui::notice(
+                    "Saved — rebooting",
+                    "Applying the new configuration and restarting in AP mode. If you \
+changed the callsign the AP name changes too — reconnect to it in ~15s.",
+                );
+                let _ = http_send(socket, "text/html", page.as_bytes()).await;
+            }
             let _ = socket.flush().await;
             defmt::info!("config saved via web; rebooting to apply");
             crate::nlog!("config saved (web), rebooting");
@@ -160,15 +186,46 @@ reconnect in ~20s.",
             cortex_m::peripheral::SCB::sys_reset();
         } else {
             // Nothing set (all blank) — just re-show the panel.
-            let _ = write_panel(socket, stack, hostname).await;
+            let _ = write_panel(socket, stack, ctx).await;
             let _ = socket.flush().await;
         }
         return;
     }
 
-    // Maintenance: "Switch to setup AP" — set the sticky FORCE_AP flag via the
-    // console config path, persist, and reboot. The node comes up as its config
-    // AP (`pico-<callsign>`) until a config save clears the flag.
+    // `POST /join` (AP mode) — the conscious path back to LAN: stage the supplied
+    // WiFi, clear the sticky AP flag, reboot into STA.
+    if headers.starts_with(b"POST /join") {
+        let content_len = parse_content_length(headers).unwrap_or(0);
+        while hlen < header_end + content_len && hlen < hdr.len() {
+            match socket.read(&mut hdr[hlen..]).await {
+                Ok(0) => break,
+                Ok(n) => hlen += n,
+                Err(_) => break,
+            }
+        }
+        if crate::provisioning::apply_join_form(&hdr[..hlen]) {
+            let page = crate::webui::notice(
+                "Joining — rebooting",
+                "Leaving AP mode and joining the Wi-Fi network. This access point \
+will disappear; reconnect your device to your LAN to find the node again (it \
+returns here only if the network can't be joined).",
+            );
+            let _ = http_send(socket, "text/html", page.as_bytes()).await;
+            let _ = socket.flush().await;
+            defmt::info!("join requested via web; rebooting into STA");
+            crate::nlog!("join WiFi (web), rebooting to LAN");
+            Timer::after_millis(800).await;
+            cortex_m::peripheral::SCB::sys_reset();
+        } else {
+            let _ = write_panel(socket, stack, ctx).await;
+            let _ = socket.flush().await;
+        }
+        return;
+    }
+
+    // `POST /apmode` (STA mode) — "Switch to AP mode": set the sticky FORCE_AP
+    // flag and reboot. AP mode is a first-class operating mode (portable/hilltop
+    // use), not just setup; it stays in AP until the conscious join flow.
     if headers.starts_with(b"POST /apmode") {
         use ax25_node_core::console::ConfigOp;
         let _ = config_store::handle_op(&ConfigOp::Set {
@@ -177,22 +234,22 @@ reconnect in ~20s.",
         });
         let (_t, _) = config_store::handle_op(&ConfigOp::Save);
         let page = crate::webui::notice(
-            "Switching to setup AP",
-            "Rebooting into the <code>pico-…</code> configuration access point. \
-Join that WiFi network and browse to <code>192.168.4.1</code> to move this node \
-to a different network. It stays in setup mode until you save a new config.",
+            "Switching to AP mode",
+            "Rebooting as a standalone access point. Join its Wi-Fi network (shown \
+on the node's display) and browse to <code>192.168.4.1</code> to manage it. It \
+stays in AP mode until you join a network from there.",
         );
         let _ = http_send(socket, "text/html", page.as_bytes()).await;
         let _ = socket.flush().await;
-        defmt::info!("FORCE_AP set via web; rebooting into setup AP");
-        crate::nlog!("switch to setup AP (web), rebooting");
+        defmt::info!("FORCE_AP set via web; rebooting into AP mode");
+        crate::nlog!("switch to AP mode (web), rebooting");
         Timer::after_millis(800).await;
         cortex_m::peripheral::SCB::sys_reset();
     }
 
     if !headers.starts_with(b"POST /firmware") {
-        // Any other GET → the node panel (status + config + firmware + maint).
-        let _ = write_panel(socket, stack, hostname).await;
+        // Any other GET → the mode-aware node panel.
+        let _ = write_panel(socket, stack, ctx).await;
         let _ = socket.flush().await;
         return;
     }
@@ -355,86 +412,104 @@ const PANEL_HEAD: &str = "<!DOCTYPE html><html lang=en><head><meta charset=utf-8
 const PANEL_STYLE_MID: &str = "</style></head><body>";
 const PANEL_TAIL: &str = "</body></html>";
 
-/// Send the node panel — a status header, the pre-filled config form, the
-/// firmware-update section, and the "Switch to setup AP" maintenance action.
+/// Send the mode-aware node panel — a status header plus, in **STA** mode, the
+/// pre-filled config form + firmware + "Switch to AP mode"; in **AP** mode, an
+/// identity form + a conscious "Join a WiFi network" section + firmware.
 ///
 /// **Heap discipline:** the heap is only 16 KiB and shared with the
-/// session/codec allocations; building the whole ~4.5 KiB page (plus its
-/// `format!` temporaries) peaked well past that and the alloc-error handler
-/// halts the node. So only the two *small* dynamic pieces are allocated (status
-/// header ~0.3 KiB + config form ~1.2 KiB); everything else is written from
-/// `&str` constants. Peak heap ≈ 1.5 KiB. Both are measured so the response
-/// carries a real `Content-Length` (no close-delimited body → the client and
-/// the single-socket server don't wait on the FIN).
-async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname: &str) -> bool {
-    use crate::webui::{config_form, esc, CSS};
+/// session/codec allocations; building the whole page as one `String` peaked
+/// well past that and the alloc-error handler halts the node. So only the small
+/// dynamic pieces are allocated (header + the form section(s), ≲1.5 KiB total);
+/// everything else is written from `&str` constants. The total is measured so
+/// the response carries a real `Content-Length` (no close-delimited body → the
+/// client and the single-socket server don't wait on the FIN).
+async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebCtx) -> bool {
+    use crate::webui::{ap_identity_section, ap_join_section, esc, sta_config_form, CSS};
     use alloc::format;
+    use alloc::string::String;
     use core::fmt::Write;
 
     let p = config_store::current_pending();
 
-    // Status header (small dynamic String).
-    let call = p.callsign.as_deref().unwrap_or("(unconfigured)");
-    let alias = p.alias.as_deref().unwrap_or("");
-    let grid = p.grid.as_deref().unwrap_or("");
-    let ip = stack
-        .config_v4()
-        .map(|c| format!("{}", c.address.address()))
-        .unwrap_or_else(|| alloc::string::String::from("—"));
-    let mut idline = alloc::string::String::new();
-    if !alias.is_empty() {
-        idline += &esc(alias);
-    }
-    if !grid.is_empty() {
-        if !idline.is_empty() {
-            idline += " · ";
+    // Dynamic pieces (mode-specific). `form_b` is empty/unused in STA.
+    let (header, form_a, form_b): (String, String, String) = if ctx.sta {
+        let call = p.callsign.as_deref().unwrap_or("(unconfigured)");
+        let alias = p.alias.as_deref().unwrap_or("");
+        let grid = p.grid.as_deref().unwrap_or("");
+        let ip = stack
+            .config_v4()
+            .map(|c| format!("{}", c.address.address()))
+            .unwrap_or_else(|| String::from("—"));
+        let mut idline = String::new();
+        if !alias.is_empty() {
+            idline += &esc(alias);
         }
-        idline += &esc(grid);
-    }
-    let header = format!(
-        "<div class=spread><h1 class=mono>{}</h1>\
+        if !grid.is_empty() {
+            if !idline.is_empty() {
+                idline += " · ";
+            }
+            idline += &esc(grid);
+        }
+        let header = format!(
+            "<div class=spread><h1 class=mono>{}</h1>\
 <span class=sub><span class=dot>●</span> online</span></div>{}\
 <p class=\"sub mono\">{}.local · {} · {}</p>",
-        esc(call),
-        if idline.is_empty() {
-            alloc::string::String::new()
-        } else {
-            format!("<p class=sub>{idline}</p>")
-        },
-        esc(hostname),
-        esc(&ip),
-        esc(BUILD_TAG),
-    );
+            esc(call),
+            if idline.is_empty() {
+                String::new()
+            } else {
+                format!("<p class=sub>{idline}</p>")
+            },
+            esc(ctx.hostname),
+            esc(&ip),
+            esc(BUILD_TAG),
+        );
+        (header, sta_config_form(&p), String::new())
+    } else {
+        let header = format!(
+            "<div class=spread><h1 class=mono>{}</h1>\
+<span class=sub><span class=dot>●</span> AP mode</span></div>\
+<p class=\"sub mono\">Wi-Fi pass: {} · 192.168.4.1 · {}</p>",
+            esc(ctx.ap_ssid),
+            esc(ctx.ap_pass),
+            esc(BUILD_TAG),
+        );
+        (header, ap_identity_section(&p), ap_join_section())
+    };
 
-    // Pre-filled config form (~1.2 KiB String). Held alongside `header` only —
-    // peak heap stays ~1.5 KiB.
-    let form = config_form(&p);
+    // Assemble the body as an ordered list of byte slices (static + dynamic);
+    // measured for Content-Length, written in order. Nothing holds the whole page.
+    let mut parts: heapless::Vec<&[u8], 9> = heapless::Vec::new();
+    let _ = parts.push(PANEL_HEAD.as_bytes());
+    let _ = parts.push(CSS.as_bytes());
+    let _ = parts.push(PANEL_STYLE_MID.as_bytes());
+    let _ = parts.push(header.as_bytes());
+    let _ = parts.push(form_a.as_bytes());
+    if !ctx.sta {
+        let _ = parts.push(form_b.as_bytes());
+    }
+    let _ = parts.push(FIRMWARE_SECTION.as_bytes());
+    if ctx.sta {
+        let _ = parts.push(MAINTENANCE_SECTION.as_bytes());
+    }
+    let _ = parts.push(PANEL_TAIL.as_bytes());
 
-    let body_len = PANEL_HEAD.len()
-        + CSS.len()
-        + PANEL_STYLE_MID.len()
-        + header.len()
-        + form.len()
-        + FIRMWARE_SECTION.len()
-        + MAINTENANCE_SECTION.len()
-        + PANEL_TAIL.len();
-
+    let body_len: usize = parts.iter().map(|s| s.len()).sum();
     let mut head = heapless::String::<96>::new();
     let _ = write!(
         head,
         "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_len
     );
-
-    write_all(socket, head.as_bytes()).await
-        && write_all(socket, PANEL_HEAD.as_bytes()).await
-        && write_all(socket, CSS.as_bytes()).await
-        && write_all(socket, PANEL_STYLE_MID.as_bytes()).await
-        && write_all(socket, header.as_bytes()).await
-        && write_all(socket, form.as_bytes()).await
-        && write_all(socket, FIRMWARE_SECTION.as_bytes()).await
-        && write_all(socket, MAINTENANCE_SECTION.as_bytes()).await
-        && write_all(socket, PANEL_TAIL.as_bytes()).await
+    if !write_all(socket, head.as_bytes()).await {
+        return false;
+    }
+    for part in parts {
+        if !write_all(socket, part).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// The firmware-update section (static): file picker + a tiny uploader that
@@ -454,9 +529,11 @@ try{var r=await fetch('/firmware',{method:'POST',body:f});\
 log(await r.text())}catch(e){log('Upload sent; if the node accepted it, it is now \
 rebooting. Reconnect in ~30s.')}}</script>";
 
-/// The maintenance section (static): the "Switch to setup AP" action.
+/// The maintenance section (static, STA only): switch to AP mode — a first-class
+/// operating mode (portable/hilltop), not just setup.
 const MAINTENANCE_SECTION: &str = "<section><h2>Maintenance</h2>\
-<p class=hint>Reboot into the <code>pico-…</code> setup access point to move this node \
-to a different WiFi network. It stays in setup mode until you save a new config.</p>\
-<form method=post action=/apmode><button type=submit class=ghost>Switch to setup AP</button></form>\
+<p class=hint>Switch to <strong>AP mode</strong> — run as a standalone access point for \
+portable/hilltop use, or to manage the node without infrastructure Wi-Fi. It stays in AP \
+mode until you join a network from there.</p>\
+<form method=post action=/apmode><button type=submit class=ghost>Switch to AP mode</button></form>\
 </section>";

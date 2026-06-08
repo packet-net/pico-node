@@ -124,12 +124,19 @@ and de-risk 3–5, which are UX.
 - **In-place reconfiguration DONE** (web-panel PR): a deployed STA-mode node
   serves the same config form (pre-filled with its current values) on its web
   panel at `http://<node-ip>/` (`POST /save`), so you can change callsign / WiFi /
-  alias / MQTT without re-onboarding or BOOTSEL. The node also offers a **"Switch
-  to setup AP"** action (`POST /apmode`) that reboots it into the
-  `pico-<callsign>` config AP to move it to a different WiFi — a **sticky** flag
-  (`FORCE_AP`, `src/config_store.rs`) keeps it in setup mode across reboots until
-  a config save clears it. This is the STA→AP return path that previously
-  required a probe/erase.
+  alias / MQTT without re-onboarding or BOOTSEL.
+- **AP mode is a first-class operating mode** (later PR): not just onboarding —
+  a hilltop/portable node you reach only by phone over its own
+  `pico-<callsign>` access point. One web server serves both modes (`src/ota.rs`,
+  `WebCtx`; the old `provisioning::http_portal` is gone, DHCP + DNS-catch-all
+  remain). In **AP mode** the panel shows node identity + a deliberate **"Join a
+  Wi-Fi network"** section (empty fields — `POST /join`) + firmware upload; it
+  hides MQTT and does **not** pre-fill any WiFi (rejoining a LAN is a conscious
+  act). The OLED line 1 shows the **AP SSID** in AP mode (vs `<hostname>.local`
+  in STA). STA's **"Switch to AP mode"** (`POST /apmode`) sets the **sticky**
+  `FORCE_AP` flag (`src/config_store.rs`); it is cleared **only** by the conscious
+  join — an identity save in AP keeps you in AP. This is the STA↔AP path that
+  previously required a probe/erase.
 - **Step 5 (polish) remaining**: WiFi scan-and-pick in the portal, AP passphrase
   change, factory-reset gesture, config export/import.
 
