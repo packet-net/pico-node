@@ -23,7 +23,7 @@ use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
+use embedded_graphics::text::{Baseline, Text};
 
 use ssd1306::mode::DisplayConfig;
 use ssd1306::prelude::*;
@@ -91,7 +91,10 @@ pub async fn task(
 ) {
     let i2c = I2c::new_async(i2c0, scl, sda, Irqs, I2cConfig::default());
     let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+    // NinoBLE Rev5 panels are user-installed and vary (128x32 or 128x64); the
+    // common one is the 0.91" 128x32, mounted such that it reads upside-down to
+    // Rotate0. (TODO: make size+rotation a config option for 128x64 boards.)
+    let mut display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate180)
         .into_buffered_graphics_mode();
 
     if display.init().is_err() {
@@ -129,9 +132,12 @@ pub async fn task(
         );
 
         display.clear(BinaryColor::Off).ok();
+        // Top-left aligned: three 10px lines filling the 128x32 panel (tops at
+        // y=0/11/22, Baseline::Top so the first line sits flush against the top).
         for (i, line) in [l1.as_str(), l2.as_str(), l3.as_str()].iter().enumerate() {
-            let y = 10 + i as i32 * 14;
-            let _ = Text::new(line, Point::new(0, y), text).draw(&mut display);
+            let y = i as i32 * 11;
+            let _ = Text::with_baseline(line, Point::new(0, y), text, Baseline::Top)
+                .draw(&mut display);
         }
         let _ = display.flush();
 
