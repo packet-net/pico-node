@@ -185,3 +185,93 @@ The minimum-green path for every gate works **standalone on this machine** (loca
 **Stretch:** Gate 5 minimum-green, Gate 7 on-target tests, and the connected-mode AXUDP exchange against a real peer once the lab side is coordinated.
 
 **Out of scope for this session:** the hardware-in-the-loop CI workflow, NODES origination / L4 circuits on-target validation against the lab, RF/TNC tiers beyond Gate 6, and any `ax25sdl` codegen changes (raise upstream instead).
+
+---
+
+## 9. Dev loop + OTA bench (operational notes)
+
+Hard-won rig knowledge. Credentials/IPs are placeholders — fill from your own
+environment; never commit the real values (§5).
+
+### Flashing since OTA (the app is bootloader-chained, blob de-duplicated)
+
+The app is **not** standalone: it boots via the bootloader and reads the cyw43
+firmware from the **BLOBS** flash region (`docs/OTA.md`). So the chip needs
+**three** things present, flashed once:
+
+```sh
+# Build artifacts
+( cd crates/ax25-node-bootloader && cargo build --release )   # -> bootloader ELF
+( cd crates/ax25-node-fw         && cargo build --release )   # -> app ELF
+python3 scripts/build-blobs.py crates/ax25-node-fw/cyw43-firmware/43439A0.bin \
+  crates/ax25-node-fw/cyw43-firmware/43439A0_clm.bin \
+  crates/ax25-node-fw/cyw43-firmware/nvram_rp2040.bin /tmp/blobs.bin
+
+# Flash. FULL-ERASE whenever the flash layout changed — a stale embassy-boot
+# state sector corrupts the first OTA swap (erased vector table -> lock-up).
+probe-rs download --chip RP2040 --chip-erase <bootloader-elf>
+probe-rs download --chip RP2040 --binary-format bin --base-address 0x10108000 /tmp/blobs.bin
+probe-rs download --chip RP2040 <app-elf>
+# Verify the boot-critical pages — the bench SWD is flaky and silently corrupts
+# writes (see below). Compare the first 4 KiB of the app .bin and of blobs.bin:
+probe-rs verify --chip RP2040 --binary-format bin --base-address 0x10007000 <app-vt-4k.bin>
+probe-rs verify --chip RP2040 --binary-format bin --base-address 0x10108000 /tmp/blobs.bin
+probe-rs reset --chip RP2040
+```
+
+Thereafter the hands-free loop (`cargo run` from the fw dir) flashes **only** the
+app to ACTIVE; the resident bootloader + BLOBS chain it. For a release-shaped
+image and the BOOTSEL `pico-node-combined.uf2`, use `scripts/package-ota.sh`.
+
+### probe-rs / SWD gotchas (these cost real time)
+
+- **`pkill -9 -x probe-rs`, never `pkill -f probe-rs`.** `-f` matches the
+  *full command line*, which includes the word "probe-rs" in your own shell
+  wrapper — it SIGKILLs the very shell running the command (exit 1, no output,
+  looks like the flash failed).
+- **`DP Multidrop` / "communication with an access port" warnings on
+  `reset`/`verify` are normal while the radio is running** — the CYW43 PIO +
+  clocks make SWD flaky. It is NOT a boot failure; the chip still resets/runs.
+  But that same flakiness *does* occasionally corrupt a flash write — hence
+  always `verify` the boot-critical pages after a download.
+- **`probe-rs run` (RTT streaming) produces no captured output in some headless
+  shells.** Use `probe-rs download` + `probe-rs reset`, then verify behaviour
+  over the network. To read the post-boot log, `probe-rs attach <elf>` (the
+  16 KiB RTT buffer — `DEFMT_RTT_BUFFER_SIZE` in `.cargo/config.toml` — retains
+  the boot history). To read the *bootloader's* log specifically, attach with the
+  bootloader ELF (its own RTT block).
+- **`probe-rs read` is RAM-only** — to inspect flash, use `probe-rs verify`
+  against a known `.bin` (note: `objcopy -O binary` fills section gaps with
+  `0x00` while erased flash is `0xFF`, so a *whole-image* verify can "fail" on
+  the unused tail — verify the first N KiB, or a specific page, instead).
+
+### Finding the node, and OTA
+
+- The node answers **TCP/UDP services, not ICMP** (smoltcp default) — don't ping
+  as a liveness check. After an OTA reboot it may take a **new DHCP lease**, so
+  don't assume the old IP: `nmap -p 8023 --open -n <lan-cidr>` finds it by its
+  telnet port, or use `pico-node.local` (mDNS).
+- OTA: `GET http://<node-ip>/version` (running build tag); `POST` the raw
+  `pico-node-app.bin` to `http://<node-ip>/firmware` (STA mode, :80) → swap →
+  trial → auto-rollback. AP mode keeps the captive portal on :80 instead.
+
+### Onboarding a same-for-everyone image (the real flow)
+
+A credential-free release boots into **config-only AP mode**: SSID `pico-setup`,
+WPA2 passphrase `pico-node-config`. Join it from a phone → captive portal pops
+(or `http://192.168.4.1/`) → enter callsign + WiFi + alias → Save & reboot →
+joins your WiFi from **flash-stored** config (not compiled). This is how the
+bench should be set up to dogfood the actual release; compiled-in creds
+(`option_env!` via a gitignored `~/.cargo/config.toml [env]`) are a dev
+convenience only, and stored config overrides them at boot.
+
+### CYW43 gotchas
+
+- **SAE wedge:** cyw43's default join (`Wpa2Wpa3` → SAE) hangs forever against a
+  WPA2-PSK AP and the wedge **persists across `probe-rs reset`** (the RP2040
+  resets, the radio doesn't) — mimics hardware/SWD faults. Fixed in `net.rs`
+  with explicit `JoinAuth::Wpa2` + a join timeout; recovery from a wedge is a
+  **physical power-cycle** of the Pico.
+- **Multicast RX filter:** `Stack::join_multicast_group` is not enough — the chip
+  filters RX by MAC, so `Control::add_multicast_address` must add the group MAC
+  (e.g. `01:00:5e:00:00:fb` for mDNS) or multicast never reaches smoltcp.

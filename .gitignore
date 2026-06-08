@@ -1,6 +1,14 @@
 /target
 **/target
 Cargo.lock
+
+# Claude Code local state (scheduled-task locks, etc.) — machine-local, not project.
+/.claude/
+
+# Local build-env convenience files (WiFi creds / LAN endpoints live here; §5) —
+# never commit. The home ~/.cargo/config.toml [env] is outside the repo anyway.
+*.env
+.pico-node-build.env
 # (The cyw43 firmware blobs under crates/ax25-node-fw/cyw43-firmware/ ARE
 # committed: licence-checked at Gate 2 — Infineon Permissive Binary License,
 # redistribution permitted with the notice, which travels in that directory.)
