@@ -122,3 +122,30 @@ pub fn notice(heading: &str, body_html: &str) -> String {
         &format!("<h1>{}</h1><p class=hint>{}</p>", esc(heading), body_html),
     )
 }
+
+/// Like [`notice`], but auto-returns to the panel once the node is back: a
+/// client-side poller waits for the reboot, polls `/version`, and redirects to
+/// `/` on the first success (with a manual link as fallback). Runs entirely in
+/// the browser — no device-side cost.
+///
+/// **Use only where the client stays on the same network as the node** — i.e.
+/// the STA-mode panel's `POST /save`, where it returns at the same address. NOT
+/// for the AP captive portal or the switch-to-AP action, where the node moves to
+/// a different network and `/` would be unreachable. The poll starts after an
+/// 8 s delay so it doesn't catch the node in the ~0.8 s window it's still up
+/// before resetting (which would redirect prematurely).
+pub fn notice_reconnect(heading: &str, body_html: &str) -> String {
+    page(
+        heading,
+        &format!(
+            "<h1>{}</h1><p class=hint>{}</p>\
+<p class=hint id=w>Waiting for the node to come back…</p>\
+<p class=hint><a href=/>Return to the panel &rarr;</a></p>\
+<script>setTimeout(function p(){{fetch('/version',{{cache:'no-store'}})\
+.then(function(r){{r.ok?location.assign('/'):setTimeout(p,2000)}})\
+.catch(function(){{setTimeout(p,2000)}})}},8000)</script>",
+            esc(heading),
+            body_html
+        ),
+    )
+}
