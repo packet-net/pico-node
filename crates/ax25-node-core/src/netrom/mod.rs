@@ -47,6 +47,7 @@ pub mod transport;
 pub mod wire;
 
 use crate::ax25::{Callsign, Frame, PID_NETROM};
+use crate::netrom::wire::inp3_rif::Inp3Rif;
 
 pub use connector::{
     InterlinkSend, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomNoRoute,
@@ -252,6 +253,48 @@ impl NetRomService {
     /// Borrow the underlying routing table (read access for richer queries).
     pub fn table(&self) -> &NodeRoutingTable {
         &self.table
+    }
+
+    // ── INP3 host-driving hooks (the firmware/embedder runs the engine + scheduler and
+    //    drives these to ingest/advertise time-routes on the shared table — the no_std
+    //    analogue of the C# `Inp3Host` wiring + the ax25-ts `NetRomConnector` inp3 glue).
+    //    All no-ops in effect when the overlay is off (an un-probed link learns nothing). ──
+
+    /// Ingest a parsed RIF into the routing table as INP3 time-routes, supplying the
+    /// engine's measured SNTT for the carrying link. Delegates to
+    /// [`NetRomRoutingTable::ingest_rif`].
+    pub fn ingest_rif(
+        &mut self,
+        received_from: Callsign,
+        my_call: Callsign,
+        neighbour_sntt_ms: u32,
+        rif: &Inp3Rif,
+        hop_limit: u32,
+    ) {
+        if self.enabled {
+            self.table
+                .ingest_rif(received_from, my_call, neighbour_sntt_ms, rif, hop_limit);
+        }
+    }
+
+    /// Build the poison-reversed RIF to advertise toward `to_target_neighbour`, including
+    /// one horizon RIP per entry of the host-drained `recently_withdrawn` snapshot.
+    /// Delegates to [`NetRomRoutingTable::build_rif`].
+    pub fn build_rif(
+        &self,
+        my_call: Callsign,
+        to_target_neighbour: Callsign,
+        recently_withdrawn: &[Callsign],
+    ) -> Inp3Rif {
+        self.table
+            .build_rif(my_call, to_target_neighbour, recently_withdrawn)
+    }
+
+    /// Atomically snapshot + clear the recently-withdrawn set (the host drains it once at
+    /// the start of each fan-out round). Delegates to
+    /// [`NetRomRoutingTable::drain_recently_withdrawn`].
+    pub fn drain_recently_withdrawn(&mut self) -> alloc::vec::Vec<Callsign> {
+        self.table.drain_recently_withdrawn()
     }
 
     // ── INetRomRoutingView equivalents (no_std: borrow/visitor, not an alloc snapshot) ──

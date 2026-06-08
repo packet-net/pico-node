@@ -42,7 +42,13 @@ use ax25_node_core::axudp;
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
 use ax25_node_core::console::{DispatchOutcome, LineAssembler, TransportKind};
-use ax25_node_core::netrom::wire::Alias;
+use ax25_node_core::netrom::routing::inp3_sntt::SNTT_UNSET;
+use ax25_node_core::netrom::transport::inp3_engine::{Inp3Engine, Inp3NeighbourDownEvent};
+use ax25_node_core::netrom::transport::inp3_update_scheduler::Inp3UpdateScheduler;
+use ax25_node_core::netrom::wire::inp3_l3rtt;
+use ax25_node_core::netrom::wire::inp3_options::NetRomInp3Options;
+use ax25_node_core::netrom::wire::inp3_rif::Inp3Rif;
+use ax25_node_core::netrom::wire::{Alias, NetRomPacket};
 use ax25_node_core::netrom::{
     CircuitEvent, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomOriginator,
     NetRomOriginatorOptions,
@@ -73,6 +79,25 @@ const NETROM_SAVE_SECS: u64 = 300;
 /// Seconds between "ensure interlinks" passes — proactively (re)establish an
 /// L2 link to every known NET/ROM neighbour we can reach, BPQ-style.
 const INTERLINK_ENSURE_SECS: u64 = 30;
+
+/// Master gate for the INP3 time-routing overlay on this firmware host (the
+/// analogue of the C# `config.Inp3.Enabled` / the ax25-ts connector `inp3` opt-in).
+/// Default ON for the demo node — flip later via a config knob. Kept a single const
+/// here so the whole overlay (engine + scheduler construction, the inbound 0xCF tap,
+/// the tick fan-out) is trivially gateable: when `false` the [`Inp3Host`] is never
+/// constructed and every INP3 step is a no-op.
+const INP3_ENABLED: bool = option_env!("INP3_DISABLE").is_none();
+
+/// Demo-node INP3 cadences (SHORT, so a 2-node lab demo shows the time-route being
+/// LEARNED in seconds, not minutes — production tunables are 60 s / 300 s / 180 s).
+/// L3RTT probe every ~5 s; periodic full RIF every ~10 s; reflection-timeout reset
+/// at ~30 s. Encoded as ms (the netrom no_std idiom).
+const INP3_L3RTT_INTERVAL_MS: u32 = 5_000;
+const INP3_RIF_INTERVAL_MS: u32 = 10_000;
+const INP3_RESET_WINDOW_MS: u32 = 30_000;
+/// The positive-update debounce — must be > 0 and < the RIF interval. Kept short for
+/// the demo so a newly-learned route fans out within ~1 s of its debounce.
+const INP3_POSITIVE_DEBOUNCE_MS: u32 = 1_000;
 
 /// Set by a console REBOOT on the AX.25 path; honoured by [`drive`] after the
 /// response frames have been transmitted (so the farewell reaches the user).
@@ -203,6 +228,29 @@ pub async fn task(
     );
     let mut circuits: [Option<CircuitConsole>; 4] = [const { None }; 4];
 
+    // INP3 time-routing overlay (the embedded host wiring — the analogue of the C#
+    // `NetRomService.Inp3Host` + the ax25-ts connector `inp3` glue). Constructed once
+    // here, only when the overlay is on, with the node call already known (the C# sets
+    // the engine's local node at AttachPort; we set it at construction, since `my_call`
+    // is a parameter). Quality forwarding is left primary
+    // (`set_prefer_inp3_routes(false)`) so the demo shows the time-route being LEARNED,
+    // not yet routed by (AWARENESS ONLY, matching the C#/TS slice). `None` when off —
+    // the engine/scheduler are then never even constructed.
+    let mut inp3: Option<Inp3Host> = if INP3_ENABLED {
+        connector.set_prefer_inp3_routes(false);
+        let host = Inp3Host::new(my_call);
+        defmt::info!(
+            "axudp: INP3 overlay constructed (probe {=u32}ms, rif {=u32}ms, reset {=u32}ms) — awareness-only, quality forwarding unchanged",
+            INP3_L3RTT_INTERVAL_MS,
+            INP3_RIF_INTERVAL_MS,
+            INP3_RESET_WINDOW_MS
+        );
+        Some(host)
+    } else {
+        defmt::info!("axudp: INP3 overlay disabled");
+        None
+    };
+
     let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
     let mut next_nodes_at = Instant::now(); // announce on the first tick
     if netrom_cfg.originate {
@@ -303,9 +351,10 @@ pub async fn task(
                         &heard,
                         beacon_ep,
                         my_call,
-                        &netrom,
+                        &mut netrom,
                         &mut connector,
                         &mut circuits,
+                        inp3.as_mut(),
                         &console_id,
                         &prompt,
                     )
@@ -334,8 +383,9 @@ pub async fn task(
                     service_l4(
                         &mut L4 {
                             connector: &mut connector,
-                            netrom: &netrom,
+                            netrom: &mut netrom,
                             circuits: &mut circuits,
+                            inp3: inp3.as_mut(),
                         },
                         &peers,
                         &mut queue,
@@ -352,8 +402,9 @@ pub async fn task(
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
-                                netrom: &netrom,
+                                netrom: &mut netrom,
                                 circuits: &mut circuits,
+                                inp3: inp3.as_mut(),
                             },
                             i,
                             ev,
@@ -361,6 +412,71 @@ pub async fn task(
                             &prompt,
                         )
                         .await;
+                    }
+                }
+
+                // INP3 time-routing overlay tick (the embedded host wiring). Rides the
+                // beacon tick — the single driver, the core owns no ambient timer (as the
+                // C# host's 1 s timer / the ax25-ts connector `tick`). Robust: a faulting
+                // INP3 step must not kill the task, and the whole block is a no-op when
+                // the overlay is off (`inp3` is `None`). Drive engine + scheduler in the
+                // locked order, then SHIP each produced frame over the SAME PID-0xCF
+                // interlink seam the connector's outbound datagrams use (find the
+                // neighbour's L2 session; cold interlink → drop, don't dial).
+                if let Some(round) = inp3
+                    .as_mut()
+                    // Advance the engine + scheduler in the locked order. The `host`
+                    // borrow of `inp3` ends at the `tick_round` call (NLL: last use),
+                    // so the ship loop below is free to reborrow `inp3` for L4.
+                    .map(|host| host.tick_round(&mut netrom, my_call, now_ms()))
+                {
+
+                    // L3RTT probes + reflections, then advertised RIFs — both ride the
+                    // neighbour's interlink as PID-0xCF I-frames, exactly as
+                    // `service_l4` ships an InterlinkSend (find_peer → drive a
+                    // DlDataRequest(PID_NETROM, …)); a cold interlink is dropped.
+                    for (nbr, bytes) in round.l3rtt.into_iter().chain(round.rifs.into_iter()) {
+                        if let Some(i) = find_peer(&peers, &nbr) {
+                            drive(
+                                &mut sessions,
+                                &mut peers,
+                                &socket,
+                                &heard,
+                                beacon_ep,
+                                my_call,
+                                &mut L4 {
+                                    connector: &mut connector,
+                                    netrom: &mut netrom,
+                                    circuits: &mut circuits,
+                                    inp3: inp3.as_mut(),
+                                },
+                                i,
+                                Event::DlDataRequest(PID_NETROM, bytes),
+                                &console_id,
+                                &prompt,
+                            )
+                            .await;
+                        } else {
+                            let mut name = [0u8; 16];
+                            defmt::debug!(
+                                "axudp: INP3 frame dropped — no interlink up to {=str} (drop, don't dial)",
+                                call_str(&nbr, &mut name)
+                            );
+                        }
+                    }
+
+                    // Neighbour-down events: no clean table-mut / mark-neighbour-down
+                    // seam is reachable through the firmware's `netrom` handle from here
+                    // (it lives on the routing table, not NetRomService), so — per the
+                    // brief — log and skip rather than invent a teardown. The engine has
+                    // already dropped the neighbour's INP3 state.
+                    for down in &round.downs {
+                        let mut name = [0u8; 16];
+                        defmt::info!(
+                            "axudp: INP3 neighbour {=str} down (silent {=u64}ms) — engine state reset (no table teardown wired)",
+                            call_str(&down.neighbour, &mut name),
+                            down.silent_for_ms
+                        );
                     }
                 }
 
@@ -501,8 +617,9 @@ pub async fn task(
                         my_call,
                         &mut L4 {
                             connector: &mut connector,
-                            netrom: &netrom,
+                            netrom: &mut netrom,
                             circuits: &mut circuits,
+                            inp3: inp3.as_mut(),
                         },
                         i,
                         event,
@@ -535,8 +652,9 @@ pub async fn task(
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
-                                netrom: &netrom,
+                                netrom: &mut netrom,
                                 circuits: &mut circuits,
+                                inp3: inp3.as_mut(),
                             },
                             i,
                             session::expiry_event(id),
@@ -570,8 +688,9 @@ pub async fn task(
                                 my_call,
                                 &mut L4 {
                                     connector: &mut connector,
-                                    netrom: &netrom,
+                                    netrom: &mut netrom,
                                     circuits: &mut circuits,
+                                    inp3: inp3.as_mut(),
                                 },
                                 i,
                                 Event::DlConnectRequest,
@@ -594,8 +713,9 @@ pub async fn task(
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
-                                netrom: &netrom,
+                                netrom: &mut netrom,
                                 circuits: &mut circuits,
+                                inp3: inp3.as_mut(),
                             },
                             i,
                             Event::DlDataRequest(PID_NO_LAYER3, buf[..n].to_vec()),
@@ -617,8 +737,9 @@ pub async fn task(
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
-                                netrom: &netrom,
+                                netrom: &mut netrom,
                                 circuits: &mut circuits,
+                                inp3: inp3.as_mut(),
                             },
                             i,
                             Event::DlDisconnectRequest,
@@ -748,12 +869,29 @@ async fn drive(
                     neighbour,
                     datagram,
                 } => {
-                    l4.connector.on_interlink_data(
-                        l4.netrom.table(),
-                        neighbour,
-                        &datagram,
-                        now_ms(),
-                    );
+                    // INP3 peel BEFORE the connector (mirrors the C# `DispatchInp3` /
+                    // the ax25-ts `dispatchInp3` precedence): a RIF (0xFF-led) or an
+                    // L3RTT is consumed here so it can never reach L4 circuits /
+                    // forwarding. `true` ⇒ consumed; fall through to the connector
+                    // only on `false`. Disjoint-field borrows of `*l4` (inp3 + netrom).
+                    let consumed = match l4.inp3.as_deref_mut() {
+                        Some(host) => host.dispatch_inbound(
+                            neighbour,
+                            &datagram,
+                            l4.netrom,
+                            my_call,
+                            now_ms(),
+                        ),
+                        None => false,
+                    };
+                    if !consumed {
+                        l4.connector.on_interlink_data(
+                            l4.netrom.table(),
+                            neighbour,
+                            &datagram,
+                            now_ms(),
+                        );
+                    }
                 }
                 FollowUp::BridgeEnded { survivor } => {
                     if let Some(si) = find_peer(peers, &survivor) {
@@ -794,10 +932,234 @@ fn now_ms() -> u64 {
 }
 
 /// The L4 connector bundle threaded through [`drive`].
+///
+/// `netrom` is a `&mut` borrow (not the read-only `&` the pre-INP3 path used) so the
+/// inbound 0xCF tap can ingest a RIF into the shared routing table
+/// ([`NetRomService::ingest_rif`]) — the second metric space on the same table —
+/// before the datagram would otherwise reach the connector. The connector + circuit
+/// reads still go through `netrom.table()` (an immutable reborrow), unchanged.
 struct L4<'a> {
     connector: &'a mut NetRomConnector,
-    netrom: &'a session::NetRom,
+    netrom: &'a mut session::NetRom,
     circuits: &'a mut [Option<CircuitConsole>; 4],
+    /// The INP3 host (engine + scheduler + per-round withdrawn snapshot), or `None`
+    /// when the overlay is off ([`INP3_ENABLED`] false). The inbound tap consults it
+    /// in [`drive`]'s `FollowUp::NetRom` arm to peel RIF / L3RTT frames off the 0xCF
+    /// stream ahead of the L4 path (mirrors the C# `DispatchInp3` precedence).
+    inp3: Option<&'a mut Inp3Host>,
+}
+
+/// The embedded INP3 host: owns the host-free [`Inp3Engine`] + [`Inp3UpdateScheduler`]
+/// and the per-round drained-withdrawn snapshot, and glues their OUTBOX/TAKE outputs
+/// to the firmware's interlink send path + the shared routing table. The no_std
+/// analogue of the C# `NetRomService.Inp3Host` nested type and the ax25-ts
+/// `NetRomConnector` inp3 fields. Constructed once before the select loop, only when
+/// [`INP3_ENABLED`]; when the overlay is off this type is never instantiated and every
+/// INP3 step is skipped.
+///
+/// **Scope: AWARENESS ONLY** (as the C#/TS): the node learns + tells the time-space
+/// (probe / ingest / advertise / reset); `set_prefer_inp3_routes(false)` keeps quality
+/// forwarding unchanged, so the demo shows the time-route being LEARNED, not yet routed
+/// by. Driven by the firmware's beacon tick (no ambient timer — the core has none),
+/// exactly as the connector's circuit manager is.
+struct Inp3Host {
+    engine: Inp3Engine,
+    scheduler: Inp3UpdateScheduler,
+    /// The resolved overlay options — kept so RIF ingestion uses the configured
+    /// `hop_limit` (the C# `options.HopLimit` / ax25-ts `inp3Options.hopLimit`).
+    options: NetRomInp3Options,
+    /// The recently-withdrawn snapshot DRAINED once at the top of the current fan-out
+    /// round and handed to every `build_rif` this round (the atomic round boundary
+    /// that mirrors the C# host's `currentRoundWithdrawn` / the ax25-ts
+    /// `inp3RoundWithdrawn`). Empty outside a round.
+    round_withdrawn: Vec<Callsign>,
+}
+
+/// What one [`Inp3Host::tick_round`] produced, for the caller (the ticker arm) to
+/// SHIP over the interlinks (the engine/scheduler are host-free + own no I/O, so the
+/// frames come back out as data to send). The caller maps each to a PID-0xCF I-frame
+/// over the named neighbour's interlink, reusing the exact send seam the connector's
+/// outbound datagrams use; a cold interlink is dropped (don't dial).
+struct Inp3Round {
+    /// Outbound L3RTT sends (probes the engine originated + verbatim reflections of a
+    /// peer's probe) — each `(neighbour, frame_bytes)`.
+    l3rtt: Vec<(Callsign, Vec<u8>)>,
+    /// Built poison-reversed RIFs to advertise — each `(neighbour, rif_bytes)`.
+    rifs: Vec<(Callsign, Vec<u8>)>,
+    /// Neighbour-down events the engine raised this round (180 s reset of a
+    /// previously-capable neighbour). The firmware has no clean table-mut seam from
+    /// here (see [`Inp3Host::tick_round`]); these are logged, not torn down.
+    downs: Vec<Inp3NeighbourDownEvent>,
+}
+
+impl Inp3Host {
+    /// Construct the host with the demo cadences, the node call pinned as the engine's
+    /// local node (the L3 origin stamped into probes + the reflection self-test
+    /// identity — the C# pins it at AttachPort; we pin it here since `my_call` is
+    /// known). Options are validated for parity with the C#/TS constructors; on the
+    /// impossible event they don't validate we fall back to the canonical demo set
+    /// rather than panic (a no_std host never unwraps on a config path).
+    fn new(my_call: Callsign) -> Self {
+        let options = NetRomInp3Options {
+            enabled: true,
+            l3_rtt_interval_ms: INP3_L3RTT_INTERVAL_MS,
+            l3_rtt_reset_window_ms: INP3_RESET_WINDOW_MS,
+            rif_interval_ms: INP3_RIF_INTERVAL_MS,
+            positive_debounce_ms: INP3_POSITIVE_DEBOUNCE_MS,
+            ..NetRomInp3Options::DEFAULT
+        };
+        // Validate for symmetry with the C#/TS resolver; if (impossibly) the demo
+        // constants ever fall out of range, log and fall back rather than panic.
+        let options = match options.validate() {
+            Ok(()) => options,
+            Err(reason) => {
+                defmt::warn!(
+                    "axudp: INP3 demo options invalid ({=str}) — using defaults",
+                    reason
+                );
+                NetRomInp3Options {
+                    enabled: true,
+                    ..NetRomInp3Options::DEFAULT
+                }
+            }
+        };
+        Self {
+            engine: Inp3Engine::new(my_call, options),
+            scheduler: Inp3UpdateScheduler::new(
+                options.rif_interval_ms as u64,
+                options.positive_debounce_ms as u64,
+            ),
+            options,
+            round_withdrawn: Vec::new(),
+        }
+    }
+
+    /// The inbound 0xCF dispatch — mirrors the C# `DispatchInp3` / the ax25-ts
+    /// `dispatchInp3` precedence EXACTLY, adapted to the Rust core API. Returns `true`
+    /// when the frame was consumed as INP3 (the caller must NOT pass it to the
+    /// connector); `false` when it is an ordinary L4 datagram to fall through.
+    ///
+    /// Any neighbour we hear ANYTHING 0xCF from becomes a probe target (optimistic
+    /// probing is on by default — even a neighbour that only ever sent L4). Then:
+    /// (A) a `0xFF`-led frame is a RIF — consumed regardless of whether it parses (a
+    /// malformed RIF is dropped, NEVER retried as L4); a parsed RIF is ingested into
+    /// the shared table with the engine's measured SNTT (or the unset sentinel when
+    /// the link is un-probed). (B) else an L3RTT (a `NetRomPacket` to `L3RTT-0`) is
+    /// timed / reflected by the engine and consumed. Anything else → `false`.
+    ///
+    /// Never panics: every parse returns `Option`, and a faulting step cannot occur (no
+    /// unwraps). `now` is the monotonic ms tick.
+    fn dispatch_inbound(
+        &mut self,
+        from: Callsign,
+        info: &[u8],
+        netrom: &mut session::NetRom,
+        my_call: Callsign,
+        now: u64,
+    ) -> bool {
+        // Optimistic neighbour observation (idempotent refresh) — every 0xCF speaker
+        // becomes a probe target.
+        self.engine.observe_neighbour(from, now);
+
+        // (A) RIF? — the single-byte 0xFF signature is a total, unambiguous
+        // discriminator (a 0xFF first byte can't be a valid AX.25-shifted callsign).
+        if info.first() == Some(&Inp3Rif::SIGNATURE) {
+            if let Some(rif) = Inp3Rif::try_parse(info) {
+                // Supply the engine's measured SNTT for the carrying link, mapped to
+                // the table's unset sentinel when the link is not yet probed (the C#
+                // `engine.SnttMs(from) ?? Inp3Sntt.Unset` / the ax25-ts `?? SNTT_UNSET`).
+                let sntt = self.engine.sntt_ms(&from).unwrap_or(SNTT_UNSET);
+                netrom.ingest_rif(from, my_call, sntt, &rif, self.options.hop_limit as u32);
+                let mut name = [0u8; 16];
+                defmt::info!(
+                    "axudp: INP3 RIF ingested from {=str} ({=usize} RIP(s), {=u32} destinations known)",
+                    call_str(&from, &mut name),
+                    rif.rips.len(),
+                    netrom.destination_count() as u32
+                );
+            }
+            // Consumed either way: a 0xFF-led-but-unparseable frame is a malformed RIF,
+            // dropped — NEVER retried as an L4 datagram.
+            return true;
+        }
+
+        // (B) L3RTT? — a well-formed NetRomPacket to L3RTT-0. Decode once, classify by
+        // dest/opcode, and let the engine time our reflection or reflect a peer probe.
+        if let Some(packet) = NetRomPacket::decode(info) {
+            if inp3_l3rtt::is_l3rtt(&packet) {
+                // on_l3rtt_packet recognises + processes the L3RTT (verbatim reflect or
+                // SNTT fold) and returns true; it never panics on a non-L3RTT.
+                self.engine.on_l3rtt_packet(from, &packet, now);
+                return true;
+            }
+        }
+
+        // Not INP3 — fall through to the existing connector (L4) path.
+        false
+    }
+
+    /// One host tick in the LOCKED order (design §6.4 / the C# `TickOnce` / the
+    /// ax25-ts `inp3Tick`): refresh the capable fan-out set from the engine → tick the
+    /// engine (probes / resets) → DRAIN the table's recently-withdrawn set ONCE (the
+    /// atomic round boundary) and mark each on the scheduler → set the round snapshot →
+    /// tick the scheduler. Then build the per-neighbour poison-reversed RIFs from the
+    /// SAME drained snapshot, and drain the engine's outbound L3RTT + neighbour-down
+    /// outboxes. Returns everything to SHIP; the caller does the interlink I/O.
+    ///
+    /// Draining the withdrawn set ONCE at the round top (not per-neighbour) is the
+    /// race fix: a withdrawal landing mid-round is captured by the NEXT drain, never
+    /// cleared unadvertised. Never panics (every step is total).
+    fn tick_round(&mut self, netrom: &mut session::NetRom, my_call: Callsign, now: u64) -> Inp3Round {
+        // Keep the scheduler's fan-out set current before it reads it.
+        let capable = self.engine.inp3_capable_neighbours();
+        self.scheduler.set_target_neighbours(&capable);
+
+        // Engine first — may raise neighbour-down (→ a future table mark) and queue
+        // probes/reflections.
+        self.engine.tick(now);
+
+        // DRAIN the recently-withdrawn set ONCE, mark each NEGATIVE on the scheduler so
+        // it fans out THIS round, and remember the snapshot for every build_rif below.
+        let withdrawn = netrom.drain_recently_withdrawn();
+        for dest in &withdrawn {
+            self.scheduler.mark_withdrawn(*dest, now);
+        }
+        self.round_withdrawn = withdrawn;
+
+        // Scheduler fans out due intents (NEGATIVE immediate / POSITIVE debounced /
+        // periodic), one per target neighbour.
+        self.scheduler.tick(now);
+
+        // Build the full poison-reversed RIF for each advertise intent from the round's
+        // drained snapshot (mirrors the C# Advertise sink's BuildRif(currentRoundWithdrawn)).
+        let mut rifs: Vec<(Callsign, Vec<u8>)> = Vec::new();
+        for intent in self.scheduler.take_advertise_intents() {
+            let rif = netrom.build_rif(my_call, intent.neighbour, &self.round_withdrawn);
+            if let Some(bytes) = rif.to_bytes() {
+                rifs.push((intent.neighbour, bytes));
+            }
+        }
+        // The snapshot belongs to exactly one round — clear it after the RIFs are built.
+        self.round_withdrawn.clear();
+
+        // Drain the engine's outbound L3RTT sends (probes + reflections) to ship.
+        let l3rtt: Vec<(Callsign, Vec<u8>)> = self
+            .engine
+            .take_outbound_l3rtt()
+            .into_iter()
+            .map(|(nbr, frame)| (nbr, frame.to_bytes()))
+            .collect();
+
+        // Drain neighbour-down events. The C# wires these to table.MarkNeighbourDown +
+        // a DISC/re-establish; the firmware's `netrom` handle exposes no public
+        // mark-neighbour-down / table-mut seam reachable from here (it lives on the
+        // routing table, not NetRomService, and "edit only axudp.rs" precludes adding
+        // one), so — per the brief — we log them and skip the teardown rather than
+        // invent one. The engine has already removed the neighbour's INP3 state.
+        let downs = self.engine.take_neighbour_down();
+
+        Inp3Round { l3rtt, rifs, downs }
+    }
 }
 
 /// Drain the connector: new inbound circuits get the node console + banner;
@@ -914,9 +1276,10 @@ async fn ensure_interlinks(
     heard: &[Option<(Callsign, IpEndpoint)>; 8],
     beacon_ep: Option<IpEndpoint>,
     my_call: Callsign,
-    netrom: &session::NetRom,
+    netrom: &mut session::NetRom,
     connector: &mut NetRomConnector,
     circuits: &mut [Option<CircuitConsole>; 4],
+    mut inp3: Option<&mut Inp3Host>,
     console_id: &Identity,
     prompt: &str,
 ) {
@@ -951,6 +1314,7 @@ async fn ensure_interlinks(
                         connector,
                         netrom,
                         circuits,
+                        inp3: inp3.as_deref_mut(),
                     },
                     i,
                     Event::DlConnectRequest,
