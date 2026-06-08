@@ -61,6 +61,7 @@ mod provisioning;
 mod session;
 #[cfg(target_os = "none")]
 mod transports;
+mod webui;
 
 // The global allocator. `ax25-node-core` uses `alloc` (the session queues, the
 // streaming codecs), so the firmware must install one. `embedded-alloc`'s
@@ -204,6 +205,11 @@ mod firmware {
                 defmt::info!("mode: no WiFi configured — AP mode");
             }
             false
+        } else if cfg.force_ap {
+            // "Switch to setup AP" maintenance action: come up as the config AP
+            // even though WiFi is configured. Sticky — a config save clears it.
+            defmt::info!("mode: FORCE_AP set — setup AP (clear by saving config)");
+            false
         } else {
             net::try_join(&mut control, &cfg.wifi, 3).await
         };
@@ -329,7 +335,7 @@ mod firmware {
         // (BOOTSEL). A configured, networked node serves the upload page +
         // POST /firmware at http://<ip>/. ---
         if sta_ok {
-            spawner.spawn(defmt::unwrap!(ota::http_task(stack)));
+            spawner.spawn(defmt::unwrap!(ota::http_task(stack, cfg.hostname)));
         }
 
         // --- GATE 5 (HW-BRINGUP.md §4): KISS-over-TCP (capability 2) ---

@@ -281,15 +281,19 @@ pub async fn http_portal(stack: Stack<'static>) {
             if saved {
                 // Reboot shortly after the page is sent (into STA mode).
                 REBOOT_AFTER_HTTP.store(true, core::sync::atomic::Ordering::Relaxed);
-                SAVED_PAGE
+                crate::webui::notice(
+                    "Saved — rebooting",
+                    "The node is restarting. If you set a WiFi network it will join \
+that now; otherwise it returns to this configuration AP.",
+                )
             } else {
-                FORM_PAGE
+                setup_page()
             }
         } else {
-            FORM_PAGE
+            setup_page()
         };
 
-        let _ = http_write(&mut socket, response).await;
+        let _ = http_write(&mut socket, &response).await;
         let _ = socket.flush().await;
         socket.close();
         if REBOOT_AFTER_HTTP.load(core::sync::atomic::Ordering::Relaxed) {
@@ -330,7 +334,7 @@ async fn http_write(socket: &mut TcpSocket<'_>, body: &str) -> bool {
 /// Parse the urlencoded POST body, apply each field to the pending config via
 /// the console ConfigOp path, then SAVE. Returns whether anything was saved.
 /// Apply a urlencoded config POST body and persist it — shared by the AP captive
-/// portal and the STA-mode `/config` page (`crate::ota`). Returns whether
+/// portal and the STA-mode panel's `POST /save` (`crate::ota`). Returns whether
 /// anything was saved. The caller reboots to apply (boot-time config is
 /// immutable while running).
 pub fn apply_config_form(request: &[u8]) -> bool {
@@ -369,6 +373,12 @@ fn apply_form(request: &[u8], scratch: &mut [u8; 1024]) -> bool {
         any = true;
     }
     if any {
+        // A successful config save clears the sticky "setup AP" flag, so a node
+        // that was parked in the config AP returns to STA once reconfigured.
+        let (_t, _) = crate::config_store::handle_op(&ConfigOp::Set {
+            key: alloc::string::String::from("FORCE_AP"),
+            value: alloc::string::String::from("false"),
+        });
         let (_text, _) = crate::config_store::handle_op(&ConfigOp::Save);
     }
     any
@@ -408,12 +418,26 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-// Mobile-friendly: 16px inputs (anything smaller triggers iOS auto-zoom-on-focus,
-// which widens the page and causes the side-scroll); universal border-box +
-// full-width controls so nothing overflows; autocomplete/autocorrect/spellcheck
-// off everywhere (callsign/SSID/MQTT-host are not dictionary words — let the user
-// type), with callsign/alias/grid auto-uppercased since those are conventionally
-// upper case. Shared by the AP captive portal and the STA-mode /config page.
-pub const FORM_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>pico-node config</title><style>*{box-sizing:border-box}html{overflow-x:hidden}body{font-family:sans-serif;max-width:30em;margin:0 auto;padding:1em}label{display:block;margin:.8em 0 .2em}input{width:100%;padding:.5em;font-size:16px}button{margin-top:1.2em;padding:.7em;font-size:16px;width:100%}</style></head><body><h2>pico-node configuration</h2><form method=post action=/save autocomplete=off><label>Callsign</label><input name=callsign placeholder=M0ABC-1 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Alias</label><input name=alias placeholder=NODE autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>Grid</label><input name=grid placeholder=IO91 autocomplete=off autocorrect=off autocapitalize=characters spellcheck=false><label>WiFi network (SSID)</label><input name=wifi_ssid autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>WiFi password</label><input name=wifi_pass type=password autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><label>MQTT host (optional, host:port for logs)</label><input name=mqtt_host placeholder=10.0.0.5:1883 inputmode=url autocomplete=off autocorrect=off autocapitalize=off spellcheck=false><button type=submit>Save &amp; reboot</button></form><p>Leave a field blank to keep its current value. Set a WiFi network to join it on the next boot; the node returns to this AP if it can't.</p></body></html>";
-
-const SAVED_PAGE: &str = "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>saved</title></head><body style=\"font-family:sans-serif;max-width:30em;margin:2em auto\"><h2>Saved &mdash; rebooting</h2><p>The node is restarting. If you set a WiFi network it will join that now; otherwise it returns to this configuration AP.</p></body></html>";
+/// The AP-mode setup page: the shared node header + the pre-filled config form
+/// (re-onboarding shows the current values). Same look as the STA-mode panel,
+/// but config-only — no firmware/maintenance during onboarding.
+fn setup_page() -> alloc::string::String {
+    use alloc::string::String;
+    let p = crate::config_store::current_pending();
+    let call = p.callsign.as_deref().unwrap_or("");
+    let header = if call.is_empty() {
+        String::from(
+            "<h1>pico-node setup</h1><p class=sub>Enter a callsign and your WiFi to bring this node online.</p>",
+        )
+    } else {
+        alloc::format!(
+            "<div class=spread><h1 class=mono>{}</h1><span class=sub>setup AP</span></div>\
+<p class=sub>Update this node, then save to rejoin WiFi.</p>",
+            crate::webui::esc(call)
+        )
+    };
+    crate::webui::page(
+        "pico-node setup",
+        &alloc::format!("{header}{}", crate::webui::config_form(&p)),
+    )
+}

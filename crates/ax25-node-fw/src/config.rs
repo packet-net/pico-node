@@ -33,6 +33,10 @@ pub struct NodeConfig {
     /// (observability without a debug probe). From `MQTT_HOST` / flash config;
     /// absent ⇒ no MQTT.
     pub mqtt_host: Option<&'static str>,
+    /// When `true`, come up in the config AP instead of joining WiFi even though
+    /// WiFi is configured (the web panel's "Switch to setup AP" maintenance
+    /// action). Sticky in flash; cleared by the next config save.
+    pub force_ap: bool,
 }
 
 #[derive(Clone)]
@@ -143,6 +147,7 @@ pub fn load() -> NodeConfig {
             nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
         },
         mqtt_host: option_env!("MQTT_HOST"),
+        force_ap: false,
     }
 }
 
@@ -194,6 +199,9 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     }
     if let Some(v) = &st.mqtt_host {
         cfg.mqtt_host = Some(leak(v));
+    }
+    if let Some(v) = st.force_ap {
+        cfg.force_ap = v;
     }
 }
 

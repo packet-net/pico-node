@@ -94,13 +94,30 @@ every OTA path ends in a reset, so that's fine.
 
 ## Using it
 
-- **Check the running build:** `GET http://<node-ip>/version` → plain-text build
-  tag (the crate version by default; override with `OTA_BUILD_TAG` at build time).
-- **Update:** browse `http://<node-ip>/`, pick the raw **`pico-node-app.bin`**
-  (NOT the `.uf2`), upload. The node writes it, reboots, and swaps. Reconnect in
-  ~30 s; `/version` should show the new build.
-- **AP mode:** the captive portal owns :80 there, so OTA isn't offered in AP mode
-  — you're physically present, so use BOOTSEL.
+In STA mode the node serves a single **web panel** at `http://<node-ip>/`
+(`src/ota.rs`, rendered via `src/webui.rs`): a status header (callsign · alias ·
+grid, `<hostname>.local`, IP, running build), a **pre-filled** config form, the
+firmware-update section, and a maintenance action. Routes:
+
+- **`GET /`** — the panel.
+- **`GET /version`** — plain-text build tag (the crate version by default;
+  override with `OTA_BUILD_TAG` at build time). Handy for scripted swap checks.
+- **`POST /save`** — apply the config form (shared with the AP captive portal)
+  and reboot. Blank fields keep their current value; the password is never
+  echoed back into the form.
+- **`POST /firmware`** — the OTA upload: pick the raw **`pico-node-app.bin`**
+  (NOT the `.uf2`) in the Firmware section and upload. The node writes it,
+  reboots, and swaps; reconnect in ~30 s and `/version` should show the new
+  build.
+- **`POST /apmode`** ("Switch to setup AP") — reboot into the config AP
+  (`pico-<callsign>`) to move the node to a different WiFi without a probe. It is
+  **sticky**: the node stays in setup mode across reboots until a config save
+  clears it. Saving new WiFi in the AP portal returns it to STA on the next boot.
+
+There is no separate `/config` page any more — status, config, and firmware are
+one panel. **AP mode:** the captive portal owns :80 there (it serves the same
+config form), so OTA-over-WiFi isn't offered in AP mode — you're physically
+present, so use BOOTSEL for a firmware change.
 
 **Security:** the upload is unauthenticated, like the captive portal — anyone on
 the node's LAN can push firmware. Fine for a hobby node on a trusted LAN; gate it
