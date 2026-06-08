@@ -33,22 +33,17 @@ use embassy_net::Stack;
 
 /// A snapshot of node state for the display, refreshed by the owner. Cheap
 /// `Copy` so the OLED task can read it without locking the live structures.
+///
+/// Identity (line 1) is the node's mDNS hostname, passed into the task at spawn
+/// — it's callsign-derived, so it stands in for the callsign rather than
+/// duplicating it.
 #[derive(Clone, Copy, Default)]
 pub struct Status {
-    /// Callsign text (e.g. `"M9YYY-9"`), null-padded.
-    pub callsign: [u8; 12],
     /// `true` = STA mode, `false` = AP mode.
     pub sta: bool,
     /// NET/ROM neighbours / destinations known.
     pub neighbours: u16,
     pub destinations: u16,
-}
-
-impl Status {
-    fn callsign_str(&self) -> &str {
-        let n = self.callsign.iter().position(|&b| b == 0).unwrap_or(12);
-        core::str::from_utf8(&self.callsign[..n]).unwrap_or("?")
-    }
 }
 
 /// Shared status the OLED renders. The owner (`main`/transports) updates it; the
@@ -57,7 +52,6 @@ pub static STATUS: embassy_sync::blocking_mutex::Mutex<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
     core::cell::RefCell<Status>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(Status {
-    callsign: [0; 12],
     sta: true,
     neighbours: 0,
     destinations: 0,
@@ -88,6 +82,7 @@ pub async fn task(
     sda: Peri<'static, PIN_4>,
     scl: Peri<'static, PIN_5>,
     stack: Stack<'static>,
+    hostname: &'static str,
 ) {
     let i2c = I2c::new_async(i2c0, scl, sda, Irqs, I2cConfig::default());
     let interface = I2CDisplayInterface::new(i2c);
@@ -109,8 +104,10 @@ pub async fn task(
         let status = STATUS.lock(|c| *c.borrow());
 
         // Compose the page off the live structures + the net stack's current IP.
+        // Line 1 is the node's mDNS name (callsign-derived, so it doubles as the
+        // identity): `<hostname>.local`.
         let mut l1 = heapless::String::<24>::new();
-        let _ = write!(l1, "{} pico-node", status.callsign_str());
+        let _ = write!(l1, "{}.local", hostname);
         let mut l2 = heapless::String::<24>::new();
         match (status.sta, stack.config_v4()) {
             (true, Some(v4)) => {

@@ -95,9 +95,9 @@ pub fn config_form(p: &StoredConfig) -> String {
 
     let mut f = String::from("<section><h2>Configure</h2><form method=post action=/save autocomplete=off>");
     f += &field("callsign", "Callsign", p.callsign.as_deref().unwrap_or(""),
-        &format!("placeholder=M0ABC-1 {g} {caps}"));
+        &format!("placeholder=M0ABC-1 maxlength=9 {g} {caps}"));
     f += &field("alias", "Alias", p.alias.as_deref().unwrap_or(""),
-        &format!("placeholder=NODE {g} {caps}"));
+        &format!("placeholder=NODE maxlength=6 {g} {caps}"));
     f += &field("grid", "Grid", p.grid.as_deref().unwrap_or(""),
         &format!("placeholder=IO91 {g} {caps}"));
     f += &field("wifi_ssid", "WiFi network (SSID)", p.wifi_ssid.as_deref().unwrap_or(""),
