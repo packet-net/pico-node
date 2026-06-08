@@ -115,9 +115,15 @@ firmware-update section, and a maintenance action. Routes:
   clears it. Saving new WiFi in the AP portal returns it to STA on the next boot.
 
 There is no separate `/config` page any more — status, config, and firmware are
-one panel. **AP mode:** the captive portal owns :80 there (it serves the same
-config form), so OTA-over-WiFi isn't offered in AP mode — you're physically
-present, so use BOOTSEL for a firmware change.
+one panel, served by **one web server that runs in both modes** (`src/ota.rs`,
+`WebCtx`). **AP mode is first-class** (portable/hilltop use), not just setup, so
+the same server runs there too — over the node's own `pico-<callsign>` AP at
+`http://192.168.4.1/` it shows the AP panel (node identity + a conscious "Join a
+Wi-Fi network" section + **firmware upload**). Firmware-over-AP matters for a
+field node reached only by phone, with no USB for BOOTSEL. The STA panel adds
+WiFi/MQTT config and a "Switch to AP mode" action; `POST /join` (AP) and
+`POST /apmode` (STA) move between the modes (the sticky `FORCE_AP` flag, cleared
+only by a conscious join — see PROVISIONING.md).
 
 **Security:** the upload is unauthenticated, like the captive portal — anyone on
 the node's LAN can push firmware. Fine for a hobby node on a trusted LAN; gate it

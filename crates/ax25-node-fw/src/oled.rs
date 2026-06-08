@@ -83,6 +83,7 @@ pub async fn task(
     scl: Peri<'static, PIN_5>,
     stack: Stack<'static>,
     hostname: &'static str,
+    ap_ssid: &'static str,
 ) {
     let i2c = I2c::new_async(i2c0, scl, sda, Irqs, I2cConfig::default());
     let interface = I2CDisplayInterface::new(i2c);
@@ -104,10 +105,15 @@ pub async fn task(
         let status = STATUS.lock(|c| *c.borrow());
 
         // Compose the page off the live structures + the net stack's current IP.
-        // Line 1 is the node's mDNS name (callsign-derived, so it doubles as the
-        // identity): `<hostname>.local`.
+        // Line 1 is the node's identity: in STA mode its mDNS name
+        // (`<hostname>.local`, callsign-derived); in AP mode the SSID you join
+        // (`pico-<callsign>`) — the relevant thing when there's no LAN.
         let mut l1 = heapless::String::<24>::new();
-        let _ = write!(l1, "{}.local", hostname);
+        if status.sta {
+            let _ = write!(l1, "{}.local", hostname);
+        } else {
+            let _ = write!(l1, "{}", ap_ssid);
+        }
         let mut l2 = heapless::String::<24>::new();
         match (status.sta, stack.config_v4()) {
             (true, Some(v4)) => {

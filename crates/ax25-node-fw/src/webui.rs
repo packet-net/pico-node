@@ -72,47 +72,86 @@ pub fn page(title: &str, body: &str) -> String {
     )
 }
 
-/// The CONFIGURE section: a `<form>` POSTing to `/save`, with every field
-/// **pre-filled** from the current pending config. The password is deliberately
-/// never echoed — the field is empty with a "leave blank = keep" hint, and the
-/// server-side `apply_form` treats an empty value as "keep current".
-pub fn config_form(p: &StoredConfig) -> String {
-    // name, label, current value, and the per-field input attributes (the mobile
-    // + identity-typing rules: autocomplete/autocorrect/spellcheck off, and
-    // callsign/alias/grid auto-uppercased since those are conventionally caps).
-    fn field(name: &str, label: &str, value: &str, attrs: &str) -> String {
-        format!(
-            "<label>{}</label><input name={} value=\"{}\" {}>",
-            label,
-            name,
-            esc(value),
-            attrs
-        )
-    }
-    let g = "autocomplete=off autocorrect=off spellcheck=false";
-    let caps = "autocapitalize=characters";
-    let lower = "autocapitalize=off";
+// Shared input-typing attrs: mobile rules (autocomplete/autocorrect/spellcheck
+// off — callsign/SSID/MQTT aren't dictionary words) + auto-uppercase for the
+// identity fields, which are conventionally upper case.
+const GEN_ATTRS: &str = "autocomplete=off autocorrect=off spellcheck=false";
+const CAPS_ATTR: &str = "autocapitalize=characters";
+const LOWER_ATTR: &str = "autocapitalize=off";
 
-    let mut f = String::from("<section><h2>Configure</h2><form method=post action=/save autocomplete=off>");
-    f += &field("callsign", "Callsign", p.callsign.as_deref().unwrap_or(""),
-        &format!("placeholder=M0ABC-1 maxlength=9 {g} {caps}"));
+/// One `<label> + <input>` row. `value` is pre-filled (HTML-escaped); pass `""`
+/// to leave it blank.
+fn field(name: &str, label: &str, value: &str, attrs: &str) -> String {
+    format!(
+        "<label>{}</label><input name={} value=\"{}\" {}>",
+        label,
+        name,
+        esc(value),
+        attrs
+    )
+}
+
+/// The three identity inputs (callsign / alias / grid), pre-filled — shared by
+/// the STA Configure form and the AP identity form. Validation + lengths are
+/// enforced server-side in `config_store::set_field`; `maxlength` here is a UX
+/// nicety only.
+pub fn identity_inputs(p: &StoredConfig) -> String {
+    let mut f = field("callsign", "Callsign", p.callsign.as_deref().unwrap_or(""),
+        &format!("placeholder=M0ABC-1 maxlength=9 {GEN_ATTRS} {CAPS_ATTR}"));
     f += &field("alias", "Alias", p.alias.as_deref().unwrap_or(""),
-        &format!("placeholder=NODE maxlength=6 {g} {caps}"));
+        &format!("placeholder=NODE maxlength=6 {GEN_ATTRS} {CAPS_ATTR}"));
     f += &field("grid", "Grid", p.grid.as_deref().unwrap_or(""),
-        &format!("placeholder=IO91 {g} {caps}"));
+        &format!("placeholder=IO91 {GEN_ATTRS} {CAPS_ATTR}"));
+    f
+}
+
+/// STA-mode CONFIGURE section: identity + WiFi (pre-filled) + MQTT, POSTing to
+/// `/save`. The password is never echoed (empty, "leave blank = keep"; the
+/// server treats blank as keep-current).
+pub fn sta_config_form(p: &StoredConfig) -> String {
+    let mut f = String::from("<section><h2>Configure</h2><form method=post action=/save autocomplete=off>");
+    f += &identity_inputs(p);
     f += &field("wifi_ssid", "WiFi network (SSID)", p.wifi_ssid.as_deref().unwrap_or(""),
-        &format!("{g} {lower}"));
-    // Password: never pre-filled.
+        &format!("{GEN_ATTRS} {LOWER_ATTR}"));
     f += &format!(
         "<label>WiFi password</label><input name=wifi_pass type=password \
-placeholder=\"leave blank = keep\" {g} {lower}>"
+placeholder=\"leave blank = keep\" {GEN_ATTRS} {LOWER_ATTR}>"
     );
     f += &field("mqtt_host", "MQTT host (optional, host:port for logs)",
         p.mqtt_host.as_deref().unwrap_or(""),
-        &format!("placeholder=10.0.0.5:1883 inputmode=url {g} {lower}"));
+        &format!("placeholder=10.0.0.5:1883 inputmode=url {GEN_ATTRS} {LOWER_ATTR}"));
     f += "<button type=submit class=primary>Save &amp; reboot</button></form>";
-    f += "<p class=hint>Blank fields keep their current value. Set a WiFi network to join it on the next boot.</p></section>";
+    f += "<p class=hint>Blank fields keep their current value.</p></section>";
     f
+}
+
+/// AP-mode identity section: callsign/alias/grid only, POSTing to `/save`.
+/// Saving here keeps the node in AP mode (no WiFi, no MQTT — those are LAN
+/// concerns set from the STA panel).
+pub fn ap_identity_section(p: &StoredConfig) -> String {
+    let mut f = String::from("<section><h2>Node identity</h2><form method=post action=/save autocomplete=off>");
+    f += &identity_inputs(p);
+    f += "<button type=submit class=primary>Save &amp; reboot</button></form>";
+    f += "<p class=hint>Saving keeps this node in AP mode. Changing the callsign \
+changes the AP name (you'll reconnect to it).</p></section>";
+    f
+}
+
+/// AP-mode "Join a WiFi network" section: a *conscious* path back to LAN mode.
+/// Fields are deliberately **empty** (not pre-filled with any stored network) —
+/// joining is an explicit action, not a side-effect. POSTs to `/join`, which
+/// clears the sticky AP flag and reboots into STA.
+pub fn ap_join_section() -> String {
+    format!(
+        "<section><h2>Join a Wi-Fi network</h2>\
+<form method=post action=/join autocomplete=off>\
+<label>Network (SSID)</label><input name=wifi_ssid placeholder=\"network name\" {GEN_ATTRS} {LOWER_ATTR}>\
+<label>Password</label><input name=wifi_pass type=password {GEN_ATTRS} {LOWER_ATTR}>\
+<button type=submit class=primary>Join network &amp; switch to LAN</button></form>\
+<p class=hint>Connects this node to infrastructure Wi-Fi and leaves AP mode. This \
+access point will disappear; the node returns here only if the network can't be \
+joined.</p></section>"
+    )
 }
 
 /// A standalone "saved, rebooting" confirmation page, themed to match.
