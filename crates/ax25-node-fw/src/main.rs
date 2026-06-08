@@ -180,6 +180,25 @@ mod firmware {
             defmt::warn!("mode: NO CALLSIGN CONFIGURED — config-only AP mode (set a callsign to operate)");
         }
 
+        // mDNS/DHCP hostname: when it's still the compiled default, derive it
+        // from the callsign so two units on one WLAN don't both answer to
+        // `pico-node.local`. "M9YYY-10" -> "m9yyy-10" (a valid DNS label:
+        // lowercase letters, digits, hyphen). An explicit hostname (set in
+        // config) wins, and `leak` matches the boot-once-config lifetime model.
+        if configured && cfg.hostname == "pico-node" {
+            let mut h = String::new();
+            for &b in &call_buf[..call_len] {
+                let c = b.to_ascii_lowercase();
+                if c.is_ascii_alphanumeric() || c == b'-' {
+                    h.push(c as char);
+                }
+            }
+            if !h.is_empty() {
+                cfg.hostname = alloc::boxed::Box::leak(h.into_boxed_str());
+                defmt::info!("mDNS hostname derived from callsign: {=str}", cfg.hostname);
+            }
+        }
+
         let sta_ok = if !configured || cfg.wifi.ssid.is_empty() {
             if configured {
                 defmt::info!("mode: no WiFi configured — AP mode");

@@ -260,7 +260,7 @@ combined UF2 won't drag-drop; see docs/OTA.md), use `scripts/package-ota.sh`.
 ### Onboarding a same-for-everyone image (the real flow)
 
 A credential-free release boots into **config-only AP mode**: SSID `pico-setup`,
-WPA2 passphrase `pico-node-config`. Join it from a phone → captive portal pops
+WPA2 passphrase `packetradio`. Join it from a phone → captive portal pops
 (or `http://192.168.4.1/`) → enter callsign + WiFi + alias → Save & reboot →
 joins your WiFi from **flash-stored** config (not compiled). This is how the
 bench should be set up to dogfood the actual release; compiled-in creds
