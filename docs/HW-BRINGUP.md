@@ -220,8 +220,10 @@ probe-rs reset --chip RP2040
 ```
 
 Thereafter the hands-free loop (`cargo run` from the fw dir) flashes **only** the
-app to ACTIVE; the resident bootloader + BLOBS chain it. For a release-shaped
-image and the BOOTSEL `pico-node-combined.uf2`, use `scripts/package-ota.sh`.
+app to ACTIVE; the resident bootloader + BLOBS chain it. For release-shaped,
+credential-free artifacts and the BOOTSEL files (`pico-node-firmware.uf2` +
+`pico-node-blobs.uf2` — two contiguous files, because a single multi-region
+combined UF2 won't drag-drop; see docs/OTA.md), use `scripts/package-ota.sh`.
 
 ### probe-rs / SWD gotchas (these cost real time)
 
