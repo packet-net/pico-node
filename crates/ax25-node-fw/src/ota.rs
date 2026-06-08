@@ -142,7 +142,11 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, hostname:
             }
         }
         if crate::provisioning::apply_config_form(&hdr[..hlen]) {
-            let page = crate::webui::notice(
+            // Auto-returns to the panel once the node is back — safe here because
+            // a STA-mode save rejoins the *same* WiFi at the same address. (If
+            // the WiFi was changed it may not come back on this network; the
+            // poller just keeps waiting and the manual link still works.)
+            let page = crate::webui::notice_reconnect(
                 "Saved — rebooting",
                 "Applying the new configuration and restarting. If you changed its \
 WiFi it will join that now (and falls back to the setup AP if it can't); \
