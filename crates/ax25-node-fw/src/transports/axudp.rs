@@ -631,6 +631,41 @@ pub async fn task(
                         &prompt,
                     )
                     .await;
+
+                    // If that inbound frame was an INP3 L3RTT *probe*, the engine has
+                    // queued our reflection — ship it NOW (same event-loop turn), not on
+                    // the next 10 s beacon tick: the peer times our reflection to measure
+                    // its SNTT to us, so a tick-deferred reflection would inflate it by up
+                    // to BEACON_INTERVAL_SECS. (Originated probes + RIFs stay on the tick;
+                    // only the reflection is latency-critical.) The inbound `drive` has
+                    // returned, so `inp3`/`peers`/`sessions` are free to reborrow here.
+                    let reflections = match inp3.as_mut() {
+                        Some(host) => host.take_outbound_l3rtt(),
+                        None => Vec::new(),
+                    };
+                    for (nbr, bytes) in reflections {
+                        if let Some(j) = find_peer(&peers, &nbr) {
+                            drive(
+                                &mut sessions,
+                                &mut peers,
+                                &socket,
+                                &heard,
+                                beacon_ep,
+                                my_call,
+                                &mut L4 {
+                                    connector: &mut connector,
+                                    netrom: &mut netrom,
+                                    circuits: &mut circuits,
+                                    inp3: inp3.as_mut(),
+                                },
+                                j,
+                                Event::DlDataRequest(PID_NETROM, bytes),
+                                &console_id,
+                                &prompt,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Either4::Second(Err(e)) => {
@@ -1146,13 +1181,9 @@ impl Inp3Host {
         // The snapshot belongs to exactly one round — clear it after the RIFs are built.
         self.round_withdrawn.clear();
 
-        // Drain the engine's outbound L3RTT sends (probes + reflections) to ship.
-        let l3rtt: Vec<(Callsign, Vec<u8>)> = self
-            .engine
-            .take_outbound_l3rtt()
-            .into_iter()
-            .map(|(nbr, frame)| (nbr, frame.to_bytes()))
-            .collect();
+        // Drain the engine's outbound L3RTT sends — any probes originated by tick()
+        // above, plus any reflections not already shipped inline on receipt.
+        let l3rtt = self.take_outbound_l3rtt();
 
         // Drain neighbour-down events. The C# wires these to table.MarkNeighbourDown +
         // a DISC/re-establish; the firmware's `netrom` handle exposes no public
@@ -1163,6 +1194,21 @@ impl Inp3Host {
         let downs = self.engine.take_neighbour_down();
 
         Inp3Round { l3rtt, rifs, downs }
+    }
+
+    /// Drain the engine's queued outbound L3RTT frames (probes the engine originated,
+    /// plus reflections of peers' probes) as ready-to-ship `(neighbour, bytes)`. Called
+    /// both INLINE right after an inbound L3RTT (so a reflection ships within the same
+    /// event-loop turn — the peer times our reflection, so deferring it to the next
+    /// `tick_round` would inflate its measured SNTT to us by up to one
+    /// `BEACON_INTERVAL_SECS`) and from `tick_round` itself (for originated probes).
+    /// Idempotent: a no-op `Vec` when the outbox is empty.
+    fn take_outbound_l3rtt(&mut self) -> Vec<(Callsign, Vec<u8>)> {
+        self.engine
+            .take_outbound_l3rtt()
+            .into_iter()
+            .map(|(nbr, frame)| (nbr, frame.to_bytes()))
+            .collect()
     }
 }
 
