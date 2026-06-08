@@ -133,6 +133,7 @@ pub struct NetRomConnector {
     enabled: bool,
     forward_enabled: bool,
     forward_mode: ForwardMode,
+    prefer_inp3_routes: bool,
     max_ttl: u8,
     node_call: Callsign,
     manager: CircuitManager,
@@ -151,6 +152,9 @@ impl NetRomConnector {
             enabled: options.enabled,
             forward_enabled: options.enabled && options.forward,
             forward_mode: options.forward_mode,
+            // Quality forwarding by default; the firmware host flips this via
+            // set_prefer_inp3_routes once the INP3 overlay is feeding the table.
+            prefer_inp3_routes: false,
             max_ttl: options.circuit.time_to_live,
             node_call,
             manager: CircuitManager::new(node_call, options.circuit),
@@ -164,6 +168,16 @@ impl NetRomConnector {
     /// True if connect-routing is enabled (the C# `ConnectEnabled`).
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Set the INP3 forwarding preference at runtime (BPQ's `PREFERINP3ROUTES`). When
+    /// `true`, [`forward_datagram`](Self::on_interlink_data) and the connect/reply
+    /// next-hop forward over a destination's lowest-target-time INP3 route (quality
+    /// fallback when none is usable); when `false`, quality decides exactly as today.
+    /// The firmware host flips this when the INP3 overlay is feeding the table
+    /// time-routes — the live engine/scheduler/dispatch wiring is the firmware's job.
+    pub fn set_prefer_inp3_routes(&mut self, prefer: bool) {
+        self.prefer_inp3_routes = prefer;
     }
 
     /// True if this node forwards transit datagrams (the network-layer routing role).
@@ -319,6 +333,7 @@ impl NetRomConnector {
             routing,
             self.max_ttl,
             self.forward_mode,
+            self.prefer_inp3_routes,
         );
         let Some(neighbour) = decision.next_hop else {
             return; // dropped — TTL expired, looped back, or no onward route
