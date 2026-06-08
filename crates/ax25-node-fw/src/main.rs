@@ -50,6 +50,8 @@ mod mqtt;
 #[cfg(target_os = "none")]
 mod netrom_store;
 #[cfg(target_os = "none")]
+mod netrom_view;
+#[cfg(target_os = "none")]
 mod oled;
 #[cfg(target_os = "none")]
 mod ota;
@@ -271,6 +273,9 @@ mod firmware {
                 "axudp [up] udp/0.0.0.0:{}",
                 cfg.axudp.listen_port
             )],
+            // Filled live per-command by the console tasks from `netrom_view`
+            // (the routing table lives in the axudp task, not the console tasks).
+            routes: alloc::vec![],
         };
         // Prompt suffix "> " (the {call}> form), aligned with pdn's node prompt.
         let mut prompt = String::from(call_text);

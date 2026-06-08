@@ -338,6 +338,10 @@ pub async fn task(
                     netrom.neighbour_count() as u16,
                     netrom.destination_count() as u16,
                 );
+                // Publish the rendered route lines (NET/ROM + INP3 metric) for the
+                // `Nodes` console command — the console tasks read this snapshot
+                // since they don't share this task's routing table.
+                crate::netrom_view::set_routes(netrom.route_lines());
 
                 // Persistent interlinks: keep an L2 link up to every reachable
                 // NET/ROM neighbour, so the connector's L4 datagrams always
@@ -1204,7 +1208,9 @@ fn service_l4(
                 let conn = slot.conn;
                 for line in slot.asm.push(&data) {
                     let cmd = parse_bytes(&line);
-                    let resp = dispatch(&cmd, console_id, TransportKind::Ax25);
+                    // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes`.
+                    let id = console_id.with_routes(crate::netrom_view::snapshot());
+                    let resp = dispatch(&cmd, &id, TransportKind::Ax25);
                     let mut reply = resp.body;
                     let mut disconnect = false;
                     match resp.outcome {
@@ -1532,7 +1538,9 @@ fn post_one(
                         let lines = asm.push(&info);
                         for line in lines {
                             let cmd = parse_bytes(&line);
-                            let resp = dispatch(&cmd, console_id, TransportKind::Ax25);
+                            // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes`.
+                            let id = console_id.with_routes(crate::netrom_view::snapshot());
+                            let resp = dispatch(&cmd, &id, TransportKind::Ax25);
                             let mut reply = resp.body;
                             let mut disconnect = false;
                             let mut bridging = false;

@@ -340,6 +340,43 @@ impl NetRomService {
             self.table.for_each_route(dest, f);
         }
     }
+
+    /// Render the learned routes as display lines for the `Nodes` console command —
+    /// one line per known destination's best route, with the INP3 measured
+    /// time-metric appended when the route carries one (the dual-metric surfacing,
+    /// the no_std analogue of the pdn `NodeCommandService` route render + its
+    /// `[inp3 <t>ms/<h>h]` suffix). Empty when disabled or the table is empty.
+    /// Stable order (alias-or-callsign ascending, as `for_each_destination`).
+    pub fn route_lines(&self) -> alloc::vec::Vec<alloc::string::String> {
+        use alloc::string::String;
+        use core::fmt::Write as _;
+        let mut lines = alloc::vec::Vec::new();
+        if !self.enabled {
+            return lines;
+        }
+        let mut buf = [0u8; 16];
+        self.table.for_each_destination(|d| {
+            let Some(route) = d.best_route else {
+                return;
+            };
+            let mut line = String::new();
+            let n = d.destination.write_display(&mut buf).unwrap_or(0);
+            line.push_str(core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+            if !d.alias.is_empty() {
+                line.push(':');
+                line.push_str(d.alias.as_str());
+            }
+            line.push_str(" via ");
+            let n = route.neighbour.write_display(&mut buf).unwrap_or(0);
+            line.push_str(core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+            let _ = write!(line, " q={} obs={}", route.quality, route.obsolescence);
+            if let Some(inp3) = route.inp3 {
+                let _ = write!(line, " [inp3 {}ms/{}h]", inp3.target_time_ms, inp3.hop_count);
+            }
+            lines.push(line);
+        });
+        lines
+    }
 }
 
 impl Default for NetRomService {
@@ -422,6 +459,38 @@ mod tests {
         let sot = svc.table().destination(&dest_sot).expect("SOT learned");
         assert_eq!(sot.alias.as_str(), "SOT");
         assert_eq!(sot.best_route.unwrap().neighbour, neighbour); // we forward to the broadcaster
+    }
+
+    #[test]
+    fn route_lines_render_learned_routes_for_the_nodes_command() {
+        let mut svc = NetRomService::new();
+        let node = call("M0NODE");
+        let neighbour = call("GB7RDG");
+        let dest_sot = call("GB7SOT");
+        let via_xyz = call_ssid("GB7XYZ", 2);
+
+        // Empty before learning anything.
+        assert!(svc.route_lines().is_empty());
+
+        let info = build("RDGBPQ", &[(dest_sot, "SOT", via_xyz, 200)]);
+        let frame = nodes_frame(neighbour, info);
+        svc.observe_frame(&frame, node, PortId::from_str_lossy("p1"), 12_000);
+
+        let lines = svc.route_lines();
+        // One line per destination with a best route (GB7RDG direct + GB7SOT via it).
+        assert!(!lines.is_empty());
+        let joined = lines.join("\n");
+        // GB7SOT:SOT is forwarded via the broadcaster GB7RDG, with quality + obsolescence.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("GB7SOT:SOT") && l.contains("via GB7RDG")),
+            "expected a GB7SOT route line, got: {joined}"
+        );
+        assert!(joined.contains("q="), "renders quality");
+        assert!(joined.contains("obs="), "renders obsolescence");
+        // No RIF ingested → no INP3 metric on any line yet (pure NODES quality routes).
+        assert!(!joined.contains("[inp3"), "no INP3 metric without a RIF");
     }
 
     #[test]

@@ -26,6 +26,25 @@ pub struct Identity {
     pub grid: Option<String>,
     /// Port descriptions for the `Nodes` command, e.g. `["axudp [up] udp/0.0.0.0:10093"]`.
     pub ports: Vec<String>,
+    /// Learned NET/ROM route lines for the `Nodes` command, each already rendered
+    /// (e.g. `"GB7BBB:BBB via GB7BBB q=192 obs=6 [inp3 1734ms/1h]"`). Empty when the
+    /// table is empty or NET/ROM is off. The embedder fills this live from the
+    /// routing table (the NET/ROM service runs in a different task from the console,
+    /// so this is the cross-task seam — see the firmware's `netrom_view`).
+    pub routes: Vec<String>,
+}
+
+impl Identity {
+    /// Clone this identity with its [`routes`](Identity::routes) replaced — the
+    /// console tasks call this just before dispatching a command, filling in the
+    /// routing table's current route lines (which they read from a cross-task
+    /// snapshot, not this boot-time identity).
+    pub fn with_routes(&self, routes: Vec<String>) -> Identity {
+        Identity {
+            routes,
+            ..self.clone()
+        }
+    }
 }
 
 /// What the loop should do after handling a command.
@@ -251,17 +270,27 @@ fn nodes_text(id: &Identity) -> String {
     s.push_str(" (");
     s.push_str(&id.callsign);
     s.push(')');
+    s.push('\n');
     if id.ports.is_empty() {
-        s.push('\n');
         s.push_str("Ports: (none configured)");
-        return s;
+    } else {
+        s.push_str("Ports:");
+        for p in &id.ports {
+            s.push('\n');
+            s.push_str("  ");
+            s.push_str(p);
+        }
     }
     s.push('\n');
-    s.push_str("Ports:");
-    for p in &id.ports {
-        s.push('\n');
-        s.push_str("  ");
-        s.push_str(p);
+    if id.routes.is_empty() {
+        s.push_str("Routes: (none learned)");
+    } else {
+        s.push_str("Routes:");
+        for r in &id.routes {
+            s.push('\n');
+            s.push_str("  ");
+            s.push_str(r);
+        }
     }
     s
 }
@@ -277,6 +306,7 @@ mod tests {
             callsign: String::from("M0LTE-1"),
             grid: Some(String::from("IO91wm")),
             ports: alloc::vec![String::from("axudp [up] udp/0.0.0.0:10093")],
+            routes: alloc::vec![],
         }
     }
 
@@ -351,6 +381,27 @@ mod tests {
         let r = dispatch(&Command::Nodes, &i, TransportKind::Telnet);
         let txt = String::from_utf8(r.body).unwrap();
         assert!(txt.contains("(none configured)"));
+    }
+
+    #[test]
+    fn nodes_lists_routes_with_inp3_metric() {
+        let mut i = id();
+        i.routes = alloc::vec![
+            String::from("GB7BBB:BBB via GB7BBB q=192 obs=6 [inp3 1734ms/1h]"),
+            String::from("GB7CCC:CCC via GB7BBB q=180 obs=5"),
+        ];
+        let r = dispatch(&Command::Nodes, &i, TransportKind::Telnet);
+        let txt = String::from_utf8(r.body).unwrap();
+        assert!(txt.contains("Routes:"));
+        assert!(txt.contains("GB7BBB:BBB via GB7BBB q=192 obs=6 [inp3 1734ms/1h]"));
+        assert!(txt.contains("GB7CCC:CCC via GB7BBB q=180 obs=5"));
+    }
+
+    #[test]
+    fn nodes_handles_no_routes() {
+        let r = dispatch(&Command::Nodes, &id(), TransportKind::Telnet);
+        let txt = String::from_utf8(r.body).unwrap();
+        assert!(txt.contains("Routes: (none learned)"));
     }
 
     #[test]

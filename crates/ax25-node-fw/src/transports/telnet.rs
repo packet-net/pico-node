@@ -88,7 +88,10 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
 
         for line in asm.push(&buf[..n]) {
             let cmd = parse_bytes(&line);
-            let resp = dispatch(&cmd, id, KIND);
+            // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes` — the
+            // routing table lives in the AXUDP task, so read its cross-task snapshot.
+            let id = id.with_routes(crate::netrom_view::snapshot());
+            let resp = dispatch(&cmd, &id, KIND);
             if !write_all(socket, &resp.body).await {
                 return;
             }
