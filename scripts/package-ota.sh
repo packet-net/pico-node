@@ -62,7 +62,11 @@ picotool uf2 convert "$BL_ELF"        -t elf                  "$OUT/.bl.uf2"
 picotool uf2 convert "$OUT/.state.bin" -t bin -o "$STATE_ADDR" "$OUT/.state.uf2"
 picotool uf2 convert "$OUT/.blobs.bin" -t bin -o "$BLOBS_ADDR" "$OUT/.blobs.uf2"
 picotool uf2 convert "$APP_ELF"       -t elf                  "$OUT/.app.uf2"
-cat "$OUT/.bl.uf2" "$OUT/.state.uf2" "$OUT/.blobs.uf2" "$OUT/.app.uf2" > "$OUT/pico-node-combined.uf2"
+# Combine into ONE UF2 with globally-consistent block numbering — a raw `cat`
+# leaves each segment's own blockNo/numBlocks, which makes the RP2040 BOOTSEL
+# bootrom reboot after the first segment (flashing only the bootloader).
+python3 "$ROOT/scripts/uf2-combine.py" "$OUT/pico-node-combined.uf2" \
+  "$OUT/.bl.uf2" "$OUT/.state.uf2" "$OUT/.blobs.uf2" "$OUT/.app.uf2"
 rm -f "$OUT/.bl.uf2" "$OUT/.state.uf2" "$OUT/.blobs.uf2" "$OUT/.app.uf2" "$OUT/.blobs.bin" "$OUT/.state.bin"
 
 echo "==> artifacts in $OUT:"

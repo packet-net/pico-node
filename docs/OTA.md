@@ -116,11 +116,15 @@ reproducible): `pico-node-app.bin` (the ~284 KB blobless OTA payload),
 - **Bootloader** (`ax25-node-bootloader`) and **app** (`ax25-node-fw`) build to
   ELFs; the raw OTA payload is `rust-objcopy -O binary <app-elf> pico-node-app.bin`.
 - **BLOBS image:** `scripts/build-blobs.py` → the `PBLB` manifest + cyw43 blobs.
-- **Combined UF2** = concatenation of four UF2 segments — bootloader, a
-  **STATE-clear** 0xFF page (at the bootloader-state sector), the BLOBS image
-  (at `0x10108000`), and the app — each converted with `picotool uf2 convert`.
-  UF2 blocks are independent (each carries its own target address + the RP2040
-  family id), so concatenation is a valid combined image.
+- **Combined UF2** = four UF2 segments — bootloader, a **STATE-clear** 0xFF page
+  (at the bootloader-state sector), the BLOBS image (at `0x10108000`), and the
+  app — each converted with `picotool uf2 convert`, then merged by
+  `scripts/uf2-combine.py`. Each block self-describes its target address + RP2040
+  family id, so block *order* doesn't matter — **BUT** they must be **renumbered**
+  to one global sequence (`blockNo 0..N-1`, `numBlocks = N`). A raw `cat` leaves
+  each segment's own `numBlocks`, which makes the RP2040 BOOTSEL bootrom reboot
+  after the first segment's count is reached (flashing only the bootloader → an
+  erased app → no boot). `uf2-combine.py` does the renumber; **don't `cat`**.
 
 ## Bench notes
 
