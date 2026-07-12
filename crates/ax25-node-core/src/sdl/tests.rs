@@ -410,6 +410,171 @@ fn extended_connect_stays_mod8_route_with_quirk_off() {
     assert_eq!(s.state, State::AwaitingConnection);
 }
 
+// ─── Quirk: #48 DM refusal degrades an extended connect to v2.0/SABM ─────────
+
+#[test]
+fn extended_dm_refusal_degrades_to_v20_with_quirk_on() {
+    // Initiator prefers v2.2: an extended DL-CONNECT routes to AwaitingV22Connection
+    // (#44) and Establish_Data_Link sends SABME.
+    let mut s = Session::new();
+    s.context.is_extended = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::DlConnectRequest, &mut t, &mut r);
+    assert_eq!(s.state, State::AwaitingV22Connection);
+    assert_eq!(r.unnumbered(), vec![UnnumberedKind::Sabme]);
+    r.frames.clear();
+
+    // XRouter-style refusal: DM(F=1) answering our polled SABME. With #48 on this
+    // degrades to v2.0 (re-establish via SABM) instead of tearing down.
+    s.post_event(Event::DmReceived(rx(true, false)), &mut t, &mut r);
+
+    // Substituted t14_frmr_received: → AwaitingConnection, mod-8, SABM on the wire.
+    assert_eq!(s.state, State::AwaitingConnection);
+    assert!(!s.context.is_extended); // forced to v2.0 so Establish emits SABM
+    assert_eq!(r.unnumbered(), vec![UnnumberedKind::Sabm]);
+}
+
+#[test]
+fn extended_dm_refusal_tears_down_with_quirk_off() {
+    let mut s = Session::new();
+    s.context.is_extended = true;
+    s.context.layer3_initiated = true;
+    s.context.quirks = Quirks::strictly_faithful();
+    // Park directly in the extended-establishment state (with #44 off an extended
+    // connect wouldn't route here; the DM handling is what's under test).
+    s.state = State::AwaitingV22Connection;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::DmReceived(rx(true, false)), &mut t, &mut r);
+
+    // figc4.6 t11_dm_received_yes as drawn (F=1): §975 refusal → Disconnected, with
+    // is_extended left stuck true and no SABM re-establish (the defect #48 fixes).
+    assert_eq!(s.state, State::Disconnected);
+    assert!(s.context.is_extended);
+    assert!(r.unnumbered().is_empty());
+}
+
+// ─── Quirk: #9 ack progress resets RC (survives a working link) ─────────────
+
+#[test]
+fn ack_progress_resets_rc_survives_working_link_with_quirk_on() {
+    // A bulk transfer living in Timer Recovery: RC has ratcheted to N2 but the peer
+    // just acked NEW data (V(A) advanced), so the link is alive. With #9 on the next
+    // T1 expiry clamps RC below N2 and keeps recovering instead of dying.
+    let mut s = Session::in_state(State::TimerRecovery);
+    s.context.reset_state();
+    s.context.n2 = 2;
+    s.context.k = 7;
+    s.context.vs = 2; // two I-frames outstanding; V(A)=0, so V(S) != V(A)
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // Peer acks frame 0 (RR response, F=0, N(R)=1): V(A) advances 0→1 = progress.
+    s.post_event(Event::RrReceived(rx_s(1, false, false)), &mut t, &mut r);
+    assert_eq!(s.context.va, 1);
+    assert_eq!(s.state, State::TimerRecovery);
+
+    // Prior T1 hiccups pushed RC to the ceiling.
+    s.context.rc = s.context.n2;
+    r.upward.clear();
+
+    // Next T1 expiry: progress was recorded, so RC is clamped below N2 → the
+    // t21_t1_expiry_no retransmit branch fires, NOT the t21_t1_expiry_yes_no death.
+    s.post_event(Event::T1Expiry, &mut t, &mut r);
+    assert_eq!(s.state, State::TimerRecovery);
+    assert!(!r.upward.contains(&DataLinkSignal::DisconnectIndication));
+}
+
+#[test]
+fn rc_ratchets_and_kills_working_link_with_quirk_off() {
+    let mut s = Session::in_state(State::TimerRecovery);
+    s.context.reset_state();
+    s.context.quirks = Quirks::strictly_faithful();
+    s.context.n2 = 2;
+    s.context.k = 7;
+    s.context.vs = 2;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // Same forward progress...
+    s.post_event(Event::RrReceived(rx_s(1, false, false)), &mut t, &mut r);
+    assert_eq!(s.context.va, 1);
+    s.context.rc = s.context.n2;
+    r.upward.clear();
+
+    // ...but with #9 off RC stays at N2, so the T1 expiry declares the (still-alive)
+    // link dead — the false-N2-death the quirk fixes.
+    s.post_event(Event::T1Expiry, &mut t, &mut r);
+    assert_eq!(s.state, State::Disconnected);
+    assert!(r.upward.contains(&DataLinkSignal::DisconnectIndication));
+}
+
+// ─── Quirk: #13 clamp SREJ window to modulus/2 ──────────────────────────────
+
+#[test]
+fn srej_window_clamped_to_half_modulus_with_quirk_on() {
+    let mut s = connected_session();
+    s.context.k = 7; // above modulus/2 (=4 for mod-8) — unsafe for Selective Repeat
+    s.context.srej_enabled = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    for n in 0..7u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            &mut t,
+            &mut r,
+        );
+    }
+
+    // Effective window capped at modulus/2 = 4: only 4 frames go out, 3 stay queued,
+    // so two in-flight frames can never share an N(S) (the ring-wrap corruption guard).
+    assert_eq!(s.context.effective_window(), 4);
+    assert_eq!(r.i_frames().len(), 4);
+    assert_eq!(s.context.vs, 4);
+    assert_eq!(s.context.i_frame_queue.len(), 3);
+}
+
+#[test]
+fn srej_window_uncapped_with_quirk_off() {
+    let mut s = connected_session();
+    s.context.k = 7;
+    s.context.srej_enabled = true;
+    s.context.quirks = Quirks::strictly_faithful();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    for n in 0..7u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            &mut t,
+            &mut r,
+        );
+    }
+
+    // Figure-literal: the full k=7 window is used — all 7 on the wire (the SREJ
+    // ring-wrap corruption the quirk guards against, for conformance study).
+    assert_eq!(s.context.effective_window(), 7);
+    assert_eq!(r.i_frames().len(), 7);
+    assert_eq!(s.context.vs, 7);
+    assert_eq!(s.context.i_frame_queue.len(), 0);
+}
+
+#[test]
+fn go_back_n_window_not_capped_even_with_quirk_on() {
+    // The clamp gates on srej_enabled: a go-back-N link (SREJ off) buffers no
+    // out-of-order frames and tolerates k up to modulus−1, so it is never capped —
+    // even with the quirk on (default).
+    let mut s = connected_session();
+    s.context.k = 7;
+    s.context.srej_enabled = false;
+    assert!(s.context.quirks.clamp_srej_window_to_half_modulus);
+    assert_eq!(s.context.effective_window(), 7);
+}
+
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
 
 #[test]

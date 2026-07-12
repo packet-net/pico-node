@@ -99,6 +99,11 @@ pub struct Session {
     pub state: State,
     /// The mutable per-connection context.
     pub context: SessionContext,
+    /// #9 (ack_progress_resets_rc): set when a committed transition advances V(A)
+    /// (the peer acknowledged new data); consumed at the next T1 expiry to clamp RC.
+    /// Session-scoped, not part of the SDL context — mirrors the C# `Ax25Session`
+    /// private `vaAdvancedSinceT1Expiry` field.
+    va_advanced_since_t1_expiry: bool,
 }
 
 impl Default for Session {
@@ -113,6 +118,7 @@ impl Session {
         Self {
             state: State::Disconnected,
             context: SessionContext::new(),
+            va_advanced_since_t1_expiry: false,
         }
     }
 
@@ -121,6 +127,7 @@ impl Session {
         Self {
             state,
             context: SessionContext::new(),
+            va_advanced_since_t1_expiry: false,
         }
     }
 
@@ -144,6 +151,21 @@ impl Session {
         timers: &mut dyn TimerService,
         sink: &mut dyn SessionSink,
     ) {
+        // #9 ack-progress-resets-RC (step 2 of 2): the figures only reset RC on the
+        // fully-acked Timer-Recovery checkpoint, so a transfer that lives in Timer
+        // Recovery with frames always in flight ratchets RC across a WORKING link and
+        // dies at the N2'th *lifetime* T1 hiccup. If V(A) advanced since the last T1
+        // expiry, the link is demonstrably alive, so this expiry is the FIRST of a new
+        // consecutive-failure run: clamp RC to 1 before the RCEqN2 guard is evaluated.
+        // Clamp (not zero) keeps Select_T1's RC==0 Karn branch meaningful. Ports the
+        // `PreClampRetryCountOnT1Expiry` block in `Ax25Session.DispatchEvent`.
+        if matches!(event, Event::T1Expiry) && self.context.quirks.ack_progress_resets_rc {
+            if self.va_advanced_since_t1_expiry && self.context.rc > 1 {
+                self.context.rc = 1;
+            }
+            self.va_advanced_since_t1_expiry = false;
+        }
+
         let on = event.to_sdl();
         let page = self.state.page();
 
@@ -173,14 +195,31 @@ impl Session {
         let _ = snapshot; // restore is only reachable on the (panic) error path,
                           // which on-target aborts via panic-probe; kept for parity.
 
-        // #45 pre-execution quirk: force v2.0 before the FRMR-fallback actions run,
-        // so Establish_Data_Link emits SABM (not SABME) on a pre-v2.2 peer's FRMR.
-        self.apply_pre_execution_quirks(t);
+        // #48 DM-degrade: a DM received in AwaitingV22Connection means the peer can't
+        // do v2.2, so degrade to v2.0/SABM like the FRMR fallback — substitute the
+        // matched DM transition for figc4.6's t14_frmr_received (v2.0 re-establish),
+        // NOT the figure-literal F=1 teardown. Ports `ResolveDmDegradeMatch`.
+        let t = self.resolve_dm_degrade_match(t, page);
+
+        // #45 / #48 pre-execution quirks: force v2.0 before the FRMR-fallback (or
+        // substituted-DM) actions run, so Establish_Data_Link emits SABM (not SABME)
+        // on a pre-v2.2 peer's FRMR/DM.
+        self.apply_pre_execution_quirks(t, &event);
+
+        // #9 ack-progress-resets-RC (step 1 of 2): snapshot V(A) so we can tell
+        // whether this transition advances it (the peer acked NEW data). The RC clamp
+        // itself is deferred to the next T1 expiry (above); RC is NOT zeroed here
+        // because RC==0 is also Select_T1's Karn "clean round-trip" signal.
+        let va_before = self.context.va;
 
         // Run the action chain (with its loop_while ranges) against the context.
         {
             let mut tx = Tx::new(&mut self.context, timers, sink, event);
             execute_actions(t.actions, t.loops, &mut tx);
+        }
+
+        if self.context.va != va_before {
+            self.va_advanced_since_t1_expiry = true;
         }
 
         // Advance state — `next`, with the #44 mod-128 connect-routing fix.
@@ -203,13 +242,59 @@ impl Session {
         State::from_name(t.next)
     }
 
+    /// figc4.6 DM-no-degrade gap (#48): when a `DM received` fires in
+    /// AwaitingV22Connection while the link is still extended, substitute the matched
+    /// DM transition (either F-branch — the F=1 teardown or the F=0 passive drop) for
+    /// figc4.6's `t14_frmr_received` (the v2.0 re-establish: SRT reset →
+    /// Establish_Data_Link → AwaitingConnection), so a DM degrades the link to v2.0
+    /// and re-establishes via SABM exactly like the FRMR fallback (#45). The
+    /// companion `is_extended=false` force ([`apply_pre_execution_quirks`]) makes
+    /// Establish_Data_Link emit SABM. Scope is tight: only a `DMReceived` trigger,
+    /// only from AwaitingV22Connection, only while extended. Ports
+    /// `Ax25Session.ResolveDmDegradeMatch`.
+    fn resolve_dm_degrade_match(
+        &self,
+        matched: &'static TransitionSpec,
+        page: &'static StatePage,
+    ) -> &'static TransitionSpec {
+        if !self.context.quirks.dm_rejection_degrades_to_v20
+            || !self.context.is_extended
+            || matched.on != Sdl::DMReceived
+            || matched.from != "AwaitingV22Connection"
+        {
+            return matched;
+        }
+
+        for t in page.transitions {
+            if t.on == Sdl::FRMRReceived {
+                return t;
+            }
+        }
+
+        matched // defensive: figc4.6 always carries t14_frmr_received
+    }
+
     /// Apply quirks that must take effect *before* a transition's actions run:
-    /// the #45 figc4.6 FRMR-fallback ordering fix. Ports `ApplyPreExecutionQuirks`.
-    fn apply_pre_execution_quirks(&mut self, t: &TransitionSpec) {
+    /// the #45 figc4.6 FRMR-fallback ordering fix, and the #48 companion DM-degrade
+    /// force. Ports `ApplyPreExecutionQuirks`.
+    fn apply_pre_execution_quirks(&mut self, t: &TransitionSpec, event: &Event) {
         if self.context.quirks.frmr_fallback_reestablishes_v20
             && self.context.is_extended
             && t.from == "AwaitingV22Connection"
             && t.on == Sdl::FRMRReceived
+        {
+            self.context.is_extended = false;
+        }
+
+        // #48 companion: the DM's match has been substituted for t14_frmr_received
+        // (so `t.on` is now FRMRReceived and the #45 branch above already fired when
+        // #45 is on). Key this on the actual DM *trigger* so #48 stays self-contained
+        // even with #45 off — otherwise Establish_Data_Link would re-emit SABME (still
+        // extended) and the degrade would loop against the non-v2.2 peer.
+        if self.context.quirks.dm_rejection_degrades_to_v20
+            && self.context.is_extended
+            && matches!(event, Event::DmReceived(_))
+            && t.from == "AwaitingV22Connection"
         {
             self.context.is_extended = false;
         }
@@ -244,7 +329,8 @@ impl Session {
         if self.context.peer_receiver_busy {
             return false;
         }
-        self.context.outstanding_count() < self.context.k as u16
+        // #13: the effective window is `k`, clamped to modulus/2 while SREJ is on.
+        self.context.outstanding_count() < self.context.effective_window() as u16
     }
 }
 
