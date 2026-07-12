@@ -49,4 +49,15 @@ alloc = []
 ax25sdl = { path = "../../../ax25sdl/spec/rust", default-features = false }
 
 [dev-dependencies]
-# (intentionally empty — host tests use only std + the ax25sdl dep above)
+# HOST-TEST-ONLY. `[dev-dependencies]` are compiled ONLY for `cargo test` on the
+# host — they never reach the `no_std` / firmware graph (the on-target build is
+# `--no-default-features --features alloc`, which pulls in neither `[dev-dependencies]`
+# nor `std`). So the library's "exactly one external dependency (ax25sdl)" rule —
+# which governs the SHIPPED graph — is preserved: serde/serde_json are not shipped.
+#
+# Used solely by `tests/golden_vectors.rs` to read the shared cross-stack golden
+# vector corpus (`vectors/*.json`) so the pico-node codec is asserted byte-identical
+# to the C# `Packet.*` reference. `include_str!` embeds the JSON at compile time, so
+# the test still runs fully offline.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
