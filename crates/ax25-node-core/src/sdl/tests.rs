@@ -512,6 +512,69 @@ fn rc_ratchets_and_kills_working_link_with_quirk_off() {
     assert!(r.upward.contains(&DataLinkSignal::DisconnectIndication));
 }
 
+// ─── Quirk: #13 clamp SREJ window to modulus/2 ──────────────────────────────
+
+#[test]
+fn srej_window_clamped_to_half_modulus_with_quirk_on() {
+    let mut s = connected_session();
+    s.context.k = 7; // above modulus/2 (=4 for mod-8) — unsafe for Selective Repeat
+    s.context.srej_enabled = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    for n in 0..7u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            &mut t,
+            &mut r,
+        );
+    }
+
+    // Effective window capped at modulus/2 = 4: only 4 frames go out, 3 stay queued,
+    // so two in-flight frames can never share an N(S) (the ring-wrap corruption guard).
+    assert_eq!(s.context.effective_window(), 4);
+    assert_eq!(r.i_frames().len(), 4);
+    assert_eq!(s.context.vs, 4);
+    assert_eq!(s.context.i_frame_queue.len(), 3);
+}
+
+#[test]
+fn srej_window_uncapped_with_quirk_off() {
+    let mut s = connected_session();
+    s.context.k = 7;
+    s.context.srej_enabled = true;
+    s.context.quirks = Quirks::strictly_faithful();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    for n in 0..7u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            &mut t,
+            &mut r,
+        );
+    }
+
+    // Figure-literal: the full k=7 window is used — all 7 on the wire (the SREJ
+    // ring-wrap corruption the quirk guards against, for conformance study).
+    assert_eq!(s.context.effective_window(), 7);
+    assert_eq!(r.i_frames().len(), 7);
+    assert_eq!(s.context.vs, 7);
+    assert_eq!(s.context.i_frame_queue.len(), 0);
+}
+
+#[test]
+fn go_back_n_window_not_capped_even_with_quirk_on() {
+    // The clamp gates on srej_enabled: a go-back-N link (SREJ off) buffers no
+    // out-of-order frames and tolerates k up to modulus−1, so it is never capped —
+    // even with the quirk on (default).
+    let mut s = connected_session();
+    s.context.k = 7;
+    s.context.srej_enabled = false;
+    assert!(s.context.quirks.clamp_srej_window_to_half_modulus);
+    assert_eq!(s.context.effective_window(), 7);
+}
+
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
 
 #[test]

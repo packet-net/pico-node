@@ -208,6 +208,23 @@ impl SessionContext {
         ((self.vs as u16 + m) - self.va as u16) % m
     }
 
+    /// The send window the engine actually enforces (#13, ax25spec#13): [`k`](Self::k),
+    /// but capped at `modulus/2` while Selective Repeat ([`srej_enabled`](Self::srej_enabled))
+    /// is in effect — the 2·W ≤ modulus wrap invariant, so two in-flight frames can
+    /// never share an N(S). Gated by
+    /// [`Quirks::clamp_srej_window_to_half_modulus`](super::quirks::Quirks); with the
+    /// quirk off (or SREJ disabled — a go-back-N link) it is just [`k`](Self::k),
+    /// reproducing the figure-literal unbounded window. Used by both the send-side
+    /// window checks (`can_transmit_i_frame`, the `v_s_eq_v_a_plus_k` guard) and the
+    /// #40 receive-window discard. Ports `Ax25SessionContext.EffectiveWindow`.
+    pub fn effective_window(&self) -> u32 {
+        if self.quirks.clamp_srej_window_to_half_modulus && self.srej_enabled {
+            self.k.min(self.modulus() as u32 / 2)
+        } else {
+            self.k
+        }
+    }
+
     /// Drop every `sent_i_frames` entry whose N(S) is no longer outstanding
     /// (has been acknowledged — now behind V(a)). Called when V(a) advances so a
     /// stale/duplicate REJ/SREJ cannot replay an already-acked frame. Mirrors

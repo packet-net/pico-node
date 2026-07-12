@@ -84,7 +84,8 @@ pub fn eval_atom(
 
         // ─── Sequence-variable comparisons (mod-aware) ──────────────────
         Ax25Guard::VsEqVa => ctx.vs == ctx.va,
-        Ax25Guard::VsEqVaPlusK => ctx.outstanding_count() >= ctx.k as u16,
+        // #13: window bound is the effective (SREJ-clamped) window, not raw `k`.
+        Ax25Guard::VsEqVaPlusK => ctx.outstanding_count() >= ctx.effective_window() as u16,
         Ax25Guard::VsEqX => ctx.x == Some(ctx.vs),
 
         // ─── Timer state ────────────────────────────────────────────────
@@ -167,7 +168,8 @@ fn reject_exception(ctx: &SessionContext, trigger: &Event) -> bool {
     if let Event::IReceived(f) = trigger {
         let m = ctx.modulus();
         let offset = ((f.ns as u16 + m) - ctx.vr as u16) % m;
-        if offset >= ctx.k as u16 {
+        // #13: the receive window bound is the effective (SREJ-clamped) window.
+        if offset >= ctx.effective_window() as u16 {
             return true; // out of window ⇒ discard
         }
     }

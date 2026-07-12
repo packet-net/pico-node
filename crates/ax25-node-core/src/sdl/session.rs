@@ -329,7 +329,8 @@ impl Session {
         if self.context.peer_receiver_busy {
             return false;
         }
-        self.context.outstanding_count() < self.context.k as u16
+        // #13: the effective window is `k`, clamped to modulus/2 while SREJ is on.
+        self.context.outstanding_count() < self.context.effective_window() as u16
     }
 }
 

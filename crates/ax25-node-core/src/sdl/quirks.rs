@@ -73,6 +73,17 @@ pub struct Quirks {
     /// consecutive-failure run. Clamp to 1 (not 0) so Select_T1's RC==0 Karn branch
     /// still means "no retransmission in progress" (ax25spec#9, packet.net LinkBench).
     pub ack_progress_resets_rc: bool,
+    /// Selective Repeat keys retransmission state by the bare N(S), so sender and
+    /// receiver windows must not overlap modulo the sequence space (the 2·W ≤ modulus
+    /// bound). AX.25 lets `k` range to modulus−1 (fine for go-back-N) and the figures
+    /// never enforce the tighter SREJ bound, so a session running SREJ with
+    /// `k > modulus/2` can, under loss, silently deliver a stale stored frame from the
+    /// previous ring cycle — exact-length, wrong-content corruption. When SREJ is
+    /// enabled, cap the effective window at `modulus/2` (≤4 mod-8, ≤64 mod-128); the
+    /// configured `k` is untouched and applies again once SREJ is off. Go-back-N links
+    /// are never capped (ax25spec#13, packet.net#393; see
+    /// [`SessionContext::effective_window`](super::context::SessionContext::effective_window)).
+    pub clamp_srej_window_to_half_modulus: bool,
 }
 
 impl Default for Quirks {
@@ -89,6 +100,7 @@ impl Default for Quirks {
             dm_rejection_degrades_to_v20: true,
             timer_recovery_drain_advances_vr: true,
             ack_progress_resets_rc: true,
+            clamp_srej_window_to_half_modulus: true,
         }
     }
 }
@@ -107,6 +119,7 @@ impl Quirks {
             dm_rejection_degrades_to_v20: false,
             timer_recovery_drain_advances_vr: false,
             ack_progress_resets_rc: false,
+            clamp_srej_window_to_half_modulus: false,
         }
     }
 }
