@@ -22,6 +22,8 @@
 //!   (`Packet.Kiss.KissFrameClassifier`).
 //! - [`serial`] — the serial-KISS transport seam over an async byte stream
 //!   (`Packet.Kiss.Serial.KissSerialModem` + the `IKissModem` seam), host-testable.
+//! - [`reconnect`] — the portable capped-backoff reconnect policy
+//!   (`Packet.Node.Core.Transports.ReconnectingKissModem`'s decision core).
 //! - [`ninotnc`] — the NinoTNC-specific extensions (`Packet.Kiss.NinoTnc`): the mode
 //!   catalog, SETHW mode byte, the TX-Test frames, and the NinoTNC-aware classifier.
 
@@ -32,6 +34,7 @@ pub mod encoder;
 pub mod frame;
 pub mod ninotnc;
 pub mod params;
+pub mod reconnect;
 pub mod serial;
 
 pub use ackmode::{AckCorrelator, AckRegisterError, TxCompletion, DEFAULT_ACK_TIMEOUT_MS};
@@ -39,4 +42,5 @@ pub use classify::{classify, InboundEvent};
 pub use decoder::Decoder;
 pub use encoder::{encode, encode_into, max_encoded_len};
 pub use frame::{Command, Frame, EXIT_KISS_MODE, FEND, FESC, TFEND, TFESC};
+pub use reconnect::{ReconnectAction, ReconnectPolicy, ReconnectingLink};
 pub use serial::{ByteStream, ModemError, SerialKissModem};
