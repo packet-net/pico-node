@@ -6,16 +6,23 @@
 //!
 //! 1. The synthetic host-side **TX-Test diagnostic** (`=FirmwareVr:` marker) — the
 //!    KISS Data frame the firmware sends to its own host when the button is pressed.
-//! 2. The over-air **TX-Test UI frame** (`CQBEEP-5` + stepping-ASCII INFO) — the
+//! 2. The numeric **status report** (`=II:` register markers) — the periodic
+//!    diagnostic beacon, or a numeric GETALL reply.
+//! 3. The **GETRSSI reply** (`RSSI:` on the 0xE0 reply command byte).
+//! 4. The over-air **TX-Test UI frame** (`CQBEEP-5` + stepping-ASCII INFO) — the
 //!    AX.25 frame *another* NinoTNC put on the air when its button was pressed.
+//!
+//! The dispatch order mirrors C# `NinoTncFrameClassifier.Classify` exactly.
 //!
 //! C# overlays via an open record hierarchy (a subclass before the event fires);
 //! Rust enums are closed, so the overlay returns the dedicated
-//! [`NinoTncInboundEvent`] enum: it carries the two NinoTNC variants plus a
+//! [`NinoTncInboundEvent`] enum: it carries the four NinoTNC variants plus a
 //! [`NinoTncInboundEvent::Generic`] passthrough for everything the overlay doesn't
 //! upgrade.
 
 use super::airtest::NinoTncAirTestFrame;
+use super::rssi::NinoTncRssiReading;
+use super::status::NinoTncStatusFrame;
 use super::txtest::NinoTncTxTestFrame;
 use crate::kiss::classify::{self, InboundEvent};
 use crate::kiss::frame::{Command, Frame};
@@ -44,6 +51,22 @@ pub enum NinoTncInboundEvent<'a> {
         /// The recognized over-air test frame (pattern borrows the AX.25 info).
         air_test: NinoTncAirTestFrame<'a>,
     },
+    /// The periodic numeric diagnostic-register report (or a numeric GETALL reply).
+    /// Mirrors `NinoTncStatusFrameReceivedEvent`.
+    StatusReport {
+        /// The raw decoded KISS frame.
+        raw: &'a Frame,
+        /// The parsed status snapshot.
+        status: NinoTncStatusFrame,
+    },
+    /// A GETRSSI reply — `RSSI:` ASCII on the 0xE0 reply command byte. Mirrors
+    /// `NinoTncRssiReadingReceivedEvent`.
+    RssiReading {
+        /// The raw decoded KISS frame.
+        raw: &'a Frame,
+        /// The parsed RX-audio level reading.
+        rssi: NinoTncRssiReading,
+    },
     /// Anything the NinoTNC overlay does not upgrade — the generic classification.
     Generic(InboundEvent<'a>),
 }
@@ -70,7 +93,26 @@ pub fn classify(frame: &Frame) -> NinoTncInboundEvent<'_> {
         }
     }
 
-    // 2) Over-air TX-Test UI frame — only when the generic classifier already gave
+    // 2) Numeric =II: register report — the periodic status frame (fake UI header,
+    //    KISS Data), or a numeric GETALL reply. Same generic-shape gate as (1).
+    if matches!(
+        generic,
+        InboundEvent::Ax25 { .. } | InboundEvent::Unknown { .. }
+    ) {
+        if let Some(status) = NinoTncStatusFrame::try_parse_frame(frame) {
+            return NinoTncInboundEvent::StatusReport { raw: frame, status };
+        }
+    }
+
+    // 3) GETRSSI reply — "RSSI:" ASCII on the 0xE0 reply command byte. Only ever an
+    //    Unknown to the generic classifier (the reply payload is not AX.25-shaped).
+    if matches!(generic, InboundEvent::Unknown { .. }) {
+        if let Some(rssi) = NinoTncRssiReading::try_parse_frame(frame) {
+            return NinoTncInboundEvent::RssiReading { raw: frame, rssi };
+        }
+    }
+
+    // 4) Over-air TX-Test UI frame — only when the generic classifier already gave
     //    us a parsed AX.25 frame. Re-parse from the raw payload so the recognized
     //    pattern can borrow a slice tied to `frame` (not the moved `generic.ax25`).
     if let InboundEvent::Ax25 { .. } = &generic {
@@ -218,6 +260,34 @@ mod tests {
             classify(&raw),
             NinoTncInboundEvent::Generic(InboundEvent::Unknown { .. })
         ));
+    }
+
+    #[test]
+    fn numeric_status_report_upgrades_to_status_report() {
+        // A KISS Data frame carrying the =II: register report (fake UI header first).
+        let mut payload: Vec<u8> = b"TNC>USB:".to_vec();
+        payload.extend_from_slice(b"=00:3.44=02:0000000A=04:0000000F=06:00000002");
+        let raw = Frame::new(0, Command::Data, payload);
+        match classify(&raw) {
+            NinoTncInboundEvent::StatusReport { status, .. } => {
+                assert_eq!(status.firmware_version_raw.as_str(), "3.44");
+                assert_eq!(status.uptime_ms, Some(0x0A));
+                assert_eq!(status.running_mode.unwrap().mode, 6);
+            }
+            other => panic!("expected StatusReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rssi_reply_upgrades_to_rssi_reading() {
+        // Reply command byte 0xE0 = port 14 + Data nibble; payload "RSSI:-62.54".
+        let raw = Frame::new(14, Command::Data, b"RSSI:-62.54".to_vec());
+        match classify(&raw) {
+            NinoTncInboundEvent::RssiReading { rssi, .. } => {
+                assert_eq!(rssi.centi_db, -6254);
+            }
+            other => panic!("expected RssiReading, got {other:?}"),
+        }
     }
 
     #[test]
