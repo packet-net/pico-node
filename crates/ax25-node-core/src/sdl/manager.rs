@@ -209,6 +209,39 @@ impl<const N: usize> SessionManager<N> {
             .as_mut()
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
+
+        // Pre-session XID *command* responder (mirrors
+        // `Ax25Listener.HandleNoCachedSession`'s XID branch): a peer doing pre-SABM
+        // XID negotiation to us before any link exists — the PDN NET/ROM mod-8
+        // interlink initiator opening with XID. §4.3.3.7 makes answering an XID
+        // command unconditional; the negotiated params stage on this cached slot's
+        // context so the *subsequent* SABM's figc4.1 t14 `Set Version 2.0` (which
+        // clears only `is_extended`) preserves the staged `srej_enabled` into the
+        // established link. We answer directly (connectionless — no LM-SEIZE),
+        // matching C# `RespondToXidCommand`; no ConnectIndication is raised (the
+        // following SABM raises it). Gated on `accept_incoming`, like SABM-accept.
+        if let Event::XidReceived(fi) = &event {
+            if fi.is_command
+                && slot.session.state == super::session::State::Disconnected
+                && slot.session.context.accept_incoming
+            {
+                let command_info = fi.info.clone();
+                let response_info = super::mdl::respond_pre_session_xid(
+                    &mut slot.session.context,
+                    &command_info,
+                );
+                // XID is a U-frame (1 octet in both modulos); modulo is immaterial.
+                slot.sink.extended = slot.session.context.is_extended;
+                let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
+                    is_command: false,
+                    pf: true, // F=1 so the initiator's figc5.2 F_eq_1 diamond fires
+                    info: response_info,
+                });
+                slot.sink.sent.push(bytes);
+                return core::mem::take(&mut slot.sink.sent);
+            }
+        }
+
         // Track the link's negotiated modulo so the sink emits 2-octet extended
         // control on an I/S frame once the session is mod-128 (SABME-established).
         // is_extended is settled before any I/S frame is emitted (it is set on the
@@ -663,5 +696,119 @@ mod tests {
             "the deferred seize resumes when the channel clears: {out:02x?}"
         );
         assert!(!mgr.seize_pending(&peer));
+    }
+
+    // ─── Pre-session XID responder (mirrors Ax25ListenerPreSessionXidTests) ──
+
+    /// A mod-8 XID command offering SREJ (what a PDN interlink initiator sends
+    /// before its SABM), as a classified inbound event.
+    fn mod8_srej_xid_command() -> Event {
+        use crate::ax25::xid::{info_field, HdlcOptionalFunctions, RejectMode, XidParameters};
+        let info = info_field::encode(&XidParameters {
+            hdlc_optional_functions: Some(HdlcOptionalFunctions {
+                reject: RejectMode::SelectiveReject,
+                modulo128: false,
+                srej_multiframe: true,
+                segmenter_reassembler: false,
+            }),
+            ..Default::default()
+        });
+        Event::XidReceived(FrameInfo {
+            poll_final: true,
+            is_command: true,
+            info,
+            ..Default::default()
+        })
+    }
+
+    /// A pre-session XID command from an unknown peer is answered with an XID
+    /// *response* (F=1) that advertises SREJ — NOT a DM, and NOT a connection.
+    #[test]
+    fn pre_session_xid_command_for_unknown_peer_is_answered_with_xid_response() {
+        use crate::ax25::xid::info_field;
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        let out = mgr.post(peer, mod8_srej_xid_command(), &mut t);
+        assert_eq!(out.len(), 1, "exactly one XID response on the wire");
+
+        let reply = Frame::decode(&out[0]).expect("XID reply decodes");
+        assert!(reply.is_response(), "the answer is an XID *response*");
+        assert!(reply.poll_final(), "F=1 so the initiator's F_eq_1 diamond fires");
+        match classify_incoming(&reply) {
+            Some(Event::XidReceived(_)) => {}
+            other => panic!("expected an XID reply, got {other:?} (must not be a DM)"),
+        }
+        // The response advertises SREJ (both sides offered it).
+        let p = info_field::parse(&reply.info).expect("response info parses");
+        assert_eq!(
+            p.hdlc_optional_functions.unwrap().reject,
+            crate::ax25::xid::RejectMode::SelectiveReject
+        );
+
+        // Answering an XID command is NOT a connection: the session stays
+        // Disconnected and no ConnectIndication was raised.
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected)
+        );
+        assert!(!mgr
+            .take_upward(&peer)
+            .contains(&DataLinkSignal::ConnectIndication));
+    }
+
+    /// The SABM that follows the pre-session XID brings the session to Connected
+    /// with the XID-negotiated SREJ adopted (the staged SrejEnabled survives the
+    /// SABM's Set Version 2.0, which clears only is_extended).
+    #[test]
+    fn sabm_after_pre_session_xid_reaches_connected_with_srej_adopted() {
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // 1) Pre-session XID → XID response; still Disconnected.
+        let xid_out = mgr.post(peer, mod8_srej_xid_command(), &mut t);
+        assert_eq!(xid_out.len(), 1);
+        assert!(matches!(
+            classify_incoming(&Frame::decode(&xid_out[0]).unwrap()),
+            Some(Event::XidReceived(_))
+        ));
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected)
+        );
+
+        // 2) The peer now sends SABM → the link establishes, adopting SREJ.
+        let sabm = Event::SabmReceived(FrameInfo {
+            poll_final: true,
+            is_command: true,
+            ..Default::default()
+        });
+        let ua_out = mgr.post(peer, sabm, &mut t);
+
+        let s = mgr.session_for(&peer).expect("session exists");
+        assert_eq!(s.state, State::Connected, "the SABM establishes the link");
+        assert!(
+            s.context.srej_enabled,
+            "the XID-negotiated SREJ survives into the established session"
+        );
+        assert!(!s.context.implicit_reject);
+        // The SABM is answered with a UA (not a DM).
+        assert!(
+            ua_out
+                .iter()
+                .any(|b| matches!(classify_incoming(&Frame::decode(b).unwrap()), Some(Event::UaReceived(_)))),
+            "the SABM must be acknowledged with a UA: {ua_out:02x?}"
+        );
+        assert!(mgr
+            .take_upward(&peer)
+            .contains(&DataLinkSignal::ConnectIndication));
     }
 }

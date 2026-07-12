@@ -44,6 +44,7 @@ pub mod event;
 pub mod guard;
 pub mod loop_exec;
 pub mod manager;
+pub mod mdl;
 pub mod quirks;
 pub mod session;
 pub mod signal;
@@ -57,6 +58,10 @@ pub use context::{Payload, SessionContext};
 pub use event::{Event, FrameInfo};
 pub use loop_exec::{run_loop, MAX_ITERATIONS};
 pub use manager::{SessionManager, Slot};
+pub use mdl::{
+    apply_negotiated, apply_version_20_defaults, default_offer_for, respond_pre_session_xid,
+    respond_to_xid_command,
+};
 pub use quirks::Quirks;
 pub use session::{Session, State};
 pub use signal::{
