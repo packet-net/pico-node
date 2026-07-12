@@ -28,6 +28,17 @@ pub const OPCODE_MASK: u8 = 0x0F;
 /// The high bits of the opcode-and-flags byte (the flow-control flags).
 pub const FLAGS_MASK: u8 = 0xF0;
 
+/// Compressed (bit 4): a **BPQ-specific** extension flag marking an Information
+/// message whose payload is a zlib / RFC 1950 compressed stream rather than raw
+/// user data — LinBPQ `L4COMP` in `asmstrucs.h`. Only ever set on a circuit where
+/// both ends negotiated compression at connect time (the `L4Compress` capability
+/// handshake), so a peer that did not agree never receives it. Reassemble all the
+/// [`FLAG_MORE_FOLLOWS`] fragments first, then inflate the concatenation as one
+/// stream. Gated behind the `netrom-compress` feature so the default on-target
+/// build carries no compression surface. Mirrors C# `NetRomTransportFlags.Compressed`.
+#[cfg(feature = "netrom-compress")]
+pub const FLAG_COMPRESSED: u8 = 0x10;
+
 /// More-follows (bit 5): this Information message is a non-final fragment of a
 /// logical frame larger than one 236-byte payload.
 pub const FLAG_MORE_FOLLOWS: u8 = 0x20;
@@ -119,6 +130,13 @@ impl NetRomTransportHeader {
     /// True if the more-follows flag (bit 5) is set (a non-final fragment).
     pub const fn more_follows(&self) -> bool {
         self.flags & FLAG_MORE_FOLLOWS != 0
+    }
+
+    /// True if the compressed flag (bit 4) is set — the payload is a zlib stream
+    /// (only on a compression-negotiated circuit). Gated behind `netrom-compress`.
+    #[cfg(feature = "netrom-compress")]
+    pub const fn compressed(&self) -> bool {
+        self.flags & FLAG_COMPRESSED != 0
     }
 
     /// The raw opcode-and-flags byte (opcode nibble OR-ed with the flag bits).
