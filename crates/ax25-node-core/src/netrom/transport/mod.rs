@@ -10,6 +10,12 @@ pub mod circuit;
 pub mod circuit_manager;
 pub mod circuit_options;
 pub mod circuit_state;
+/// The parity-named (de)compressor the circuit calls over [`deflate`] — the
+/// compress / try_decompress seam for BPQ `L4Compress` interop, with the
+/// 8 KiB fail-closed cap. Gated behind `netrom-compress`. Mirrors C#
+/// `Packet.NetRom.Transport.NetRomCompression`.
+#[cfg(feature = "netrom-compress")]
+pub mod compression;
 /// The NET/ROM L4 payload (de)compression codec (zlib / RFC 1950 + DEFLATE /
 /// RFC 1951), for BPQ `L4Compress` interop. Gated behind the `netrom-compress`
 /// cargo feature so the default on-target build carries no compression code.

@@ -35,6 +35,25 @@ pub struct NetRomCircuitOptions {
     /// *choke*. Default 0 — the receiver never self-chokes (it drains promptly); a
     /// host that can stall its reader sets this so backpressure reaches the wire.
     pub choke_threshold: usize,
+    /// Offer (and accept) LinBPQ-style negotiated NET/ROM L4 payload compression on
+    /// circuits this node originates or accepts (BPQ `L4Compress`). **Default
+    /// `false`** (decline) — a circuit then runs uncompressed, which every NET/ROM
+    /// peer can read. When `true`, the circuit advertises compression in its Connect
+    /// Request / Acknowledge and only actually compresses outbound data when the
+    /// *other end* also agreed. Gated behind `netrom-compress`. Mirrors C#
+    /// `NetRomCircuitOptions.CompressionEnabled`.
+    #[cfg(feature = "netrom-compress")]
+    pub compression_enabled: bool,
+    /// The proposed session timer (T1, whole seconds) carried in the trailing 2
+    /// octets of a LinBPQ extended Connect Request — the carrier for the
+    /// compression-supported bit. Only emitted when [`compression_enabled`] is set.
+    /// Default 60 s; the high nibble is reserved for the compress flag so the value
+    /// is masked to the low 12 bits on the wire. Gated behind `netrom-compress`.
+    /// Mirrors C# `NetRomCircuitOptions.ProposedTimerSeconds`.
+    ///
+    /// [`compression_enabled`]: Self::compression_enabled
+    #[cfg(feature = "netrom-compress")]
+    pub proposed_timer_seconds: u16,
 }
 
 impl Default for NetRomCircuitOptions {
@@ -46,6 +65,10 @@ impl Default for NetRomCircuitOptions {
             time_to_live: DEFAULT_TIME_TO_LIVE,
             fragment_size: MAX_PAYLOAD,
             choke_threshold: 0,
+            #[cfg(feature = "netrom-compress")]
+            compression_enabled: false,
+            #[cfg(feature = "netrom-compress")]
+            proposed_timer_seconds: 60,
         }
     }
 }
