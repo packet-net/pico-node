@@ -6,7 +6,7 @@ pico-node is node **firmware people build a real node with** — so radios (a Ni
 
 ## Where it stands today (2026-07-12, after the Fable wave)
 
-`crates/ax25-node-core` builds `thumbv6m-none-eabi` `no_std`+`alloc`; the `ax25-node-fw` crate cross-compiles. Health on `main`: **632 core host tests** green, `clippy -D warnings` clean, the `no_std` build clean, both fw `--locked` gates green, and the parity drift-guard passing (0 gaps).
+`crates/ax25-node-core` builds `thumbv6m-none-eabi` `no_std`+`alloc`; the `ax25-node-fw` crate cross-compiles. Health on `main`: **717 core host tests** green, `clippy -D warnings` clean, the `no_std` build clean, both fw `--locked` gates green, and the parity drift-guard passing (0 gaps).
 
 > **The old June "current state" in this doc was stale.** A fresh recon (2026-07-12) found the tree far more complete than recorded — full detail in **[Delivered — 2026-07-12 Fable wave](#delivered--2026-07-12-fable-wave)**. In brief: NET/ROM L4 + NODES origination + INP3 were *already* built (not "read-only"); mod-128 was genuinely missing *at the wire codec* (now shipped); the radio stack was greenfield (now shipped); no shared golden vectors existed (now built).
 
@@ -33,18 +33,29 @@ A parallel implementation wave — recon fan-out → 7 isolated git worktrees �
 | parity CI | cross-stack drift-guard: `scripts/parity-check.mjs` + vendored 50-item C# inventory + `parity-exceptions.json` + self-hosted `.github/workflows/parity.yml` | #53 |
 | fw wiring | NODES obsolescence-sweep fix, origination + RX-observe on RF, `kiss_serial` pump+spawn, new Tait CCDI transport — **compile-validated only, no hardware run** (also repaired a fw-build break from #58's new enum variants) | #60 |
 
-### 3-way parity mirror (cross-repo, in review)
-`interop.yml` (packet.net **#605**) and `parity-check.mjs` + `ci.yml` (ax25-ts **#73**) gain a `--rust` leg so the mirror is a true 3-way gate — C# `Packet.*` ⊆ TS `@packet-net/ax25` ⊆ Rust pico-node, drift failing on whichever side introduces it. Reuses the live C# extraction (single source of truth) against pico-node's manifest/exceptions. Held pending their own CI.
+### Shipped — "land everything not explicitly deferred" pass (PRs #62–#63)
+
+The In/Yes picks that had slipped to follow-up were then landed:
+
+| Area | What shipped | PR |
+|---|---|---|
+| D · SDM | **SDM link** (`SdmTuningLink`) over the CCDI driver — receipt-tolerant default (returns on radio-accept; a delivered send with **no** over-air receipt is *not* an error — the TM8110 SDM auto-ack refractory finding), retry-on-reject, sequence dedupe | #62 |
+| A · XID | **XID/MDL keystone** — XID info-field TLV codec (spec Fig 4.5–4.6 golden bytes), pre-session XID responder, peer-capability cache, **activates SREJ** (negotiated-SREJ link now emits SREJ — was dormant), `prefer_extended_connect` **default → on** + DM-degrade regression, XID golden vectors | #63 |
+
+This retires the earlier "SREJ / v2.2 shipped but dormant" caveat: SREJ now activates on a negotiated link, and pico dials SABME-first by default. **717 core tests** on `main`; both fw `--locked` gates + drift-guard green.
+
+### 3-way parity mirror (cross-repo — merged)
+`interop.yml` (packet.net **#605**) and `parity-check.mjs` + `ci.yml` (ax25-ts **#73**) gained a `--rust` leg so the mirror is a true 3-way gate — C# `Packet.*` ⊆ TS `@packet-net/ax25` ⊆ Rust pico-node, drift failing on whichever side introduces it. Reuses the live C# extraction (single source of truth) against pico-node's manifest/exceptions. **Both merged** (validated locally: three legs green, backward-compatible, and the Rust leg bites on injected drift).
 
 ### Decision reconciliations
 - **INP3 (decided "Later, leave a seam")** — it turned out *fully built and byte-identical*. Retroactively cargo-gating it would **diverge from the C# reference** (which also ships it always-compiled, runtime-gated). Resolution: **left as-is — present, runtime-gated *off* by default**; the wire form degrades exactly to plain NET/ROM when disabled, which honours "leave a seam" without divergence.
-- **`prefer_extended_connect`** shipped **default-off** (pico keeps dialing mod-8) because #48 DM-degrade wasn't co-landed in the codec branch. Both are on `main` now, so a follow-up can flip it to C#'s default-on with a DM-refusing-peer regression test.
+- **`prefer_extended_connect`** shipped default-off in #56 (pending #48), then **flipped to default-on in #63** with a DM-refusing-peer degrade-to-mod-8 regression — pico now dials SABME-first, matching C# `PreferExtendedConnect`.
+- **XID / MDL responder + `preConnectXid` cache** (decided In) shipped in #63; **SDM link** (decided Yes) shipped in #62. The one deferred sub-piece is the initiator XID probe (below).
 
-### Still open (follow-ups — not this wave)
-- **XID / MDL pre-session responder + per-call `preConnectXid` capability cache** (table A) — deferred: entangled in `bridge.rs`/`context.rs`/`manager.rs`, best as its own focused branch atop the mod-128 codec.
+### Still open (follow-ups)
+- **Initiator pre-connect XID *probe*** (`NegotiateSrejBeforeConnectAsync` — proactively send our XID *before* we dial, bounded-wait, merge). The XID *responder* + peer-capability cache landed (#63); the initiator half is an inherently async, fw-side multi-step flow left as a clean follow-on — the `mdl::apply_negotiated` merge + `capability.rs`/`connect_planned` dial seam are in place for it.
 - **SDL version skew** — Rust `ax25sdl` 0.8.0 vs C# `Packet.Ax25.Sdl` 0.10.0, pico floats on `main`. Recorded in `parity-manifest.toml [sdl]`; pin to a matching `crate-v*` tag. Only bites SDL-*driven* session vectors, not pure codecs.
 - **fw bench validation** — everything in #60 is compile-only; sweep timing, on-air NODES visibility, the `kiss_serial` pump under live NinoTNC traffic, and the Tait CCDI transact/demux all need the hardware-bringup session.
-- **SDM *link*** (`SdmTuningLink` retry/dedupe) — the telegram codec shipped; the link rides the now-present CCDI driver and is a clean follow-up.
 - **Optional NET/ROM parity** — L4 payload compression (needs a `no_std` deflate — a dependency decision) and NODESPACLEN per-port fragmentation; both default-off in C#, so interop is unaffected today.
 
 ## Parity discipline
@@ -69,10 +80,10 @@ A parallel implementation wave — recon fan-out → 7 isolated git worktrees �
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
 | **mod-128 (extended) framing** — SABME/extended control octets | NONE (its own flagged follow-up) | 🔒 | In | In · ✅ #56 |
-| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | In · ✅ #56 (`prefer_extended_connect` default-off pending #48 co-land) |
-| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | In · ✅ mod-128 SREJ #56 + #55 clamp |
-| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | In · ⏳ follow-up (entangled; own branch) |
-| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | In · ⏳ follow-up (rides XID) |
+| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | In · ✅ #56 codec; **#63 flips default on** (SABME-first) + DM-degrade regression |
+| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | In · ✅ codec #56/#55; **activated via XID negotiation #63** (was dormant) |
+| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | In · ✅ **#63** responder + TLV codec + activation (initiator *probe* = residual) |
+| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | In · ✅ **#63** (peer-capability cache + dial seam) |
 | **Carrier-sense (CSMA) seam** (`ICarrierSense` parity) | NONE | 🔒/🔧 | In (needed for any keyed modem) | In · ✅ #56 (default always-clear) |
 | **figc4.x quirks added after #47** (if any landed) | HAS #38–47 | 🔒 | In (audit) | In (audit) · ✅ #55 adds #48/#9/#13 → 11/12 |
 
@@ -99,7 +110,7 @@ A parallel implementation wave — recon fan-out → 7 isolated git worktrees �
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | Yes · ✅ telegram+meter codec #59 (link = follow-up) |
+| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | Yes · ✅ codec #59 + **link #62** (receipt-tolerant default) |
 | **Mode coordination / TXDELAY-min / station-hail / deviation assist** | NONE | 🔒 (telegrams) 🔧 | Later — nice but heavy; depends on C + SDM | Later |
 
 ## E. Node-host services
@@ -136,4 +147,4 @@ Two caveats that keep a "skipped" 🔒 item honest:
 
 ---
 
-*Living document. The **decision** columns are the calls made; a ✅ marks what shipped in the 2026-07-12 Fable wave (pico-node PRs #53–#60, cross-repo mirror #605/#73). Last updated 2026-07-12 against the fresh recon, the merged wave, and packet.net's parity discipline.*
+*Living document. The **decision** columns are the calls made; a ✅ marks what shipped (pico-node PRs #53–#63; cross-repo mirror #605/#73, merged). Last updated 2026-07-12 against the fresh recon, the two merged waves, and packet.net's parity discipline.*
