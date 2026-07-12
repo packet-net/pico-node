@@ -24,6 +24,7 @@
 //! an `async` request/response over [`crate::kiss::serial::ByteStream`].
 
 pub mod ccdi;
+pub mod driver;
 
 /// The CCDI serial rate these radios are commonly programmed for. The radio's
 /// programmed rate wins — 1200 to 115200 are all possible (manual §1.8). Mirrors
