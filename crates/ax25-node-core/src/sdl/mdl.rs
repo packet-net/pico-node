@@ -183,6 +183,35 @@ pub fn respond_pre_session_xid(context: &mut SessionContext, command_info: &[u8]
     info_field::encode(&agreed)
 }
 
+/// Seed `context` SREJ-capable for an **initiator** pre-connect XID *probe* and
+/// return the parameter set to advertise in the outbound XID command. This is the
+/// offer step of the LinBPQ SREJ accommodation: on a mod-8 dial we send an XID
+/// command *before* the SABM (BPQ only honours an XID that precedes the SABM), so
+/// [`default_offer_for`] must read a SREJ-capable context to advertise SREJ + the
+/// OPSREJMult bit BPQ requires. The caller encodes the returned parameters, puts them
+/// on the wire as an XID *command*, and keeps the offer to merge against the peer's
+/// response via [`apply_negotiated`]. Mirrors the offer step of
+/// `Ax25Listener.NegotiateSrejBeforeConnectAsync` (`ctx.SrejEnabled = true;
+/// ctx.ImplicitReject = false;` then `cached.Mdl.Negotiate()` advertising
+/// `DefaultOfferFor(ctx)`).
+pub fn begin_pre_connect_xid(context: &mut SessionContext) -> XidParameters {
+    context.srej_enabled = true;
+    context.implicit_reject = false;
+    default_offer_for(context)
+}
+
+/// Revert `context` to go-back-N after a pre-connect XID probe went unanswered
+/// (bounded-wait timeout / MDL give-up): we never put SREJ on the wire unilaterally,
+/// so a silent peer degrades us cleanly to implicit reject before the plain SABM.
+/// Mirrors the `if (!confirmed)` fallback of
+/// `Ax25Listener.NegotiateSrejBeforeConnectAsync` (`ctx.SrejEnabled = false;
+/// ctx.ImplicitReject = true;`). The merge on a *confirmed* response is
+/// [`apply_negotiated`] instead — this is only the no-response leg.
+pub fn revert_pre_connect_xid(context: &mut SessionContext) {
+    context.srej_enabled = false;
+    context.implicit_reject = true;
+}
+
 /// Lesser of two notification values, treating absence as "no constraint".
 fn min_present(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
@@ -447,5 +476,73 @@ mod tests {
             p.hdlc_optional_functions.unwrap().reject,
             RejectMode::SelectiveReject
         );
+    }
+
+    // ─── Initiator pre-connect probe (mirrors NegotiateSrejBeforeConnectAsync) ─
+
+    /// The offer step: `begin_pre_connect_xid` seeds the context SREJ-capable and
+    /// returns a mod-8 offer advertising SREJ + the OPSREJMult bit BPQ requires.
+    #[test]
+    fn begin_pre_connect_xid_offers_srej_and_seeds_the_context() {
+        let mut c = ctx();
+        assert!(!c.srej_enabled, "starts go-back-N");
+        let offer = begin_pre_connect_xid(&mut c);
+        // Context is now SREJ-capable so the merge on a matching response keeps SREJ.
+        assert!(c.srej_enabled);
+        assert!(!c.implicit_reject);
+        // The offer advertises SREJ, mod-8, and SREJ-multiframe (BPQ's OPSREJMult).
+        let hdlc = offer.hdlc_optional_functions.expect("offer carries HDLC opts");
+        assert_eq!(hdlc.reject, RejectMode::SelectiveReject);
+        assert!(!hdlc.modulo128, "a mod-8 probe stays mod-8");
+        assert!(hdlc.srej_multiframe, "OPSREJMult set — BPQ requires it");
+    }
+
+    /// The confirmed-response leg: our probe offer merged against a peer response
+    /// that also offers SREJ lands SREJ-enabled + mod-8 (the mutual result).
+    #[test]
+    fn pre_connect_xid_response_offering_srej_negotiates_srej() {
+        let mut c = ctx();
+        let offer = begin_pre_connect_xid(&mut c);
+        let response = XidParameters {
+            hdlc_optional_functions: Some(HdlcOptionalFunctions {
+                reject: RejectMode::SelectiveReject,
+                modulo128: false,
+                srej_multiframe: true,
+                segmenter_reassembler: false,
+            }),
+            ..Default::default()
+        };
+        apply_negotiated(&mut c, &offer, &response);
+        assert!(c.srej_enabled, "both offered SREJ ⇒ SREJ on the link");
+        assert!(!c.implicit_reject);
+        assert!(!c.is_extended, "a mod-8 probe never flips to mod-128");
+    }
+
+    /// The no-response leg: `revert_pre_connect_xid` undoes the seeded SREJ so a
+    /// silent peer degrades to go-back-N — we never put SREJ on the wire alone.
+    #[test]
+    fn revert_pre_connect_xid_falls_back_to_go_back_n() {
+        let mut c = ctx();
+        let _ = begin_pre_connect_xid(&mut c);
+        assert!(c.srej_enabled, "seeded on");
+        revert_pre_connect_xid(&mut c);
+        assert!(!c.srej_enabled, "reverted off for a silent peer");
+        assert!(c.implicit_reject);
+    }
+
+    /// A peer that answers the probe but offers REJ makes the lesser-of merge revert
+    /// our seeded SREJ — the confirmed-but-no-SREJ outcome (distinct from silence,
+    /// but the resulting link parameters are the same go-back-N).
+    #[test]
+    fn pre_connect_xid_response_offering_rej_reverts_to_go_back_n() {
+        let mut c = ctx();
+        let offer = begin_pre_connect_xid(&mut c);
+        let response = XidParameters {
+            hdlc_optional_functions: Some(hdlc(false, false)), // REJ, mod-8
+            ..Default::default()
+        };
+        apply_negotiated(&mut c, &offer, &response);
+        assert!(!c.srej_enabled, "peer offered REJ ⇒ merge reverts SREJ off");
+        assert!(c.implicit_reject);
     }
 }
