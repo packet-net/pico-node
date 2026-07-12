@@ -40,6 +40,7 @@ pub mod console;
 pub mod crc;
 pub mod kiss;
 pub mod netrom;
+pub mod radio;
 pub mod sdl;
 
 /// The node software version, surfaced by the `Info` console command (mirrors
