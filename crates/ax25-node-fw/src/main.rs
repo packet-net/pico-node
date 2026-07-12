@@ -389,6 +389,18 @@ mod firmware {
             cfg.identity.alias,
         )));
 
+        // --- Tait CCDI radio control on a SECOND UART: UART0 GP0(TX)/GP1(RX),
+        // distinct from the NinoTNC KISS link on UART1. Drives the core CCDI driver
+        // (RSSI / PTT / channel / carrier-sense). Always spawns (no build-env target
+        // for a physical UART); it self-quiets if no Tait radio answers. COMPILE-
+        // VALIDATED ONLY — the live exchange needs a Tait radio on GP0/GP1. ---
+        spawner.spawn(defmt::unwrap!(transports::tait_ccdi::task(
+            p.UART0,
+            p.PIN_0,
+            p.PIN_1,
+            cfg.tait.clone(),
+        )));
+
         // The session supervisor (shared Sessions across transports) is the next seam.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
