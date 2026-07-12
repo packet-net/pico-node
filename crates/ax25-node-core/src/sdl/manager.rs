@@ -41,17 +41,47 @@ pub struct Slot {
 #[derive(Debug)]
 pub struct SessionManager<const N: usize> {
     local: Callsign,
+    /// Whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial. See
+    /// [`Self::with_prefer_extended_connect`].
+    prefer_extended_connect: bool,
     slots: [Option<Slot>; N],
 }
 
 impl<const N: usize> SessionManager<N> {
     /// Build a manager for the node's own `local` callsign with all slots free.
+    /// A plain [`Self::connect`] dials mod-8 (SABM) by default; see
+    /// [`Self::with_prefer_extended_connect`].
     pub fn new(local: Callsign) -> Self {
         Self {
             local,
+            prefer_extended_connect: false,
             // `Option<Slot>` isn't `Copy`, so build the array element-by-element.
             slots: core::array::from_fn(|_| None),
         }
+    }
+
+    /// Set whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial with
+    /// SABM/mod-8 fallback on refusal, returning `self` for chaining. Mirrors the
+    /// listener option `Ax25ListenerOptions.PreferExtendedConnect` (Ax25Listener.cs:1712)
+    /// — but where the C# default is `true`, pico defaults **false** to preserve the
+    /// historical mod-8 dial: the SABME→SABM degrade is only half-wired (FRMR
+    /// fallback #45 is present; the DM-refusal degrade #48 is owned by another track),
+    /// so a mod-128-preferred default could strand a connect to a DM-refusing peer
+    /// until #48 lands. Callers opt in per manager here, or per dial via
+    /// [`Self::connect_extended`].
+    pub fn with_prefer_extended_connect(mut self, prefer: bool) -> Self {
+        self.prefer_extended_connect = prefer;
+        self
+    }
+
+    /// Set the [`Self::with_prefer_extended_connect`] preference in place.
+    pub fn set_prefer_extended_connect(&mut self, prefer: bool) {
+        self.prefer_extended_connect = prefer;
+    }
+
+    /// Whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial.
+    pub fn prefer_extended_connect(&self) -> bool {
+        self.prefer_extended_connect
     }
 
     /// The node's local callsign.
@@ -161,6 +191,47 @@ impl<const N: usize> SessionManager<N> {
         // here — its upward signals (DisconnectIndication/-Confirm) haven't
         // been drained yet, and freeing now would lose them (found wiring the
         // firmware's link-failure path). Call [`Self::reap`] after draining.
+    }
+
+    /// Initiate an outbound connect to `peer` from the manager's local callsign,
+    /// choosing the modulo from [`Self::prefer_extended_connect`]. Convenience over
+    /// [`Self::connect_extended`]; mirrors `Ax25Listener.ConnectAsync(remote, local, ct)`
+    /// (which uses the listener's `PreferExtendedConnect` default).
+    pub fn connect(&mut self, peer: Callsign, timers: &mut dyn TimerService) -> Vec<Vec<u8>> {
+        self.connect_extended(self.local, peer, self.prefer_extended_connect, timers)
+    }
+
+    /// Initiate an outbound connect to `peer` from `local`, explicitly choosing the
+    /// modulo. `extended = true` dials mod-128 (SABME) with SABM/mod-8 fallback on a
+    /// peer's refusal; `false` dials plain mod-8 (SABM). Sets the session's
+    /// `is_extended` **before** posting `DL-CONNECT-request`, so — with the default
+    /// quirks — an extended dial routes through `AwaitingV22Connection` (figc4.6, via
+    /// #44) and `Establish_Data_Link` emits SABME, and a subsequent FRMR refusal
+    /// degrades to a mod-8 SABM re-establishment (#45). A cached session re-dialled
+    /// after a prior fallback dropped it to mod-8 is re-armed to the caller's
+    /// preference here. Mirrors `Ax25Listener.ConnectAsync(remote, local, bool
+    /// extended, …)` (Ax25Listener.cs:412 sets `Context.IsExtended = extended`).
+    ///
+    /// Returns the wire frames emitted (the SABM/SABME), or empty if the manager is
+    /// full and `peer` has no slot.
+    pub fn connect_extended(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        extended: bool,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        let Some(i) = self.ensure_slot(peer, local) else {
+            return Vec::new();
+        };
+        // Choose the version before posting DL-CONNECT-request (Ax25Listener.cs:412).
+        self.slots[i]
+            .as_mut()
+            .expect("slot just ensured to be present")
+            .session
+            .context
+            .is_extended = extended;
+        self.post_with_local(local, peer, Event::DlConnectRequest, timers)
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -282,6 +353,123 @@ mod tests {
         mgr.post(call("G7AAA"), sabm(), &mut t);
         assert!(!mgr.reap(&call("G7AAA")));
         assert_eq!(mgr.active(), 1);
+    }
+
+    /// Decode `bytes` and return the classified event kind (mod-8 — the connect
+    /// handshake is all U-frames, 1 octet in both modulos).
+    fn classify(bytes: &[u8]) -> Event {
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+        classify_incoming(&Frame::decode(bytes).expect("emitted frame decodes"))
+            .expect("classifies")
+    }
+
+    #[test]
+    fn connect_extended_true_dials_sabme_and_routes_to_v22() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        let out = mgr.connect_extended(call("M0LTE-1"), peer, true, &mut t);
+        assert_eq!(out.len(), 1, "one SABME on the wire");
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+        let s = mgr.session_for(&peer).unwrap();
+        assert_eq!(s.state, State::AwaitingV22Connection);
+        assert!(s.context.is_extended, "mod-128 preference set on the session");
+    }
+
+    #[test]
+    fn connect_extended_false_dials_sabm_mod8() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        let out = mgr.connect_extended(call("M0LTE-1"), peer, false, &mut t);
+        assert_eq!(out.len(), 1, "one SABM on the wire");
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+        let s = mgr.session_for(&peer).unwrap();
+        assert_eq!(s.state, State::AwaitingConnection);
+        assert!(!s.context.is_extended);
+    }
+
+    #[test]
+    fn plain_connect_honours_prefer_extended_default() {
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // Default (false) ⇒ mod-8 SABM — preserves historical pico behaviour.
+        let mut mgr_default: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        assert!(!mgr_default.prefer_extended_connect());
+        let out = mgr_default.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+
+        // Opt in ⇒ mod-128 SABME.
+        let mut mgr_ext: SessionManager<2> =
+            SessionManager::new(call("M0LTE-1")).with_prefer_extended_connect(true);
+        assert!(mgr_ext.prefer_extended_connect());
+        let out = mgr_ext.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+    }
+
+    #[test]
+    fn extended_dial_accepted_reaches_connected_mod128_over_the_wire() {
+        // Full accepted path: A dials SABME, B (answerer) adopts mod-128 and replies
+        // UA, A confirms Connected with is_extended set. Two managers exchanging the
+        // exact wire octets — the initiator preference yields a real mod-128 link.
+        let mut a: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut b: SessionManager<2> = SessionManager::new(call("M0LTE-2"));
+        let mut t = MockTimerService::new();
+        let (ca, cb) = (call("M0LTE-1"), call("M0LTE-2"));
+
+        // A → SABME.
+        let sabme = a.connect_extended(ca, cb, true, &mut t);
+        assert!(matches!(classify(&sabme[0]), Event::SabmeReceived(_)));
+
+        // B receives SABME ⇒ adopts v2.2, replies UA, enters Connected extended.
+        let from_b = b.post(ca, classify(&sabme[0]), &mut t);
+        let sb = b.session_for(&ca).unwrap();
+        assert_eq!(sb.state, State::Connected);
+        assert!(sb.context.is_extended, "answerer adopts mod-128 from the SABME");
+        assert_eq!(from_b.len(), 1);
+        assert!(matches!(classify(&from_b[0]), Event::UaReceived(_)));
+
+        // B's UA arrives at A ⇒ A confirms Connected, still mod-128.
+        let _ = a.post(cb, classify(&from_b[0]), &mut t);
+        let sa = a.session_for(&cb).unwrap();
+        assert_eq!(sa.state, State::Connected);
+        assert!(sa.context.is_extended, "initiator link is mod-128");
+    }
+
+    #[test]
+    fn extended_dial_degrades_to_mod8_sabm_on_frmr() {
+        // The v2.2-preferred connect's fallback leg: an extended dial that a
+        // pre-v2.2 peer refuses with FRMR degrades to a mod-8 SABM re-establishment
+        // (#45 forces version 2.0 before Establish_Data_Link re-runs). This path is
+        // only reachable because the initiator preference set is_extended = true.
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        let out = mgr.connect_extended(call("M0LTE-1"), peer, true, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+        assert!(mgr.session_for(&peer).unwrap().context.is_extended);
+
+        // Peer refuses SABME with FRMR (final).
+        let frmr = Event::FrmrReceived(FrameInfo {
+            poll_final: true,
+            is_command: false,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, frmr, &mut t);
+
+        // Degraded: version forced to 2.0, and a mod-8 SABM re-establishment emitted.
+        let s = mgr.session_for(&peer).unwrap();
+        assert!(!s.context.is_extended, "FRMR degraded the link to mod-8");
+        assert_eq!(s.state, State::AwaitingConnection);
+        let re_sabm = out
+            .iter()
+            .any(|b| matches!(classify(b), Event::SabmReceived(_)));
+        assert!(re_sabm, "expected a mod-8 SABM re-establishment: {out:02x?}");
     }
 
     /// The relay regression: an I-frame received while we have nothing to send
