@@ -53,6 +53,15 @@ impl Recorder {
             })
             .collect()
     }
+    fn supervisory(&self) -> Vec<(SupervisoryKind, u8)> {
+        self.frames
+            .iter()
+            .filter_map(|f| match f {
+                FrameSpec::Supervisory { kind, nr, .. } => Some((*kind, *nr)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// A frame-info for a received frame with the given P/F + command bit.
@@ -573,6 +582,64 @@ fn go_back_n_window_not_capped_even_with_quirk_on() {
     s.context.srej_enabled = false;
     assert!(s.context.quirks.clamp_srej_window_to_half_modulus);
     assert_eq!(s.context.effective_window(), 7);
+}
+
+// ─── SREJ activation via negotiated XID ─────────────────────────────────────
+
+/// The point of the XID/MDL work: once XID negotiation sets `srej_enabled`
+/// (task 3's responder / `apply_negotiated`), the connected-mode machine actually
+/// *uses* Selective Reject. An out-of-sequence I-frame on a negotiated-SREJ link
+/// provokes an SREJ (requesting the single gap), where a go-back-N link falls back
+/// to REJ. Before this work `srej_enabled` was never set, so the SREJ recovery code
+/// — though present and correct — was dead on-air.
+#[test]
+fn negotiated_srej_link_emits_srej_on_out_of_sequence_i_frame() {
+    let mut s = connected_session();
+    // As left by a successful XID negotiation (mdl::apply_negotiated / the
+    // pre-session responder): Selective Reject enabled on the link.
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // Expecting N(S)=V(R)=0; receive N(S)=1 — frame 0 is the gap.
+    s.post_event(Event::IReceived(rx_i(1, 0, false)), &mut t, &mut r);
+
+    // A negotiated-SREJ link recovers with SREJ (not REJ), targeting the gap V(R)=0.
+    let sup = r.supervisory();
+    assert!(
+        sup.iter().any(|(k, nr)| *k == SupervisoryKind::Srej && *nr == 0),
+        "negotiated SREJ link must emit an SREJ for the gap: {sup:?}"
+    );
+    assert!(
+        !sup.iter().any(|(k, _)| *k == SupervisoryKind::Rej),
+        "a SREJ link must not fall back to REJ: {sup:?}"
+    );
+    // The out-of-sequence frame is stored pending the retransmission of the gap.
+    assert!(s.context.stored_received_i_frames.contains_key(&1));
+}
+
+/// The contrast: with SREJ *not* negotiated (go-back-N, the default before XID),
+/// the same out-of-sequence I-frame provokes REJ, not SREJ — proving the SREJ path
+/// is genuinely gated on the XID-negotiated `srej_enabled`.
+#[test]
+fn go_back_n_link_emits_rej_not_srej_on_out_of_sequence_i_frame() {
+    let mut s = connected_session();
+    assert!(!s.context.srej_enabled, "default: SREJ not negotiated");
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::IReceived(rx_i(1, 0, false)), &mut t, &mut r);
+
+    let sup = r.supervisory();
+    assert!(
+        sup.iter().any(|(k, _)| *k == SupervisoryKind::Rej),
+        "a go-back-N link recovers with REJ: {sup:?}"
+    );
+    assert!(
+        !sup.iter().any(|(k, _)| *k == SupervisoryKind::Srej),
+        "SREJ must stay dormant without XID negotiation: {sup:?}"
+    );
 }
 
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
