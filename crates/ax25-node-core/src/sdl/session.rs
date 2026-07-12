@@ -173,9 +173,16 @@ impl Session {
         let _ = snapshot; // restore is only reachable on the (panic) error path,
                           // which on-target aborts via panic-probe; kept for parity.
 
-        // #45 pre-execution quirk: force v2.0 before the FRMR-fallback actions run,
-        // so Establish_Data_Link emits SABM (not SABME) on a pre-v2.2 peer's FRMR.
-        self.apply_pre_execution_quirks(t);
+        // #48 DM-degrade: a DM received in AwaitingV22Connection means the peer can't
+        // do v2.2, so degrade to v2.0/SABM like the FRMR fallback — substitute the
+        // matched DM transition for figc4.6's t14_frmr_received (v2.0 re-establish),
+        // NOT the figure-literal F=1 teardown. Ports `ResolveDmDegradeMatch`.
+        let t = self.resolve_dm_degrade_match(t, page);
+
+        // #45 / #48 pre-execution quirks: force v2.0 before the FRMR-fallback (or
+        // substituted-DM) actions run, so Establish_Data_Link emits SABM (not SABME)
+        // on a pre-v2.2 peer's FRMR/DM.
+        self.apply_pre_execution_quirks(t, &event);
 
         // Run the action chain (with its loop_while ranges) against the context.
         {
@@ -203,13 +210,59 @@ impl Session {
         State::from_name(t.next)
     }
 
+    /// figc4.6 DM-no-degrade gap (#48): when a `DM received` fires in
+    /// AwaitingV22Connection while the link is still extended, substitute the matched
+    /// DM transition (either F-branch — the F=1 teardown or the F=0 passive drop) for
+    /// figc4.6's `t14_frmr_received` (the v2.0 re-establish: SRT reset →
+    /// Establish_Data_Link → AwaitingConnection), so a DM degrades the link to v2.0
+    /// and re-establishes via SABM exactly like the FRMR fallback (#45). The
+    /// companion `is_extended=false` force ([`apply_pre_execution_quirks`]) makes
+    /// Establish_Data_Link emit SABM. Scope is tight: only a `DMReceived` trigger,
+    /// only from AwaitingV22Connection, only while extended. Ports
+    /// `Ax25Session.ResolveDmDegradeMatch`.
+    fn resolve_dm_degrade_match(
+        &self,
+        matched: &'static TransitionSpec,
+        page: &'static StatePage,
+    ) -> &'static TransitionSpec {
+        if !self.context.quirks.dm_rejection_degrades_to_v20
+            || !self.context.is_extended
+            || matched.on != Sdl::DMReceived
+            || matched.from != "AwaitingV22Connection"
+        {
+            return matched;
+        }
+
+        for t in page.transitions {
+            if t.on == Sdl::FRMRReceived {
+                return t;
+            }
+        }
+
+        matched // defensive: figc4.6 always carries t14_frmr_received
+    }
+
     /// Apply quirks that must take effect *before* a transition's actions run:
-    /// the #45 figc4.6 FRMR-fallback ordering fix. Ports `ApplyPreExecutionQuirks`.
-    fn apply_pre_execution_quirks(&mut self, t: &TransitionSpec) {
+    /// the #45 figc4.6 FRMR-fallback ordering fix, and the #48 companion DM-degrade
+    /// force. Ports `ApplyPreExecutionQuirks`.
+    fn apply_pre_execution_quirks(&mut self, t: &TransitionSpec, event: &Event) {
         if self.context.quirks.frmr_fallback_reestablishes_v20
             && self.context.is_extended
             && t.from == "AwaitingV22Connection"
             && t.on == Sdl::FRMRReceived
+        {
+            self.context.is_extended = false;
+        }
+
+        // #48 companion: the DM's match has been substituted for t14_frmr_received
+        // (so `t.on` is now FRMRReceived and the #45 branch above already fired when
+        // #45 is on). Key this on the actual DM *trigger* so #48 stays self-contained
+        // even with #45 off — otherwise Establish_Data_Link would re-emit SABME (still
+        // extended) and the degrade would loop against the non-v2.2 peer.
+        if self.context.quirks.dm_rejection_degrades_to_v20
+            && self.context.is_extended
+            && matches!(event, Event::DmReceived(_))
+            && t.from == "AwaitingV22Connection"
         {
             self.context.is_extended = false;
         }

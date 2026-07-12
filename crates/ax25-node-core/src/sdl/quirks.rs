@@ -49,6 +49,16 @@ pub struct Quirks {
     /// Force version 2.0 up front for the AwaitingV22Connection FRMR_received
     /// transition (ax25spec#45, direwolf's pre-establish set_version_2_0).
     pub frmr_fallback_reestablishes_v20: bool,
+    /// figc4.6's `DM received` handler tears the link down to Disconnected on the
+    /// F=1 branch (§975 refusal) with no fallback, leaving `is_extended` stuck true.
+    /// But a DM is precisely the signal that the peer can't do v2.2 (it doesn't
+    /// recognise our SABME), so — like the FRMR fallback (#45) — it must degrade to
+    /// v2.0/SABM, not fail. On a DM (either F-branch) in AwaitingV22Connection,
+    /// substitute the `t14_frmr_received` v2.0 re-establish transition and force
+    /// version 2.0 before the actions run (so Establish_Data_Link emits SABM). This
+    /// is the XRouter-style DM-refusal degrade (ax25spec#48, packet.net Ax25Session
+    /// ResolveDmDegradeMatch).
+    pub dm_rejection_degrades_to_v20: bool,
     /// figc4.5's in-sequence I_received stored-frame drain loop draws
     /// `V(r) := V(r) - 1`, where the structurally-identical figc4.4 handler uses
     /// `+ 1`. The drain must ADVANCE V(R) past each delivered stored frame; rewrite
@@ -67,6 +77,7 @@ impl Default for Quirks {
             dl_flow_off_enters_busy: true,
             mod128_connect_routes_to_v22: true,
             frmr_fallback_reestablishes_v20: true,
+            dm_rejection_degrades_to_v20: true,
             timer_recovery_drain_advances_vr: true,
         }
     }
@@ -83,6 +94,7 @@ impl Quirks {
             dl_flow_off_enters_busy: false,
             mod128_connect_routes_to_v22: false,
             frmr_fallback_reestablishes_v20: false,
+            dm_rejection_degrades_to_v20: false,
             timer_recovery_drain_advances_vr: false,
         }
     }

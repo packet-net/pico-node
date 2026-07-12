@@ -410,6 +410,53 @@ fn extended_connect_stays_mod8_route_with_quirk_off() {
     assert_eq!(s.state, State::AwaitingConnection);
 }
 
+// ─── Quirk: #48 DM refusal degrades an extended connect to v2.0/SABM ─────────
+
+#[test]
+fn extended_dm_refusal_degrades_to_v20_with_quirk_on() {
+    // Initiator prefers v2.2: an extended DL-CONNECT routes to AwaitingV22Connection
+    // (#44) and Establish_Data_Link sends SABME.
+    let mut s = Session::new();
+    s.context.is_extended = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::DlConnectRequest, &mut t, &mut r);
+    assert_eq!(s.state, State::AwaitingV22Connection);
+    assert_eq!(r.unnumbered(), vec![UnnumberedKind::Sabme]);
+    r.frames.clear();
+
+    // XRouter-style refusal: DM(F=1) answering our polled SABME. With #48 on this
+    // degrades to v2.0 (re-establish via SABM) instead of tearing down.
+    s.post_event(Event::DmReceived(rx(true, false)), &mut t, &mut r);
+
+    // Substituted t14_frmr_received: → AwaitingConnection, mod-8, SABM on the wire.
+    assert_eq!(s.state, State::AwaitingConnection);
+    assert!(!s.context.is_extended); // forced to v2.0 so Establish emits SABM
+    assert_eq!(r.unnumbered(), vec![UnnumberedKind::Sabm]);
+}
+
+#[test]
+fn extended_dm_refusal_tears_down_with_quirk_off() {
+    let mut s = Session::new();
+    s.context.is_extended = true;
+    s.context.layer3_initiated = true;
+    s.context.quirks = Quirks::strictly_faithful();
+    // Park directly in the extended-establishment state (with #44 off an extended
+    // connect wouldn't route here; the DM handling is what's under test).
+    s.state = State::AwaitingV22Connection;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::DmReceived(rx(true, false)), &mut t, &mut r);
+
+    // figc4.6 t11_dm_received_yes as drawn (F=1): §975 refusal → Disconnected, with
+    // is_extended left stuck true and no SABM re-establish (the defect #48 fixes).
+    assert_eq!(s.state, State::Disconnected);
+    assert!(s.context.is_extended);
+    assert!(r.unnumbered().is_empty());
+}
+
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
 
 #[test]
