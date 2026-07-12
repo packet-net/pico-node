@@ -14,6 +14,13 @@
 //! - [`MeterReport`] — the `MS`-verb measurement payload (`MeterReport.cs`), with
 //!   the canonical `dec/n|fec:…|clip:…|rssi:…|lvl:…` args and the single-letter
 //!   compact form.
+//! - [`SdmTuningLink`] — the retry + sequence-dedupe reliability layer that carries
+//!   telegrams over a Tait CCDI SDM side channel (`SdmTuningLink.cs`). Unlike the two
+//!   codecs above, the link *does* ride the Tait driver — but it stays here (not under
+//!   `radio/`) because it is a tuning-protocol concern. It is **receipt-tolerant by
+//!   default** ([`SdmTuningLinkOptions::wait_for_delivery_receipt`] false): a send
+//!   completes on the radio accepting the datagram, not on an over-air delivery
+//!   receipt (which the TM8110 auto-ack refractory makes unreliable).
 //!
 //! ## Fixed-point / `no_std` divergences from the C# reference
 //!
@@ -35,9 +42,11 @@
 use core::fmt;
 
 pub mod meter_report;
+pub mod sdm_link;
 pub mod telegram;
 
 pub use meter_report::MeterReport;
+pub use sdm_link::{LinkDelay, SdmLinkError, SdmTuningLink, SdmTuningLinkOptions};
 pub use telegram::{TuningTelegram, TuningVerb};
 
 /// A [`core::fmt::Write`] sink over a fixed caller buffer. `write_str` fails (and

@@ -26,6 +26,18 @@ use alloc::vec::Vec;
 /// this). Sized for a full frame + CR.
 const OUT_LEN: usize = super::ccdi::MAX_LINE + 1;
 
+/// Characters a plain (SFI 00) Tait SDM can carry (§1.9.8). Mirrors
+/// `TaitCcdiRadio.PlainSdmMaxLength`.
+const PLAIN_SDM_MAX_LEN: usize = 32;
+
+/// Characters an extended (SFI 04) Tait SDM can carry (§1.9.8). Mirrors
+/// `TaitCcdiRadio.ExtendedSdmMaxLength`.
+const EXTENDED_SDM_MAX_LEN: usize = 128;
+
+/// The default SDM carrier lead-in, in 20 ms units — 100 ms (5 × 20 ms), matching
+/// the C# `LeadInUnits(null)` (clamp of 100 ms / 20 ms into 1..=255).
+const DEFAULT_SDM_LEAD_IN_UNITS: u8 = 5;
+
 /// An unsolicited radio event demuxed out of the CCDI stream during a transaction —
 /// the port of `TaitCcdiRadio.RouteUnsolicited`'s event fan-out. Timestamps are the
 /// caller's concern (the core has no clock): stamp each event when you drain it.
@@ -174,6 +186,87 @@ impl<S: ByteStream> TaitCcdiRadio<S> {
         let frame = build_go_to_channel(channel, zone).ok_or(TaitError::Invalid)?;
         self.transact(&frame, |_| Option::<()>::None, true).await?;
         Ok(())
+    }
+
+    /// Send a plain short data message radio-to-radio over the air — SEND_ADAPTABLE_SDM
+    /// (`a`, GFI 2 / SFI 00, §1.9.8). `dest_id` is the 8-character destination data
+    /// identity (`b'*'` wildcards per character); `payload` is up to 32 characters. The
+    /// send completes on the radio's prompt — i.e. the radio *accepted* the datagram;
+    /// a radio-level rejection surfaces as [`TaitError::Ccdi`]. Mirrors `SendSdmAsync`.
+    ///
+    /// The over-air delivery receipt (PROGRESS 0x1D) is **not** awaited here — it is an
+    /// unsolicited event demuxed into [`Self::drain_events`]. Waiting on it is unreliable
+    /// for close bidirectional SDM (the TM8110 auto-ack refractory), which is why the
+    /// [`SdmTuningLink`](crate::tune::SdmTuningLink) is receipt-tolerant by default.
+    pub async fn send_sdm(
+        &mut self,
+        dest_id: &[u8; 8],
+        payload: &[u8],
+    ) -> Result<(), TaitError<S::Error>> {
+        self.send_adaptable_sdm(dest_id, payload, false).await
+    }
+
+    /// Send an extended short data message of up to 128 characters in one command —
+    /// SEND_ADAPTABLE_SDM (`a`, GFI 2 / SFI 04, §1.9.8). The radios split it into
+    /// multiple over-air bursts and reassemble it natively. Mirrors `SendExtendedSdmAsync`.
+    pub async fn send_extended_sdm(
+        &mut self,
+        dest_id: &[u8; 8],
+        payload: &[u8],
+    ) -> Result<(), TaitError<S::Error>> {
+        self.send_adaptable_sdm(dest_id, payload, true).await
+    }
+
+    async fn send_adaptable_sdm(
+        &mut self,
+        dest_id: &[u8; 8],
+        payload: &[u8],
+        extended: bool,
+    ) -> Result<(), TaitError<S::Error>> {
+        let max = if extended {
+            EXTENDED_SDM_MAX_LEN
+        } else {
+            PLAIN_SDM_MAX_LEN
+        };
+        if payload.len() > max {
+            return Err(TaitError::Invalid);
+        }
+        let frame = build_send_sdm(dest_id, payload, extended).ok_or(TaitError::Invalid)?;
+        self.transact(&frame, |_| Option::<()>::None, true).await?;
+        Ok(())
+    }
+
+    /// Read the radio's one-deep buffered received SDM — QUERY type 1 (`q1`, §1.9.5).
+    /// Copies the buffered message bytes into `out` and returns their length, or `None`
+    /// when nothing is buffered (an empty GET_SDM). Returns [`TaitError::Invalid`] if the
+    /// buffered message is larger than `out`. This read clears the radio's SDM buffer.
+    /// Mirrors `ReadBufferedSdmAsync`.
+    pub async fn read_buffered_sdm_into(
+        &mut self,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, TaitError<S::Error>> {
+        let frame = CcdiFrame::new(b'q', b"1").expect("1-byte params fit");
+        let matched = self
+            .transact(
+                &frame,
+                |msg| match msg {
+                    CcdiMessage::Sdm(data) => Some(if data.len() > out.len() {
+                        Err(())
+                    } else {
+                        out[..data.len()].copy_from_slice(data);
+                        Ok(data.len())
+                    }),
+                    _ => None,
+                },
+                false,
+            )
+            .await?;
+        match matched {
+            // An empty buffered message (length 0) means "nothing buffered".
+            Some(Ok(0)) | None => Ok(None),
+            Some(Ok(len)) => Ok(Some(len)),
+            Some(Err(())) => Err(TaitError::Invalid),
+        }
     }
 
     async fn read_cctm_rssi(
@@ -355,6 +448,36 @@ fn build_go_to_channel(channel: u16, zone: Option<u8>) -> Option<CcdiFrame> {
         None => write_decimal(&mut params, channel as u32),
     };
     CcdiFrame::new(b'g', &params[..len])
+}
+
+/// Build the SEND_ADAPTABLE_SDM frame — `a` `{leadIn:X2}{gfi}{sfi}{id:8}{message}`
+/// (§1.9.8), with GFI `2` (text) and SFI `00` (plain) / `04` (extended). Returns
+/// `None` if the whole parameter block would exceed [`super::ccdi::MAX_PARAMS`].
+/// Mirrors `TaitCcdiRadio.SendAdaptableSdmAsync`'s parameter layout.
+fn build_send_sdm(dest_id: &[u8; 8], payload: &[u8], extended: bool) -> Option<CcdiFrame> {
+    // leadIn(2) + gfi(1) + sfi(2) + id(8) = 13-byte fixed head, then the payload.
+    const HEAD: usize = 2 + 1 + 2 + 8;
+    let total = HEAD.checked_add(payload.len())?;
+    if total > super::ccdi::MAX_PARAMS {
+        return None;
+    }
+    let mut params = [0u8; super::ccdi::MAX_PARAMS];
+    params[0] = hex_digit(DEFAULT_SDM_LEAD_IN_UNITS >> 4);
+    params[1] = hex_digit(DEFAULT_SDM_LEAD_IN_UNITS & 0x0F);
+    params[2] = b'2'; // GFI 2 — text
+    params[3] = b'0';
+    params[4] = if extended { b'4' } else { b'0' }; // SFI 04 (extended) / 00 (plain)
+    params[5..13].copy_from_slice(dest_id);
+    params[13..total].copy_from_slice(payload);
+    CcdiFrame::new(b'a', &params[..total])
+}
+
+/// The upper-case ASCII hex digit for the low nibble of `n`.
+const fn hex_digit(n: u8) -> u8 {
+    match n & 0x0F {
+        d @ 0..=9 => b'0' + d,
+        d => b'A' + (d - 10),
+    }
 }
 
 /// Write `value` as decimal digits into `dst` right-padded to nothing (natural
@@ -545,5 +668,61 @@ mod tests {
         radio.stream_mut().feed(b"BD\r.");
         let rssi = block_on(radio.read_rssi_tenths()).unwrap();
         assert_eq!(rssi, -999);
+    }
+
+    #[test]
+    fn send_sdm_builds_the_adaptable_sdm_wire() {
+        // Bare prompt = the radio accepted the datagram.
+        let mut radio = radio_primed(b".");
+        block_on(radio.send_sdm(b"12345678", b"Hi")).unwrap();
+        // `a` params = "05" (lead-in) + "2" (GFI) + "00" (SFI) + id(8) + "Hi".
+        let expected = CcdiFrame::new(b'a', b"0520012345678Hi")
+            .unwrap()
+            .encode_to_bytes();
+        assert_eq!(radio.stream_mut().take_written(), expected.as_slice());
+    }
+
+    #[test]
+    fn send_extended_sdm_uses_sfi_04() {
+        let mut radio = radio_primed(b".");
+        block_on(radio.send_extended_sdm(b"12345678", b"payload")).unwrap();
+        let expected = CcdiFrame::new(b'a', b"0520412345678payload")
+            .unwrap()
+            .encode_to_bytes();
+        assert_eq!(radio.stream_mut().take_written(), expected.as_slice());
+    }
+
+    #[test]
+    fn send_sdm_rejects_over_length_payload() {
+        let mut radio = radio_primed(b".");
+        let big = [b'x'; PLAIN_SDM_MAX_LEN + 1];
+        assert_eq!(
+            block_on(radio.send_sdm(b"12345678", &big)),
+            Err(TaitError::Invalid)
+        );
+    }
+
+    #[test]
+    fn send_sdm_surfaces_a_radio_reject() {
+        // The radio answers with a CCDI ERROR instead of a prompt.
+        let eframe = CcdiFrame::new(b'e', b"006").unwrap().encode_to_bytes();
+        let mut radio = radio_primed(&eframe);
+        let err = block_on(radio.send_sdm(b"12345678", b"Hi")).unwrap_err();
+        assert!(matches!(err, TaitError::Ccdi { .. }));
+    }
+
+    #[test]
+    fn read_buffered_sdm_returns_data_then_empty() {
+        let sframe = CcdiFrame::new(b's', b"V1|5|HI|x").unwrap().encode_to_bytes();
+        let mut radio = radio_primed(&sframe);
+        let mut buf = [0u8; 64];
+        let n = block_on(radio.read_buffered_sdm_into(&mut buf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"V1|5|HI|x");
+        // An empty GET_SDM means nothing is buffered → None.
+        let empty = CcdiFrame::new(b's', b"").unwrap().encode_to_bytes();
+        radio.stream_mut().feed(&empty);
+        assert_eq!(block_on(radio.read_buffered_sdm_into(&mut buf)).unwrap(), None);
     }
 }
