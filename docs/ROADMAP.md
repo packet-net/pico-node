@@ -33,52 +33,52 @@ Implemented + host-tested in `crates/ax25-node-core` (154 host tests; builds `th
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **mod-128 (extended) framing** — SABME/extended control octets | NONE (its own flagged follow-up) | 🔒 | In | |
-| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | |
-| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | |
-| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | |
-| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | |
-| **Carrier-sense (CSMA) seam** (`ICarrierSense` parity) | NONE | 🔒/🔧 | In (needed for any keyed modem) | |
-| **figc4.x quirks added after #47** (if any landed) | HAS #38–47 | 🔒 | In (audit) | |
+| **mod-128 (extended) framing** — SABME/extended control octets | NONE (its own flagged follow-up) | 🔒 | In | In |
+| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | In |
+| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | In |
+| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | In |
+| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | In |
+| **Carrier-sense (CSMA) seam** (`ICarrierSense` parity) | NONE | 🔒/🔧 | In (needed for any keyed modem) | In |
+| **figc4.x quirks added after #47** (if any landed) | HAS #38–47 | 🔒 | In (audit) | In (audit) |
 
 ## B. NET/ROM — beyond read-only
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | |
-| **NODES origination / broadcast scheduler** | NONE | 🔒 | In | |
-| **INP3** routing overlay | NONE (future, all-stack) | 🔒 | Later (not shipped anywhere yet) | |
+| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | In |
+| **NODES origination / broadcast scheduler** | NONE | 🔒 | In | In |
+| **INP3** routing overlay | NONE (future, all-stack) | 🔒 | Later (not shipped anywhere yet) | Later, leave a seam |
 
 ## C. Radio integration
 
 | feature | status | class | fit | rec | decision |
 |---|---|---|---|---|---|
-| **KISS-over-serial to a NinoTNC** (direct UART) | PARTIAL (codec done, transport stubbed) | 🔧 | good | In (planned cap #3) | |
-| **Direct Tait CCDI radio control** (RSSI, DCD/carrier-sense, PTT, channel, mode) over a UART | NONE | 🔧 (CCDI is a wire protocol) | good | In — the "radios are integral" core | |
-| **Tait FFSK transparent-mode modem** (AX.25 over the radio's own modem, no TNC) | NONE | 🔒 (SLIP-over-FFSK) | good | Decide | |
-| **Head-end *client*** (adopt a *remote* radio over TCP + inventory + line-control) | NONE | 🔧 | good (WiFi TCP) | Decide — lets a tiny Pico reach a shared radio | |
-| **RSSI/SNR per-frame tagging** (RssiTaggingTransport) | NONE | 🔧 | good | In (pairs with CCDI) | |
-| **IL2P / FX.25 FEC framing** | NONE | 🔒 | RAM? | Decide (NinoTNC does IL2P today; only if pico drives a bare modem) | |
+| **KISS-over-serial to a NinoTNC** (direct UART) | PARTIAL (codec done, transport stubbed) | 🔧 | good | In (planned cap #3) | In |
+| **Direct Tait CCDI radio control** (RSSI, DCD/carrier-sense, PTT, channel, mode) over a UART | NONE | 🔧 (CCDI is a wire protocol) | good | In — the "radios are integral" core | In |
+| **Tait FFSK transparent-mode modem** (AX.25 over the radio's own modem, no TNC) | NONE | 🔒 (SLIP-over-FFSK) | good | Decide | In |
+| **Head-end *client*** (adopt a *remote* radio over TCP + inventory + line-control) | NONE | 🔧 | good (WiFi TCP) | Decide — lets a tiny Pico reach a shared radio | Out |
+| **RSSI/SNR per-frame tagging** (RssiTaggingTransport) | NONE | 🔧 | good | In (pairs with CCDI) | In |
+| **IL2P / FX.25 FEC framing** | NONE | 🔒 | RAM? | Decide (NinoTNC does IL2P today; only if pico drives a bare modem) | Out - done by modem |
 
 ## D. Radio coordination / tuning (the SDM stack)
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | |
-| **Mode coordination / TXDELAY-min / station-hail / deviation assist** | NONE | 🔒 (telegrams) 🔧 | Later — nice but heavy; depends on C + SDM | |
+| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | Yes |
+| **Mode coordination / TXDELAY-min / station-hail / deviation assist** | NONE | 🔒 (telegrams) 🔧 | Later — nice but heavy; depends on C + SDM | Later |
 
 ## E. Node-host services
 
 | feature | status | class | fit | rec | decision |
 |---|---|---|---|---|---|
-| KISS-over-TCP (net-sim) · AXUDP · telnet console | PARTIAL (codecs done, transports stubbed) | 🔧 | good | In (existing caps 1/2/4) | |
-| **AGWPE server** (TCP) | NONE | 🔧 (wire protocol) | ok | Decide | |
-| **RHPv2** (XRouter protocol) | NONE | 🔧 | RAM-heavy | Later | |
-| **MQTT frame emitter** (kissproxy-compatible tracing) | NONE | 🔧 | ok | Decide | |
-| **Web config/monitor panel** | HAS (provisioning/AP panel) | 🔧 | ok | keep as-is | |
-| **OTA self-update** | HAS | 🔧 | ok | keep | |
-| **APRS** (APRS101) | NONE | 🔒 | ok | Later | |
-| **Tailscale sidecar** | NONE | 🔧 | too heavy | Skip | |
+| KISS-over-TCP (net-sim) · AXUDP · telnet console | PARTIAL (codecs done, transports stubbed) | 🔧 | good | In (existing caps 1/2/4) | Needs more breakdown |
+| **AGWPE server** (TCP) | NONE | 🔧 (wire protocol) | ok | Decide | Defer |
+| **RHPv2** (XRouter protocol) | NONE | 🔧 | RAM-heavy | Later | Defer |
+| **MQTT frame emitter** (kissproxy-compatible tracing) | NONE | 🔧 | ok | Decide | Defer |
+| **Web config/monitor panel** | HAS (provisioning/AP panel) | 🔧 | ok | keep as-is | Extend as necessary |
+| **OTA self-update** | HAS | 🔧 | ok | keep | keep |
+| **APRS** (APRS101) | NONE | 🔒 | ok | Later | Defer |
+| **Tailscale sidecar** | NONE | 🔧 | too heavy | Skip | Not relevant |
 
 ---
 
