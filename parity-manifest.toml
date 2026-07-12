@@ -1,0 +1,111 @@
+# parity-manifest.toml — pico-node's declared position in the three-stack parity
+# contract (C# Packet.* authoritative <-> TS @packet-net/ax25 <-> Rust pico-node).
+#
+# Every codec / behaviour "vector set" is EITHER opted-in (the shared golden-vector
+# corpus runs and CI fails on any byte mismatch) OR declared-out with a reason — so
+# a gap is always a reviewed decision, never a silent hole. This is the pico-node
+# analogue of ax25-ts's scripts/parity-exceptions.json.
+#
+# Consumers:
+#   1. crates/ax25-node-core/tests/golden_vectors.rs — the Rust vector runner reads
+#      the opted-in set list to know which corpus files under vectors/ to require.
+#   2. a future manifest-vs-corpus parity-guard job (the pico-node analogue of the
+#      ax25-ts `parity` job): asserts every `in = true` set has a corpus file and
+#      every corpus file is either opted-in or declared-out.
+
+schema    = 1
+stack     = "pico-node"
+reference = "packet-net/packet.net"   # C# Packet.* is the reference runtime
+
+[sdl]
+# Session / connected-mode vectors are only meaningful if all three stacks drive
+# the SAME SDL version. Surface the pin here so a skew is a visible, reviewable
+# diff rather than a silent behavioural divergence.
+#
+# KNOWN CAVEAT — version skew, un-pinned (to resolve in a follow-up):
+#   * the Rust crate ax25sdl/spec/rust is at 0.8.0
+#   * C# pins Packet.Ax25.Sdl at 0.10.0
+#   * pico-node CI currently floats on ax25sdl `main` (no pin at all)
+# Three different SDL snapshots drive three "identical" session machines. This only
+# bites the SDL-DRIVEN sets (session lifecycle, mod-128 establishment, XID
+# negotiation, SREJ recovery); the pure wire codecs (frame / KISS / AXUDP / NET-ROM
+# byte layout) never touch the SDL crate, so codec parity is unaffected. Mitigation:
+# pin pico-node to a `crate-v*` tag equal to the version C#/TS consume, then bump
+# `version`/`pin` here in lockstep.
+crate   = "ax25sdl"
+repo    = "packet-net/ax25sdl"        # formerly m0lte/ax25sdl (GitHub org-rename redirect)
+version = "0.8.0"                     # Rust crate today; C# NuGet = 0.10.0 -> SKEW to pin later
+pin     = "main"                      # TODO: pin a `crate-v*` tag, not a floating branch
+
+# ---------------------------------------------------------------------------
+# opted-IN: pico-node runs the shared corpus for these; CI fails on any mismatch.
+# `capabilities` carries negotiate-down degradations as first-class entries so a
+# future corpus can tag a vector with a required capability and the runner can
+# skip-with-note any vector whose capability the manifest doesn't claim.
+# ---------------------------------------------------------------------------
+
+[vector_sets.ax25_mod8]
+in           = true
+capabilities = ["mod8"]
+
+[vector_sets.ax25_mod128]
+in           = true
+capabilities = ["mod128", "negotiate-down-from-mod128"]
+
+[vector_sets.kiss]
+in           = true
+capabilities = ["kiss"]
+
+[vector_sets.axudp]
+in           = true
+capabilities = ["axudp"]
+
+[vector_sets.netrom_quality]
+in           = true
+capabilities = ["netrom-quality"]   # FNV-1a flow-hash + quality formula (a*b+128)/256
+
+[vector_sets.netrom_nodes]
+in           = true
+capabilities = ["netrom-nodes"]
+
+[vector_sets.netrom_l4]
+in           = true
+capabilities = ["netrom-l4"]
+
+[vector_sets.srej]
+in           = true
+capabilities = ["srej", "negotiate-down-from-srej"]
+
+[vector_sets.xid]
+in           = true
+capabilities = ["xid"]
+
+# ---------------------------------------------------------------------------
+# DECLARED-OUT / deferred: a missing runner here is a reviewed decision, not a
+# hole. The parity guard treats these as intentionally-absent, so they can never
+# cause a false CI failure for a corpus file pico-node does not yet run.
+# ---------------------------------------------------------------------------
+
+[vector_sets.sdm_telegram]
+in     = false
+reason = "SDM telegram codec in progress; runner lands with the feature"
+
+[vector_sets.agwpe]
+in     = false
+reason = "AGWPE not implemented on pico-node"
+
+[vector_sets.rhpv2]
+in     = false
+reason = "RHPv2 server is node-host-only; out of embedded scope"
+
+[vector_sets.mqtt]
+in     = false
+reason = "MQTT emission is node-host telemetry, not an on-air codec"
+
+[vector_sets.aprs]
+in     = false
+reason = "APRS parse/build not ported to pico-node"
+
+[vector_sets.headend]
+in     = false
+reason = "split-station head-end is a separate daemon; no pico-node codec"

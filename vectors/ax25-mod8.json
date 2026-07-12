@@ -1,0 +1,54 @@
+{
+  "set": "ax25_mod8",
+  "capabilities": ["mod8"],
+  "reference": "packet-net/packet.net tests/Packet.Ax25.Tests/Ax25FrameTests.cs — GoldenUi_AprsCommand_NoDigi",
+  "notes": "Shared cross-stack golden vectors for the modulo-8 AX.25 frame codec. `wire` is the KISS-delivered frame body (no HDLC flags, no FCS) as hex; whitespace/underscores in the hex are ignored. Each vector is decoded, its fields are asserted, then re-encoded and asserted byte-identical to `wire` (round-trip). The first vector transcribes the EXACT bytes C# asserts, so a green run proves the pico-node codec is byte-identical to Packet.Ax25 on real wire.",
+  "vectors": [
+    {
+      "name": "golden_ui_aprs_command_no_digi",
+      "description": "C# anchor: Ax25Frame.Ui(dest APRS-0 command, source G7XYZ-7, info \"hello\", pid 0xF0). Byte-for-byte identical to C#'s GoldenUi_AprsCommand_NoDigi.",
+      "anchor": "csharp-golden",
+      "wire": "82A0A4A64040E0 8E6EB0B2B4406F 03 F0 68656C6C6F",
+      "fields": {
+        "dest":         { "call": "APRS",  "ssid": 0 },
+        "source":       { "call": "G7XYZ", "ssid": 7 },
+        "digipeaters":  [],
+        "command":      true,
+        "control":      3,
+        "pid":          240,
+        "info_hex":     "68656C6C6F"
+      }
+    },
+    {
+      "name": "ui_command_two_digipeaters",
+      "description": "UI command with a two-hop digipeater path (WIDE1-1, WIDE2-2) and a 3-byte info field; exercises the address-field extension-bit termination across repeater slots.",
+      "wire": "82A0A4A64040E0 9A6098A88A4072 AE92888A624062 AE92888A644065 03 F0 212223",
+      "fields": {
+        "dest":         { "call": "APRS",  "ssid": 0 },
+        "source":       { "call": "M0LTE", "ssid": 9 },
+        "digipeaters":  [
+          { "call": "WIDE1", "ssid": 1 },
+          { "call": "WIDE2", "ssid": 2 }
+        ],
+        "command":      true,
+        "control":      3,
+        "pid":          240,
+        "info_hex":     "212223"
+      }
+    },
+    {
+      "name": "ui_response_poll_final_empty_info",
+      "description": "UI response (dest C=0, source C=1) with the P/F bit set (control 0x13) and an empty info field; exercises the command/response C-bit split and a PID-present, info-absent UI frame.",
+      "wire": "82A0A4A6404060 8E6EB0B2B440EF 13 F0",
+      "fields": {
+        "dest":         { "call": "APRS",  "ssid": 0 },
+        "source":       { "call": "G7XYZ", "ssid": 7 },
+        "digipeaters":  [],
+        "command":      false,
+        "control":      19,
+        "pid":          240,
+        "info_hex":     ""
+      }
+    }
+  ]
+}
