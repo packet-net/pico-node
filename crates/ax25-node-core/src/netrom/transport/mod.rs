@@ -10,6 +10,11 @@ pub mod circuit;
 pub mod circuit_manager;
 pub mod circuit_options;
 pub mod circuit_state;
+/// The NET/ROM L4 payload (de)compression codec (zlib / RFC 1950 + DEFLATE /
+/// RFC 1951), for BPQ `L4Compress` interop. Gated behind the `netrom-compress`
+/// cargo feature so the default on-target build carries no compression code.
+#[cfg(feature = "netrom-compress")]
+pub mod deflate;
 pub mod inp3_engine;
 pub mod inp3_update_scheduler;
 

@@ -39,6 +39,16 @@ std = ["alloc", "ax25sdl/std"]
 # fixed-capacity buffers — see the module docs). Kept as a separate feature so the
 # heap dependency is explicit.
 alloc = []
+# `netrom-compress` gates the NET/ROM L4 payload (de)compression codec
+# (`netrom::transport::deflate`) — a compact, self-contained zlib/DEFLATE
+# (RFC 1950 + RFC 1951) implementation for BPQ `L4Compress` interop. It is OFF by
+# default so the on-target firmware carries ZERO compression code (a flash win)
+# unless a deployment actually peers with a compressing BPQ node. It pulls
+# `alloc` because the codec's growable output buffers use `alloc::vec::Vec`
+# (following the crate's existing streaming-buffer pattern); no external crate is
+# added to the shipped graph — the codec is hand-rolled, and its miniz_oxide
+# TEST ORACLE lives in `[dev-dependencies]` only (never shipped).
+netrom-compress = ["alloc"]
 
 [dependencies]
 # The generated AX.25 v2.2 SDL state-machine tables + typed closed sets, consumed
@@ -61,3 +71,10 @@ ax25sdl = { path = "../../../ax25sdl/spec/rust", default-features = false }
 # the test still runs fully offline.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# HOST-TEST-ONLY oracle for the `netrom-compress` codec: the pure-Rust reference
+# zlib/DEFLATE implementation (flate2's backend). Used ONLY by the codec's inline
+# `#[cfg(test)]` oracle tests to prove our encoder emits valid zlib that a real
+# inflater accepts, and that our inflater reads real zlib (incl. dynamic Huffman).
+# `default-features = false, features = ["with-alloc"]` keeps it no_std+alloc. As a
+# dev-dependency it never reaches the shipped/firmware graph (like serde above).
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
