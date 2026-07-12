@@ -37,6 +37,7 @@
 //! runtime is host-tested with `cargo test` and is `no_std`-clean for the M0+.
 
 pub mod bridge;
+pub mod capability;
 pub mod carrier;
 pub mod context;
 pub mod dispatch;
@@ -44,6 +45,7 @@ pub mod event;
 pub mod guard;
 pub mod loop_exec;
 pub mod manager;
+pub mod mdl;
 pub mod quirks;
 pub mod session;
 pub mod signal;
@@ -52,11 +54,16 @@ pub mod timer;
 pub mod tx;
 
 pub use bridge::{classify_incoming, classify_incoming_modulo, WireSink};
+pub use capability::{PeerCapabilityCache, PeerCapabilityRecord, PeerDialPlan, PeerDialPolicy};
 pub use carrier::{AlwaysClear, CarrierSense};
 pub use context::{Payload, SessionContext};
 pub use event::{Event, FrameInfo};
 pub use loop_exec::{run_loop, MAX_ITERATIONS};
 pub use manager::{SessionManager, Slot};
+pub use mdl::{
+    apply_negotiated, apply_version_20_defaults, default_offer_for, respond_pre_session_xid,
+    respond_to_xid_command,
+};
 pub use quirks::Quirks;
 pub use session::{Session, State};
 pub use signal::{

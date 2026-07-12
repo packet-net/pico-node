@@ -14,8 +14,12 @@ pub mod address;
 pub mod callsign;
 pub mod frame;
 pub mod parse_options;
+pub mod xid;
 
 pub use address::{Address, ADDRESS_LEN};
 pub use callsign::Callsign;
 pub use frame::{Frame, ParseError, PID_NETROM, PID_NO_LAYER3, PID_SEGMENTED};
 pub use parse_options::Ax25ParseOptions;
+pub use xid::{
+    ClassesOfProcedures, HdlcOptionalFunctions, RejectMode, XidParameters, XidParseOptions,
+};

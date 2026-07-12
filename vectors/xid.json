@@ -1,0 +1,61 @@
+{
+  "set": "xid",
+  "capabilities": ["xid"],
+  "reference": "packet-net/packet.net tests/Packet.Ax25.Tests/Xid/XidInfoFieldTests.cs",
+  "notes": "Shared cross-stack golden vectors for the AX.25 v2.2 XID information-field TLV codec (FI/GI/GL + PI/PL/PV, §4.3.3.7 / Figure 4.5-4.6). `info_hex` is the encoded XID information field (the bytes carried in an XID U-frame's info field) as hex; whitespace/underscores are ignored. Each vector is parsed, its decoded parameters asserted, and — when `roundtrip` is true — re-encoded and asserted byte-identical to `info_hex`. The `figure_4_6_*` vectors transcribe the exact bytes C#'s XidInfoFieldTests pins, so a green run proves the pico-node XID codec is byte-identical to Packet.Ax25. NOTE: `figure_4_6_literal` is the literal Figure 4.6 print whose Classes-of-Procedures byte carries the figure's documented ABM off-by-one (0x22); it is decode-only because both C# and pico re-encode ABM canonically at bit 0 (0x21) per the Figure 4.5 table — see figure_4_6_canonical.",
+  "vectors": [
+    {
+      "name": "figure_4_6_canonical",
+      "description": "The Figure 4.6 worked example, canonically encoded (ABM at bit 0 ⇒ Classes byte 0x21, per the Figure 4.5 table; the HDLC PV is MSB-octet-first per §3.8). This is what both C# and pico Encode() produce for this parameter set, so it round-trips.",
+      "info_hex": "82 80 00 17 02 02 21 00 03 03 22 A8 82 06 02 04 00 08 01 02 09 02 10 00 0A 01 03",
+      "roundtrip": true,
+      "expect": {
+        "half_duplex": true,
+        "reject": "rej",
+        "modulo128": true,
+        "srej_multiframe": true,
+        "segmenter": false,
+        "i_field_length_rx_bits": 1024,
+        "window_size_rx": 2,
+        "ack_timer_millis": 4096,
+        "retries": 3
+      }
+    },
+    {
+      "name": "figure_4_6_literal",
+      "description": "The literal Figure 4.6 print, whose Classes-of-Procedures byte is 0x22 (the figure's ABM off-by-one). Decodes to the identical selection (duplex reads bit 5 either way); decode-only because canonical re-encode uses 0x21.",
+      "info_hex": "82 80 00 17 02 02 22 00 03 03 22 A8 82 06 02 04 00 08 01 02 09 02 10 00 0A 01 03",
+      "roundtrip": false,
+      "expect": {
+        "half_duplex": true,
+        "reject": "rej",
+        "modulo128": true,
+        "srej_multiframe": true,
+        "segmenter": false,
+        "i_field_length_rx_bits": 1024,
+        "window_size_rx": 2,
+        "ack_timer_millis": 4096,
+        "retries": 3
+      }
+    },
+    {
+      "name": "empty_header_all_defaults",
+      "description": "FI GI GL=0000 — the bare header with an empty parameter field (all fields absent ⇒ 'use current values').",
+      "info_hex": "82 80 00 00",
+      "roundtrip": true,
+      "expect": { "all_none": true }
+    },
+    {
+      "name": "mod8_srej_offer",
+      "description": "The mod-8 XID command a PDN NET/ROM interlink initiator puts on the wire before its SABM: HDLC Optional Functions offering SREJ + SREJ-multiframe at modulo-8, PV 0x22 0xA4 0x84 (MSB-first, §3.8).",
+      "info_hex": "82 80 00 05 03 03 22 A4 84",
+      "roundtrip": true,
+      "expect": {
+        "reject": "srej",
+        "modulo128": false,
+        "srej_multiframe": true,
+        "segmenter": false
+      }
+    }
+  ]
+}

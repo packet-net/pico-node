@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use crate::ax25::Callsign;
 
 use super::bridge::WireSink;
+use super::capability::PeerDialPlan;
 use super::carrier::CarrierSense;
 use super::event::Event;
 use super::session::Session;
@@ -55,13 +56,15 @@ pub struct SessionManager<const N: usize> {
 
 impl<const N: usize> SessionManager<N> {
     /// Build a manager for the node's own `local` callsign with all slots free.
-    /// A plain [`Self::connect`] dials mod-8 (SABM) by default; see
+    /// A plain [`Self::connect`] dials mod-128 (SABME) by default — matching C#
+    /// `Ax25ListenerOptions.PreferExtendedConnect = true` — with automatic degrade
+    /// to mod-8 SABM if the peer refuses (FRMR #45 or DM #48); see
     /// [`Self::with_prefer_extended_connect`]. No carrier-sense source is wired
     /// (always-clear); see [`Self::set_carrier_sense`].
     pub fn new(local: Callsign) -> Self {
         Self {
             local,
-            prefer_extended_connect: false,
+            prefer_extended_connect: true,
             carrier: None,
             // `Option<Slot>` isn't `Copy`, so build the array element-by-element.
             slots: core::array::from_fn(|_| None),
@@ -96,13 +99,13 @@ impl<const N: usize> SessionManager<N> {
 
     /// Set whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial with
     /// SABM/mod-8 fallback on refusal, returning `self` for chaining. Mirrors the
-    /// listener option `Ax25ListenerOptions.PreferExtendedConnect` (Ax25Listener.cs:1712)
-    /// — but where the C# default is `true`, pico defaults **false** to preserve the
-    /// historical mod-8 dial: the SABME→SABM degrade is only half-wired (FRMR
-    /// fallback #45 is present; the DM-refusal degrade #48 is owned by another track),
-    /// so a mod-128-preferred default could strand a connect to a DM-refusing peer
-    /// until #48 lands. Callers opt in per manager here, or per dial via
-    /// [`Self::connect_extended`].
+    /// listener option `Ax25ListenerOptions.PreferExtendedConnect` (Ax25Listener.cs:1712),
+    /// and — now that both refusal degrades are present on the session (FRMR
+    /// fallback #45 and the DM-refusal degrade #48) — pico matches the C# default of
+    /// **true**: a v2.2-preferred dial that a pre-v2.2 peer refuses with FRMR or DM
+    /// degrades to a mod-8 SABM re-establishment instead of stranding. Pass `false`
+    /// here (or dial mod-8 explicitly via [`Self::connect_extended`]) to force the
+    /// historical mod-8 dial.
     pub fn with_prefer_extended_connect(mut self, prefer: bool) -> Self {
         self.prefer_extended_connect = prefer;
         self
@@ -209,6 +212,39 @@ impl<const N: usize> SessionManager<N> {
             .as_mut()
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
+
+        // Pre-session XID *command* responder (mirrors
+        // `Ax25Listener.HandleNoCachedSession`'s XID branch): a peer doing pre-SABM
+        // XID negotiation to us before any link exists — the PDN NET/ROM mod-8
+        // interlink initiator opening with XID. §4.3.3.7 makes answering an XID
+        // command unconditional; the negotiated params stage on this cached slot's
+        // context so the *subsequent* SABM's figc4.1 t14 `Set Version 2.0` (which
+        // clears only `is_extended`) preserves the staged `srej_enabled` into the
+        // established link. We answer directly (connectionless — no LM-SEIZE),
+        // matching C# `RespondToXidCommand`; no ConnectIndication is raised (the
+        // following SABM raises it). Gated on `accept_incoming`, like SABM-accept.
+        if let Event::XidReceived(fi) = &event {
+            if fi.is_command
+                && slot.session.state == super::session::State::Disconnected
+                && slot.session.context.accept_incoming
+            {
+                let command_info = fi.info.clone();
+                let response_info = super::mdl::respond_pre_session_xid(
+                    &mut slot.session.context,
+                    &command_info,
+                );
+                // XID is a U-frame (1 octet in both modulos); modulo is immaterial.
+                slot.sink.extended = slot.session.context.is_extended;
+                let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
+                    is_command: false,
+                    pf: true, // F=1 so the initiator's figc5.2 F_eq_1 diamond fires
+                    info: response_info,
+                });
+                slot.sink.sent.push(bytes);
+                return core::mem::take(&mut slot.sink.sent);
+            }
+        }
+
         // Track the link's negotiated modulo so the sink emits 2-octet extended
         // control on an I/S frame once the session is mod-128 (SABME-established).
         // is_extended is settled before any I/S frame is emitted (it is set on the
@@ -283,6 +319,34 @@ impl<const N: usize> SessionManager<N> {
             .context
             .is_extended = extended;
         self.post_with_local(local, peer, Event::DlConnectRequest, timers)
+    }
+
+    /// Dial `peer` from `local` per a capability-cache [`PeerDialPlan`] — the
+    /// dial-time seam that supplies a peer's learned XID capabilities. The plan's
+    /// [`extended`](PeerDialPlan::extended) selects SABME vs SABM (via
+    /// [`Self::connect_extended`]). Pair with
+    /// [`PeerCapabilityCache::plan_dial`](super::capability::PeerCapabilityCache::plan_dial)
+    /// upstream and
+    /// [`PeerCapabilityCache::record_outcome`](super::capability::PeerCapabilityCache::record_outcome)
+    /// once the dial resolves (extended-vs-degraded observable from the session's
+    /// `is_extended`, SREJ from `srej_enabled`).
+    ///
+    /// NOTE: the plan's [`pre_connect_xid`](PeerDialPlan::pre_connect_xid) probe (an
+    /// *initiator* XID command sent before the SABM, then a bounded wait for the
+    /// response — the C# `NegotiateSrejBeforeConnectAsync` fast-probe) is NOT driven
+    /// here: it is an inherently async, multi-step flow above the synchronous
+    /// per-`post` core. The *responder* half is complete (see
+    /// [`super::mdl::respond_pre_session_xid`]), and the merge
+    /// ([`super::mdl::apply_negotiated`]) is available for a fw-side initiator MDL to
+    /// drive; this method honours the extended choice today.
+    pub fn connect_planned(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        plan: PeerDialPlan,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        self.connect_extended(local, peer, plan.extended, timers)
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -448,18 +512,56 @@ mod tests {
         let mut t = MockTimerService::new();
         let peer = call("G7XYZ");
 
-        // Default (false) ⇒ mod-8 SABM — preserves historical pico behaviour.
+        // Default (true, matching C# PreferExtendedConnect) ⇒ mod-128 SABME.
         let mut mgr_default: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
-        assert!(!mgr_default.prefer_extended_connect());
+        assert!(mgr_default.prefer_extended_connect());
         let out = mgr_default.connect(peer, &mut t);
-        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
-
-        // Opt in ⇒ mod-128 SABME.
-        let mut mgr_ext: SessionManager<2> =
-            SessionManager::new(call("M0LTE-1")).with_prefer_extended_connect(true);
-        assert!(mgr_ext.prefer_extended_connect());
-        let out = mgr_ext.connect(peer, &mut t);
         assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+
+        // Opt out ⇒ mod-8 SABM.
+        let mut mgr_m8: SessionManager<2> =
+            SessionManager::new(call("M0LTE-1")).with_prefer_extended_connect(false);
+        assert!(!mgr_m8.prefer_extended_connect());
+        let out = mgr_m8.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+    }
+
+    /// The safety net that makes the SABME-first default safe: a plain
+    /// (default-preference) connect to a peer that refuses SABME with **DM** must
+    /// degrade to a mod-8 SABM re-establishment (#48 DM-degrade), not strand the
+    /// connect in Disconnected. This is the DM analogue of the FRMR-degrade test,
+    /// and the reason the default could be flipped to true.
+    #[test]
+    fn default_extended_connect_degrades_to_mod8_sabm_on_dm_refusal() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // Plain connect uses the new default (SABME-first).
+        let out = mgr.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+        assert!(mgr.session_for(&peer).unwrap().context.is_extended);
+        assert_eq!(
+            mgr.session_for(&peer).unwrap().state,
+            State::AwaitingV22Connection
+        );
+
+        // Pre-v2.2 peer (XRouter-class) refuses SABME with DM (F=1).
+        let dm = Event::DmReceived(FrameInfo {
+            poll_final: true,
+            is_command: false,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, dm, &mut t);
+
+        // #48: degraded to mod-8 and a SABM re-establishment emitted — NOT stranded.
+        let s = mgr.session_for(&peer).unwrap();
+        assert!(!s.context.is_extended, "DM degraded the link to mod-8");
+        assert_eq!(s.state, State::AwaitingConnection);
+        assert!(
+            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "expected a mod-8 SABM re-establishment after the DM: {out:02x?}"
+        );
     }
 
     #[test]
@@ -663,5 +765,153 @@ mod tests {
             "the deferred seize resumes when the channel clears: {out:02x?}"
         );
         assert!(!mgr.seize_pending(&peer));
+    }
+
+    // ─── Pre-session XID responder (mirrors Ax25ListenerPreSessionXidTests) ──
+
+    /// A mod-8 XID command offering SREJ (what a PDN interlink initiator sends
+    /// before its SABM), as a classified inbound event.
+    fn mod8_srej_xid_command() -> Event {
+        use crate::ax25::xid::{info_field, HdlcOptionalFunctions, RejectMode, XidParameters};
+        let info = info_field::encode(&XidParameters {
+            hdlc_optional_functions: Some(HdlcOptionalFunctions {
+                reject: RejectMode::SelectiveReject,
+                modulo128: false,
+                srej_multiframe: true,
+                segmenter_reassembler: false,
+            }),
+            ..Default::default()
+        });
+        Event::XidReceived(FrameInfo {
+            poll_final: true,
+            is_command: true,
+            info,
+            ..Default::default()
+        })
+    }
+
+    /// A pre-session XID command from an unknown peer is answered with an XID
+    /// *response* (F=1) that advertises SREJ — NOT a DM, and NOT a connection.
+    #[test]
+    fn pre_session_xid_command_for_unknown_peer_is_answered_with_xid_response() {
+        use crate::ax25::xid::info_field;
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        let out = mgr.post(peer, mod8_srej_xid_command(), &mut t);
+        assert_eq!(out.len(), 1, "exactly one XID response on the wire");
+
+        let reply = Frame::decode(&out[0]).expect("XID reply decodes");
+        assert!(reply.is_response(), "the answer is an XID *response*");
+        assert!(reply.poll_final(), "F=1 so the initiator's F_eq_1 diamond fires");
+        match classify_incoming(&reply) {
+            Some(Event::XidReceived(_)) => {}
+            other => panic!("expected an XID reply, got {other:?} (must not be a DM)"),
+        }
+        // The response advertises SREJ (both sides offered it).
+        let p = info_field::parse(&reply.info).expect("response info parses");
+        assert_eq!(
+            p.hdlc_optional_functions.unwrap().reject,
+            crate::ax25::xid::RejectMode::SelectiveReject
+        );
+
+        // Answering an XID command is NOT a connection: the session stays
+        // Disconnected and no ConnectIndication was raised.
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected)
+        );
+        assert!(!mgr
+            .take_upward(&peer)
+            .contains(&DataLinkSignal::ConnectIndication));
+    }
+
+    /// The SABM that follows the pre-session XID brings the session to Connected
+    /// with the XID-negotiated SREJ adopted (the staged SrejEnabled survives the
+    /// SABM's Set Version 2.0, which clears only is_extended).
+    #[test]
+    fn sabm_after_pre_session_xid_reaches_connected_with_srej_adopted() {
+        use crate::ax25::Frame;
+        use crate::sdl::bridge::classify_incoming;
+
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // 1) Pre-session XID → XID response; still Disconnected.
+        let xid_out = mgr.post(peer, mod8_srej_xid_command(), &mut t);
+        assert_eq!(xid_out.len(), 1);
+        assert!(matches!(
+            classify_incoming(&Frame::decode(&xid_out[0]).unwrap()),
+            Some(Event::XidReceived(_))
+        ));
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected)
+        );
+
+        // 2) The peer now sends SABM → the link establishes, adopting SREJ.
+        let sabm = Event::SabmReceived(FrameInfo {
+            poll_final: true,
+            is_command: true,
+            ..Default::default()
+        });
+        let ua_out = mgr.post(peer, sabm, &mut t);
+
+        let s = mgr.session_for(&peer).expect("session exists");
+        assert_eq!(s.state, State::Connected, "the SABM establishes the link");
+        assert!(
+            s.context.srej_enabled,
+            "the XID-negotiated SREJ survives into the established session"
+        );
+        assert!(!s.context.implicit_reject);
+        // The SABM is answered with a UA (not a DM).
+        assert!(
+            ua_out
+                .iter()
+                .any(|b| matches!(classify_incoming(&Frame::decode(b).unwrap()), Some(Event::UaReceived(_)))),
+            "the SABM must be acknowledged with a UA: {ua_out:02x?}"
+        );
+        assert!(mgr
+            .take_upward(&peer)
+            .contains(&DataLinkSignal::ConnectIndication));
+    }
+
+    /// A `connect_planned` dial honours the capability plan's extended choice:
+    /// an extended plan dials SABME, a mod-8 plan dials SABM.
+    #[test]
+    fn connect_planned_honours_the_dial_plan_extended_choice() {
+        use crate::sdl::capability::PeerDialPlan;
+
+        let peer = call("G7XYZ");
+        let local = call("M0LTE-1");
+
+        let mut ext: SessionManager<2> = SessionManager::new(local);
+        let out = ext.connect_planned(
+            local,
+            peer,
+            PeerDialPlan {
+                extended: true,
+                pre_connect_xid: false,
+            },
+            &mut MockTimerService::new(),
+        );
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+
+        let mut m8: SessionManager<2> = SessionManager::new(local);
+        let out = m8.connect_planned(
+            local,
+            peer,
+            PeerDialPlan {
+                extended: false,
+                pre_connect_xid: true,
+            },
+            &mut MockTimerService::new(),
+        );
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
     }
 }
