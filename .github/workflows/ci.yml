@@ -38,13 +38,19 @@ jobs:
       # a sibling checkout (kept a path dep deliberately, co-developed, no crates.io
       # pin). Provide that sibling: it resolves to $GITHUB_WORKSPACE/../ax25sdl
       # (a level up from this repo's checkout). ax25sdl is public, so this needs no
-      # token. Tracks ax25sdl main, matching local dev. The rm -rf makes it
+      # token. Pinned to a reproducible SHA (below), not floating main. The rm -rf makes it
       # idempotent across the self-hosted runner's persistent _work tree (the dir
       # lives outside the checkout, so actions/checkout does not clean it).
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          git clone --depth 1 https://github.com/m0lte/ax25sdl.git "${GITHUB_WORKSPACE}/../ax25sdl"
+          # Pinned to a reproducible ax25sdl commit — the latest SDL source. A
+          # release tag can't be used: the no_std Rust backend landed post-v0.10.0
+          # (ADR-0003), so the tags carry the old pre-no_std crate. To advance the
+          # SDL, bump this SHA (both jobs) + the parity-manifest.toml [sdl] block.
+          git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 14ad468a80635a6a574962fc60eed469e6cc975c
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ clippy)
         uses: dtolnay/rust-toolchain@1.93.1
@@ -78,7 +84,13 @@ jobs:
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          git clone --depth 1 https://github.com/m0lte/ax25sdl.git "${GITHUB_WORKSPACE}/../ax25sdl"
+          # Pinned to a reproducible ax25sdl commit — the latest SDL source. A
+          # release tag can't be used: the no_std Rust backend landed post-v0.10.0
+          # (ADR-0003), so the tags carry the old pre-no_std crate. To advance the
+          # SDL, bump this SHA (both jobs) + the parity-manifest.toml [sdl] block.
+          git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 14ad468a80635a6a574962fc60eed469e6cc975c
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ thumbv6m target)
         uses: dtolnay/rust-toolchain@1.93.1

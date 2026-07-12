@@ -18,24 +18,29 @@ stack     = "pico-node"
 reference = "packet-net/packet.net"   # C# Packet.* is the reference runtime
 
 [sdl]
-# Session / connected-mode vectors are only meaningful if all three stacks drive
-# the SAME SDL version. Surface the pin here so a skew is a visible, reviewable
-# diff rather than a silent behavioural divergence.
+# pico-node's Rust `sdl/` module consumes the generated typed tables from the
+# ax25sdl Rust crate (spec/rust). The pin is recorded here AND in ci.yml — bump
+# both together to advance the SDL.
 #
-# KNOWN CAVEAT — version skew, un-pinned (to resolve in a follow-up):
-#   * the Rust crate ax25sdl/spec/rust is at 0.8.0
-#   * C# pins Packet.Ax25.Sdl at 0.10.0
-#   * pico-node CI currently floats on ax25sdl `main` (no pin at all)
-# Three different SDL snapshots drive three "identical" session machines. This only
-# bites the SDL-DRIVEN sets (session lifecycle, mod-128 establishment, XID
-# negotiation, SREJ recovery); the pure wire codecs (frame / KISS / AXUDP / NET-ROM
-# byte layout) never touch the SDL crate, so codec parity is unaffected. Mitigation:
-# pin pico-node to a `crate-v*` tag equal to the version C#/TS consume, then bump
-# `version`/`pin` here in lockstep.
-crate   = "ax25sdl"
-repo    = "packet-net/ax25sdl"        # formerly m0lte/ax25sdl (GitHub org-rename redirect)
-version = "0.8.0"                     # Rust crate today; C# NuGet = 0.10.0 -> SKEW to pin later
-pin     = "main"                      # TODO: pin a `crate-v*` tag, not a floating branch
+# Versioning note (this tripped an earlier "0.8.0 vs 0.10.0 skew" report —
+# corrected here; the two numbers are different schemes, not a lag):
+#   * ax25sdl carries THREE independent version schemes that are NOT comparable:
+#     the Rust crate's Cargo.toml version, the git tags (v0.x.y), and the C#
+#     `Packet.Ax25.Sdl` NuGet version. Git tag v0.10.0 (= C# NuGet 0.10.0) ships
+#     Rust crate 0.7.0; the no_std Rust backend + typed closed sets only landed on
+#     `main` afterwards (ADR-0003, commit 6bfe59d, Rust crate → 0.8.0). So the
+#     v0.10.0 tag cannot even satisfy this path dependency.
+#   * The commits `main` is ahead of v0.10.0 are tooling/codegen/distribution
+#     (Rust backend, licence, SVG renders, Scriban bump, SDL-source→submodule) —
+#     NOT SDL state-machine changes. pico-node (on `main`) is therefore
+#     behaviourally SDL-aligned with C#'s 0.10.0; there is no session-behaviour skew.
+# pico-node was already on the latest SDL source; the only real fix was to stop
+# floating `main` (silent-drift risk) and pin a reproducible commit.
+crate        = "ax25sdl"
+repo         = "packet-net/ax25sdl"   # formerly m0lte/ax25sdl (GitHub org-rename redirect)
+rust_crate   = "0.8.0"                # the Rust crate version this pin provides (main; no_std backend)
+csharp_nuget = "0.10.0"               # what C# pins — git tag v0.10.0; behaviourally aligned (delta is tooling)
+pin          = "14ad468a80635a6a574962fc60eed469e6cc975c"  # reproducible latest; MUST match ci.yml
 
 # ---------------------------------------------------------------------------
 # opted-IN: pico-node runs the shared corpus for these; CI fails on any mismatch.
