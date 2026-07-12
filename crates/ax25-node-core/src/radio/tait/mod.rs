@@ -25,6 +25,7 @@
 
 pub mod ccdi;
 pub mod driver;
+pub mod transparent;
 
 /// The CCDI serial rate these radios are commonly programmed for. The radio's
 /// programmed rate wins — 1200 to 115200 are all possible (manual §1.8). Mirrors
