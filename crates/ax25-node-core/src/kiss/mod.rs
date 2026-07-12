@@ -34,6 +34,7 @@ pub mod ninotnc;
 pub mod params;
 pub mod serial;
 
+pub use ackmode::{AckCorrelator, AckRegisterError, TxCompletion, DEFAULT_ACK_TIMEOUT_MS};
 pub use classify::{classify, InboundEvent};
 pub use decoder::Decoder;
 pub use encoder::{encode, encode_into, max_encoded_len};
