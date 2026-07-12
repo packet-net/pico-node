@@ -65,6 +65,17 @@ jobs:
       - name: Test
         run: cargo test -p ax25-node-core
 
+      # The `netrom-compress` feature (LinBPQ L4Compress interop: the zlib/DEFLATE
+      # codec + the NET/ROM L4 negotiation/compress/inflate path) is OFF by default,
+      # so the default Test step above never exercises it. Run its suite explicitly
+      # here so this gated path can't silently rot (a prior enum break slipped
+      # through exactly this way). Clippy the feature too, warnings-as-errors.
+      - name: Clippy — netrom-compress feature (warnings are errors)
+        run: cargo clippy -p ax25-node-core --all-targets --features netrom-compress -- -D warnings
+
+      - name: Test — netrom-compress feature
+        run: cargo test -p ax25-node-core --features netrom-compress
+
       - name: no_std build (firmware crate's library shape — default features off, alloc on)
         run: cargo build -p ax25-node-core --no-default-features --features alloc
 
