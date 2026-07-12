@@ -1,0 +1,32 @@
+{
+  "$comment": "Reviewed, intentional omissions from pico-node's parity coverage — the analogue of ax25-ts scripts/parity-exceptions.json. Two kinds of entry: (1) inventoryExceptions — a C# inventory item (parity/expected-inventory.json) that pico-node deliberately does NOT map to an opted-in vector_set, each with a reason; scripts/parity-check.mjs treats any unmapped C# item NOT listed here as drift and fails CI. (2) declaredOut — whole capability areas pico-node declares out of scope (mirrors the manifest's in=false vector_sets, plus areas that are not vector_sets at all). Remove an entry when the coverage lands. Keyed by inventory `section` then `name`.",
+  "inventoryExceptions": {
+    "listenerOptions": {
+      "MaxCachedPeers": "Listener resource-management knob (LRU peer-session cache bound); no on-air wire or FSM behaviour to vector. Firmware sizes its own fixed-capacity pool.",
+      "ConfigureSession": "C# host-API extension hook (Action<Ax25Session> delegate). A callback surface, not an on-air behaviour; pico-node firmware has no equivalent delegate seam to vector.",
+      "CarrierSense": "TX medium-access / CSMA gating (ICarrierSense). A transmit-timing/transport concern, not a codec or FSM behaviour; not represented by any parity vector set.",
+      "RestartT1OnTxComplete": "Re-arms a running T1 from a TNC ACKMODE TX-completion echo — a TNC/node-host transport capability (packet.net kiss.t1FromTxComplete). Same reason ax25-ts excepts it: no vectored on-air behaviour."
+    },
+    "listenerSurface": {
+      "StartAsync": "Host listener lifecycle (start the RX/TX loop). pico-node firmware brings its own I/O loop up; not a vectored on-air behaviour.",
+      "StopAsync": "Host listener lifecycle (stop). Not a vectored on-air behaviour.",
+      "DisposeAsync": "IAsyncDisposable teardown. Host resource lifecycle, not an on-air behaviour.",
+      "UpdateSessionParameters": "Live per-listener reseed, driven by packet.net node-host hot-reload. Node-host capability; mirrors the ax25-ts exception.",
+      "AddLocalAlias": "Multi-callsign acceptance (answering for app callsigns registered by the RHPv2 server). Node-host-only; mirrors the ax25-ts exception.",
+      "RemoveLocalAlias": "Pair of AddLocalAlias — see that entry. Node-host-only; mirrors the ax25-ts exception.",
+      "FrameTraced": "Host observability event (frame-trace callback). Diagnostics surface, not an on-air behaviour.",
+      "SessionAccepted": "Host callback event (incoming session accepted). Wiring surface, not an on-air behaviour; the establishment itself is covered by ax25_mod8/ConnectAsync."
+    }
+  },
+  "declaredOut": {
+    "sdm_telegram": "SDM telegram link codec in progress; the vector runner lands with the feature (manifest vector_sets.sdm_telegram in=false).",
+    "agwpe": "AGWPE monitor/port protocol not implemented on pico-node (manifest vector_sets.agwpe in=false).",
+    "rhpv2": "RHPv2 application-host server is node-host-only; out of embedded scope (manifest vector_sets.rhpv2 in=false).",
+    "mqtt": "MQTT frame-emitter is node-host telemetry, not an on-air codec (manifest vector_sets.mqtt in=false).",
+    "aprs": "APRS parse/build not ported to pico-node (manifest vector_sets.aprs in=false).",
+    "headend": "Split-station head-end client is a separate daemon; no pico-node codec (manifest vector_sets.headend in=false).",
+    "l4-compression": "NET/ROM L4 payload compression is a node-host feature; pico-node ships the uncompressed L4 codec only (netrom_l4 covers the base codec, not compression).",
+    "nodespaclen": "BPQ NODESPACLEN (NODES-broadcast packet-length tuning) is a host config knob, not an on-air codec behaviour pico-node vectors.",
+    "inp3": "INP3 routing extensions are not cargo-feature-gated in pico-node and are out of the current parity scope; revisit if/when an INP3 vector set is defined."
+  }
+}
