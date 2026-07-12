@@ -15,11 +15,13 @@
 //! timer task + the socket/UART plumbing around it. `no_std` + `alloc`.
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::ax25::Callsign;
 
 use super::bridge::WireSink;
+use super::carrier::CarrierSense;
 use super::event::Event;
 use super::session::Session;
 use super::timer::TimerService;
@@ -44,20 +46,52 @@ pub struct SessionManager<const N: usize> {
     /// Whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial. See
     /// [`Self::with_prefer_extended_connect`].
     prefer_extended_connect: bool,
+    /// Optional carrier-sense (CSMA) source gating the `LM-SEIZE` grant. `None` (the
+    /// default) is the always-clear degenerate gate — the historical full-duplex
+    /// behaviour. See [`Self::set_carrier_sense`].
+    carrier: Option<Box<dyn CarrierSense>>,
     slots: [Option<Slot>; N],
 }
 
 impl<const N: usize> SessionManager<N> {
     /// Build a manager for the node's own `local` callsign with all slots free.
     /// A plain [`Self::connect`] dials mod-8 (SABM) by default; see
-    /// [`Self::with_prefer_extended_connect`].
+    /// [`Self::with_prefer_extended_connect`]. No carrier-sense source is wired
+    /// (always-clear); see [`Self::set_carrier_sense`].
     pub fn new(local: Callsign) -> Self {
         Self {
             local,
             prefer_extended_connect: false,
+            carrier: None,
             // `Option<Slot>` isn't `Copy`, so build the array element-by-element.
             slots: core::array::from_fn(|_| None),
         }
+    }
+
+    /// Wire a carrier-sense (CSMA) source that gates every `LM-SEIZE` grant: while it
+    /// reports the channel busy the seize is deferred (the radio isn't keyed over
+    /// received traffic), and it is granted once the channel clears. Fail-open — an
+    /// unknown state keys up. Mirrors `Ax25ListenerOptions.CarrierSense` feeding
+    /// `CarrierSenseGate` (Ax25Listener.cs:263). Off by default (always-clear).
+    pub fn set_carrier_sense(&mut self, source: Box<dyn CarrierSense>) {
+        self.carrier = Some(source);
+    }
+
+    /// [`Self::set_carrier_sense`] as a builder, returning `self` for chaining.
+    pub fn with_carrier_sense(mut self, source: Box<dyn CarrierSense>) -> Self {
+        self.carrier = Some(source);
+        self
+    }
+
+    /// Remove any wired carrier-sense source, restoring the always-clear gate.
+    pub fn clear_carrier_sense(&mut self) {
+        self.carrier = None;
+    }
+
+    /// Whether the channel is currently clear to key up. Fail-open: `true` when no
+    /// source is wired or the source reports anything other than a definite busy.
+    fn carrier_is_clear(&self) -> bool {
+        self.carrier.as_ref().is_none_or(|c| c.is_clear())
     }
 
     /// Set whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial with
@@ -106,6 +140,15 @@ impl<const N: usize> SessionManager<N> {
         self.index_of(peer)
             .and_then(|i| self.slots[i].as_ref())
             .map(|slot| &slot.session)
+    }
+
+    /// Whether `peer`'s session has an `LM-SEIZE` request still awaiting a grant —
+    /// `true` when a seize has been requested but deferred (e.g. by a busy carrier).
+    /// `false` if there is no slot or nothing is pending.
+    pub fn seize_pending(&self, peer: &Callsign) -> bool {
+        self.index_of(peer)
+            .and_then(|i| self.slots[i].as_ref())
+            .is_some_and(|slot| slot.sink.seize_pending)
     }
 
     /// Ensure a slot exists for `peer`, returning its index. Returns `None` if the
@@ -158,6 +201,10 @@ impl<const N: usize> SessionManager<N> {
         let Some(i) = self.ensure_slot(peer, local) else {
             return Vec::new();
         };
+        // Sample carrier-sense once for this drive (the synchronous runtime doesn't
+        // advance time mid-post). A busy channel defers the LM-SEIZE grant below;
+        // no source / unknown / idle is clear. Read before borrowing the slot.
+        let carrier_clear = self.carrier_is_clear();
         let slot = self.slots[i]
             .as_mut()
             .expect("slot just ensured to be present");
@@ -170,15 +217,19 @@ impl<const N: usize> SessionManager<N> {
         slot.sink.extended = slot.session.context.is_extended;
         slot.session.post_event(event, timers, &mut slot.sink);
 
-        // Grant LM-SEIZE immediately: the node's wire transports (AXUDP,
-        // KISS-TCP) are full-duplex, so the channel is always free. The
-        // confirm drives the figc4 `AckPending` path that emits the delayed
-        // RR acknowledgement — without it, received I-frames with no reply
-        // data are never acked and the peer eventually declares link failure
-        // (found live against LinBPQ through the console relay). Bounded:
-        // the confirm path releases, it never re-seizes.
+        // Grant LM-SEIZE when the channel is clear. On a full-duplex wire (AXUDP,
+        // KISS-TCP) — or with no carrier-sense source — `carrier_clear` is always
+        // true, so the channel is treated as always free (the historical behaviour).
+        // The confirm drives the figc4 `AckPending` path that emits the delayed RR
+        // acknowledgement — without it, received I-frames with no reply data are
+        // never acked and the peer eventually declares link failure (found live
+        // against LinBPQ through the console relay). Bounded: the confirm path
+        // releases, it never re-seizes. When a carrier-sense source reports the
+        // channel busy the seize is *deferred* — `seize_pending` stays set and a
+        // later drive (once the channel clears) grants it, so a half-duplex radio
+        // port never keys over received traffic.
         let mut grants = 0;
-        while slot.sink.seize_pending && grants < 4 {
+        while carrier_clear && slot.sink.seize_pending && grants < 4 {
             slot.sink.seize_pending = false;
             slot.session
                 .post_event(Event::LmSeizeConfirm, timers, &mut slot.sink);
@@ -509,5 +560,108 @@ mod tests {
             )
         });
         assert!(acked, "received I-frame was not acknowledged: {out:02x?}");
+    }
+
+    // ─── Carrier-sense (CSMA) seam ──────────────────────────────────────────
+
+    /// A carrier whose busy state is fixed at construction — the seam's test double.
+    #[derive(Debug, Clone, Copy)]
+    struct TestCarrier(Option<bool>);
+    impl crate::sdl::carrier::CarrierSense for TestCarrier {
+        fn channel_busy(&self) -> Option<bool> {
+            self.0
+        }
+    }
+
+    /// Bring `peer` up (SABM⇒UA) then feed it an in-sequence I-frame with no reply
+    /// data queued — the scenario whose delayed RR ack rides the LM-SEIZE grant.
+    fn connect_then_receive_i_frame(
+        mgr: &mut SessionManager<2>,
+        peer: Callsign,
+        t: &mut MockTimerService,
+    ) -> Vec<Vec<u8>> {
+        mgr.post(peer, sabm(), t);
+        let i_frame = Event::IReceived(FrameInfo {
+            ns: 0,
+            nr: 0,
+            pid: Some(crate::ax25::PID_NO_LAYER3),
+            info: alloc::vec![0x42],
+            is_command: true,
+            ..Default::default()
+        });
+        mgr.post(peer, i_frame, t)
+    }
+
+    fn emitted_rr(out: &[Vec<u8>]) -> bool {
+        out.iter().any(|b| matches!(classify(b), Event::RrReceived(_)))
+    }
+
+    #[test]
+    fn busy_carrier_defers_the_seize_and_the_ack() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        mgr.set_carrier_sense(Box::new(TestCarrier(Some(true)))); // channel busy
+        let mut t = MockTimerService::new();
+        let peer = call("M0LTE-9");
+
+        let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
+
+        // Busy ⇒ the seize (and the RR ack it drives) is deferred, not granted.
+        assert!(!emitted_rr(&out), "busy carrier must defer the ack: {out:02x?}");
+        assert!(
+            mgr.seize_pending(&peer),
+            "the seize stays pending while the channel is busy"
+        );
+    }
+
+    #[test]
+    fn clear_carrier_grants_the_seize() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        mgr.set_carrier_sense(Box::new(TestCarrier(Some(false)))); // channel idle
+        let mut t = MockTimerService::new();
+        let peer = call("M0LTE-9");
+
+        let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
+
+        // Clear ⇒ the seize is granted and the RR ack goes out; nothing left pending.
+        assert!(emitted_rr(&out), "clear carrier must grant the ack: {out:02x?}");
+        assert!(!mgr.seize_pending(&peer), "no seize left pending once granted");
+    }
+
+    #[test]
+    fn unknown_carrier_fails_open_like_no_source() {
+        // Unknown state (None) must fail open — behave like the default no-source
+        // manager, granting the seize.
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        mgr.set_carrier_sense(Box::new(TestCarrier(None)));
+        let mut t = MockTimerService::new();
+        let peer = call("M0LTE-9");
+
+        let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
+        assert!(emitted_rr(&out), "unknown carrier fails open (grants): {out:02x?}");
+        assert!(!mgr.seize_pending(&peer));
+    }
+
+    #[test]
+    fn deferred_seize_is_granted_once_the_channel_clears() {
+        // A deferral must resume, not drop: after a busy defer, clearing the channel
+        // and driving the session again grants the pending seize (the RR ack goes out).
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        mgr.set_carrier_sense(Box::new(TestCarrier(Some(true))));
+        let mut t = MockTimerService::new();
+        let peer = call("M0LTE-9");
+
+        let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
+        assert!(!emitted_rr(&out));
+        assert!(mgr.seize_pending(&peer));
+
+        // Channel clears; a T2 expiry re-drives the session, and the still-pending
+        // seize is now granted ⇒ the delayed RR is emitted.
+        mgr.set_carrier_sense(Box::new(TestCarrier(Some(false))));
+        let out = mgr.post(peer, Event::T2Expiry, &mut t);
+        assert!(
+            emitted_rr(&out),
+            "the deferred seize resumes when the channel clears: {out:02x?}"
+        );
+        assert!(!mgr.seize_pending(&peer));
     }
 }
