@@ -20,6 +20,7 @@
 //! These are the only intentional departures from the C# behaviour; the wire
 //! codecs ([`tait::ccdi`]) are byte-for-byte identical.
 
+pub mod rssi_tagging;
 pub mod tait;
 
 /// Feature flags for a radio control channel — which of the abstract operations
