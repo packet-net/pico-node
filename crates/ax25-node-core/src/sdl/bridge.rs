@@ -48,6 +48,12 @@ mod uctl {
     pub const DM: u8 = 0x0F;
     /// UA — 0110_0011.
     pub const UA: u8 = 0x63;
+    /// FRMR — 1000_0111 (§4.3.3.6).
+    pub const FRMR: u8 = 0x87;
+    /// XID — 1010_1111 (§4.3.3.7).
+    pub const XID: u8 = 0xAF;
+    /// TEST — 1110_0011 (§4.3.4.2).
+    pub const TEST: u8 = 0xE3;
 }
 
 /// S-frame control low nibble (the N(R) goes in the high 3 bits, mod-8; P/F is
@@ -157,6 +163,16 @@ impl WireSink {
                 // I-frame (mod-8): bit0=0; N(S) in bits 3..1; P in bit4; N(R) in 7..5.
                 let control = ((nr & 0x07) << 5) | if *p { PF_BIT } else { 0 } | ((ns & 0x07) << 1);
                 self.frame(true, control, Some(*pid), info.clone())
+            }
+            FrameSpec::Xid {
+                is_command,
+                pf,
+                info,
+            } => {
+                // XID U-frame (§4.3.3.7): base 0xAF | P/F, no PID; info carries the
+                // encoded parameter TLVs. Mirrors C# `Ax25Frame.Xid`.
+                let control = uctl::XID | if *pf { PF_BIT } else { 0 };
+                self.frame(*is_command, control, None, info.clone())
             }
         }
     }
@@ -318,6 +334,13 @@ pub fn classify_incoming_modulo(frame: &Frame, control_extension: Option<u8>) ->
         uctl::DISC => Event::DiscReceived(info),
         uctl::UA => Event::UaReceived(info),
         uctl::DM => Event::DmReceived(info),
+        // FRMR/XID/TEST are the info-bearing U-frames (§3.5). Mirrors the C#
+        // `Ax25FrameClassifier` U-frame switch. XID is always classified as the
+        // single `XidReceived` event — the command/response distinction rides in
+        // `FrameInfo::is_command`, which the MDL responder reads to decide routing.
+        uctl::FRMR => Event::FrmrReceived(info),
+        uctl::XID => Event::XidReceived(info),
+        uctl::TEST => Event::TestReceived(info),
         c if (c & 0xEF) == crate::ax25::frame::CONTROL_UI => Event::UiReceived(info),
         _ => return None,
     })
@@ -326,3 +349,141 @@ pub fn classify_incoming_modulo(frame: &Frame, control_extension: Option<u8>) ->
 /// PID used when an outbound spec carries none (UI/I always carry one in practice,
 /// but a defensive default keeps the encoder total).
 pub const DEFAULT_PID: u8 = PID_NO_LAYER3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ax25::xid::{info_field, HdlcOptionalFunctions, RejectMode, XidParameters};
+
+    fn call(s: &str) -> Callsign {
+        Callsign::parse(s).unwrap()
+    }
+
+    /// A received XID command (0xAF, command C-bits, F=1) classifies as
+    /// `XidReceived` — not `ControlFieldError` — and its `FrameInfo` marks it a
+    /// command and carries the raw XID info bytes for the responder to parse.
+    #[test]
+    fn xid_command_classifies_as_xid_received_with_command_flag() {
+        let info = info_field::encode(&XidParameters {
+            hdlc_optional_functions: Some(HdlcOptionalFunctions {
+                reject: RejectMode::SelectiveReject,
+                modulo128: false,
+                srej_multiframe: true,
+                segmenter_reassembler: false,
+            }),
+            ..Default::default()
+        });
+        // dest C-bit set, source C-bit clear ⇒ command.
+        let frame = Frame {
+            destination: Address {
+                callsign: call("M0LTE"),
+                crh: true,
+                extension: false,
+            },
+            source: Address {
+                callsign: call("G7XYZ"),
+                crh: false,
+                extension: false,
+            },
+            digipeaters: Vec::new(),
+            control: uctl::XID | PF_BIT, // XID, P/F=1
+            pid: None,
+            info: info.clone(),
+        };
+        let event = classify_incoming(&frame).expect("XID must classify, not ControlFieldError");
+        match event {
+            Event::XidReceived(fi) => {
+                assert!(fi.is_command, "command C-bits ⇒ is_command");
+                assert!(fi.poll_final, "F=1 preserved");
+                assert_eq!(fi.info, info, "raw XID info bytes carried through");
+                // The carried info re-parses to the offered parameters.
+                let p = info_field::parse(&fi.info).expect("info round-trips");
+                assert_eq!(p.hdlc_optional_functions.unwrap().reject, RejectMode::SelectiveReject);
+            }
+            other => panic!("expected XidReceived, got {other:?}"),
+        }
+    }
+
+    /// An XID *response* (response C-bits) still classifies as `XidReceived`
+    /// (matching the single-event C# classifier); the response-ness is in the flag.
+    #[test]
+    fn xid_response_classifies_as_xid_received_with_response_flag() {
+        let frame = Frame {
+            destination: Address {
+                callsign: call("G7XYZ"),
+                crh: false,
+                extension: false,
+            },
+            source: Address {
+                callsign: call("M0LTE"),
+                crh: true,
+                extension: false,
+            },
+            digipeaters: Vec::new(),
+            control: uctl::XID | PF_BIT,
+            pid: None,
+            info: info_field::encode(&XidParameters::default()),
+        };
+        match classify_incoming(&frame).expect("classifies") {
+            Event::XidReceived(fi) => assert!(!fi.is_command, "response C-bits ⇒ not command"),
+            other => panic!("expected XidReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frmr_and_test_classify() {
+        let mk = |base: u8| Frame {
+            destination: Address {
+                callsign: call("M0LTE"),
+                crh: true,
+                extension: false,
+            },
+            source: Address {
+                callsign: call("G7XYZ"),
+                crh: false,
+                extension: false,
+            },
+            digipeaters: Vec::new(),
+            control: base,
+            pid: None,
+            info: Vec::new(),
+        };
+        assert!(matches!(
+            classify_incoming(&mk(uctl::FRMR)),
+            Some(Event::FrmrReceived(_))
+        ));
+        assert!(matches!(
+            classify_incoming(&mk(uctl::TEST)),
+            Some(Event::TestReceived(_))
+        ));
+    }
+
+    /// A built `FrameSpec::Xid` encodes to a real XID U-frame that decodes +
+    /// classifies back to `XidReceived` with the same info — the outbound→inbound
+    /// round-trip the MDL responder relies on.
+    #[test]
+    fn xid_frame_spec_builds_and_round_trips() {
+        let sink = WireSink::new(call("M0LTE"), call("G7XYZ"), Vec::new());
+        let info = info_field::encode(&XidParameters {
+            window_size_rx: Some(7),
+            ..Default::default()
+        });
+        let bytes = sink.encode_spec(&FrameSpec::Xid {
+            is_command: false, // response
+            pf: true,
+            info: info.clone(),
+        });
+        let decoded = Frame::decode(&bytes).expect("XID frame decodes");
+        assert_eq!(decoded.pid, None, "XID carries no PID");
+        assert_eq!(decoded.control & 0xEF, uctl::XID, "XID control base");
+        assert!(decoded.poll_final(), "F=1");
+        assert!(decoded.is_response(), "built as a response");
+        match classify_incoming(&decoded).expect("classifies") {
+            Event::XidReceived(fi) => {
+                assert!(!fi.is_command);
+                assert_eq!(fi.info, info);
+            }
+            other => panic!("expected XidReceived, got {other:?}"),
+        }
+    }
+}

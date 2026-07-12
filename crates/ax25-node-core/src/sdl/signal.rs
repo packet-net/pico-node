@@ -93,6 +93,17 @@ pub enum FrameSpec {
         /// Information field.
         info: Vec<u8>,
     },
+    /// An XID (Exchange Identification) frame — the §4.3.3.7 parameter-negotiation
+    /// U-frame. Carries no PID; the info field is the encoded XID parameters (see
+    /// [`crate::ax25::xid`]). Emitted by the management data-link responder.
+    Xid {
+        /// Command (true) vs response (false).
+        is_command: bool,
+        /// Poll/final bit.
+        pf: bool,
+        /// Information field — the encoded XID parameter TLVs.
+        info: Vec<u8>,
+    },
 }
 
 /// A signal raised to Layer 3 (the upper-layer service-access point). Ports the
