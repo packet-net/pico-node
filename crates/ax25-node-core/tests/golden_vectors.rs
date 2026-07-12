@@ -76,7 +76,7 @@ fn hex_decode(s: &str) -> Vec<u8> {
         .filter(|b| !b.is_ascii_whitespace() && *b != b'_')
         .collect();
     assert!(
-        nibbles.len() % 2 == 0,
+        nibbles.len().is_multiple_of(2),
         "hex string has an odd number of digits: {s:?}"
     );
     nibbles
