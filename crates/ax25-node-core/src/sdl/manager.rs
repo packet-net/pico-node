@@ -18,6 +18,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::ax25::xid::{info_field, XidParameters};
 use crate::ax25::Callsign;
 
 use super::bridge::WireSink;
@@ -26,6 +27,23 @@ use super::carrier::CarrierSense;
 use super::event::Event;
 use super::session::Session;
 use super::timer::TimerService;
+
+/// An in-flight initiator pre-connect XID probe (the LinBPQ SREJ accommodation).
+/// Present on a slot between emitting our XID *command* and its resolution — the
+/// bounded-wait window of C# `Ax25Listener.NegotiateSrejBeforeConnectAsync`. The
+/// SABM is deferred until either the peer's XID *response* arrives (merge via
+/// [`super::mdl::apply_negotiated`] → connect) or [`SessionManager::xid_probe_timeout`]
+/// fires (revert → connect).
+#[derive(Debug, Clone, Copy)]
+pub struct XidProbe {
+    /// The parameter set we advertised in the XID command, merged against the peer's
+    /// response (§6.3.2) via [`super::mdl::apply_negotiated`]. Kept verbatim so the
+    /// merge runs against the exact offer we sent (matching the C# MDL's stored offer).
+    pub offered: XidParameters,
+    /// The local callsign this dial uses, so the deferred SABM re-dials as the same
+    /// station on the timeout path.
+    pub local: Callsign,
+}
 
 /// One occupied link slot: the peer it serves, its session, and its outbound wire
 /// sink (which also captures the DL signals raised upward for the app/console).
@@ -37,6 +55,9 @@ pub struct Slot {
     pub session: Session,
     /// The outbound wire sink (encoded frames + upward DL signals accumulate here).
     pub sink: WireSink,
+    /// An in-flight initiator pre-connect XID probe, if one is awaiting its response.
+    /// `None` on an ordinary link. See [`XidProbe`].
+    pub xid_probe: Option<XidProbe>,
 }
 
 /// A fixed-capacity, peer-keyed collection of [`Session`]s. `N` is the maximum
@@ -167,6 +188,7 @@ impl<const N: usize> SessionManager<N> {
             peer,
             session: Session::new(),
             sink: WireSink::new(local, peer, Vec::new()),
+            xid_probe: None,
         });
         Some(free)
     }
@@ -198,7 +220,7 @@ impl<const N: usize> SessionManager<N> {
         &mut self,
         local: Callsign,
         peer: Callsign,
-        event: Event,
+        mut event: Event,
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
         let Some(i) = self.ensure_slot(peer, local) else {
@@ -212,6 +234,35 @@ impl<const N: usize> SessionManager<N> {
             .as_mut()
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
+
+        // Initiator pre-connect XID *response* handler (mirrors the inbound-router
+        // leg of `Ax25Listener.NegotiateSrejBeforeConnectAsync`): the peer's XID
+        // response to a probe we sent. Merge it into our offer via the §6.3.2
+        // reverts-to (`apply_negotiated`) — settling SREJ/window/N1/T1/N2 to the
+        // mutual result — then proceed to connect by converting this drive into the
+        // deferred `DL-CONNECT-request` (the SABM the probe was holding back). The
+        // negotiated `srej_enabled` is staged on the context and survives the SABM's
+        // figc4.1 `Set Version 2.0` into the established link (proven by the responder
+        // path). A mod-8 probe never merges to mod-128 (our offer is mod-8), so the
+        // deferred connect is always a plain SABM.
+        let mut proceed_to_connect = false;
+        if let Event::XidReceived(fi) = &event {
+            if fi.is_response() && slot.xid_probe.is_some() {
+                let response_info = fi.info.clone();
+                let probe = slot.xid_probe.take().expect("is_some checked above");
+                let response = info_field::parse(&response_info).unwrap_or_default();
+                super::mdl::apply_negotiated(
+                    &mut slot.session.context,
+                    &probe.offered,
+                    &response,
+                );
+                proceed_to_connect = true;
+            }
+        }
+        if proceed_to_connect {
+            // Fall through to the normal dispatch as the deferred connect request.
+            event = Event::DlConnectRequest;
+        }
 
         // Pre-session XID *command* responder (mirrors
         // `Ax25Listener.HandleNoCachedSession`'s XID branch): a peer doing pre-SABM
@@ -322,23 +373,29 @@ impl<const N: usize> SessionManager<N> {
     }
 
     /// Dial `peer` from `local` per a capability-cache [`PeerDialPlan`] — the
-    /// dial-time seam that supplies a peer's learned XID capabilities. The plan's
-    /// [`extended`](PeerDialPlan::extended) selects SABME vs SABM (via
-    /// [`Self::connect_extended`]). Pair with
+    /// dial-time seam that supplies a peer's learned XID capabilities. Pair with
     /// [`PeerCapabilityCache::plan_dial`](super::capability::PeerCapabilityCache::plan_dial)
     /// upstream and
     /// [`PeerCapabilityCache::record_outcome`](super::capability::PeerCapabilityCache::record_outcome)
     /// once the dial resolves (extended-vs-degraded observable from the session's
     /// `is_extended`, SREJ from `srej_enabled`).
     ///
-    /// NOTE: the plan's [`pre_connect_xid`](PeerDialPlan::pre_connect_xid) probe (an
-    /// *initiator* XID command sent before the SABM, then a bounded wait for the
-    /// response — the C# `NegotiateSrejBeforeConnectAsync` fast-probe) is NOT driven
-    /// here: it is an inherently async, multi-step flow above the synchronous
-    /// per-`post` core. The *responder* half is complete (see
-    /// [`super::mdl::respond_pre_session_xid`]), and the merge
-    /// ([`super::mdl::apply_negotiated`]) is available for a fw-side initiator MDL to
-    /// drive; this method honours the extended choice today.
+    /// Two dial shapes, mirroring `Ax25Listener.ConnectAsync(remote, local, extended,
+    /// preConnectXidNegotiatesSrej, ct)`:
+    ///
+    /// - **`plan.pre_connect_xid` (a mod-8 probe)** — begin an *initiator* pre-connect
+    ///   XID probe ([`Self::begin_xid_probe`]): emit our XID *command* and enter the
+    ///   bounded-wait pre-connect state WITHOUT sending SABM yet. The SABM is deferred
+    ///   until either the peer's XID *response* arrives — [`Self::post`] merges it via
+    ///   [`super::mdl::apply_negotiated`] and proceeds to connect — or
+    ///   [`Self::xid_probe_timeout`] fires — reverting to go-back-N and dialling a
+    ///   plain SABM. Mirrors the `NegotiateSrejBeforeConnectAsync` fast-probe. (The
+    ///   probe is meaningless on the extended path — SABME negotiates XID post-UA — so
+    ///   it is only started when `plan.extended` is false; a plan is never both.)
+    /// - **otherwise (a fresh cache hit, the extended path, or a known non-answerer)**
+    ///   — dial straight via [`Self::connect_extended`], honouring
+    ///   [`extended`](PeerDialPlan::extended) (SABME vs SABM). No probe: the whole
+    ///   point of the cache is to skip the stall for a peer we already know.
     pub fn connect_planned(
         &mut self,
         local: Callsign,
@@ -346,7 +403,84 @@ impl<const N: usize> SessionManager<N> {
         plan: PeerDialPlan,
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
-        self.connect_extended(local, peer, plan.extended, timers)
+        if plan.pre_connect_xid && !plan.extended {
+            self.begin_xid_probe(local, peer)
+        } else {
+            self.connect_extended(local, peer, plan.extended, timers)
+        }
+    }
+
+    /// Begin an initiator pre-connect XID probe to `peer` from `local`: seed the
+    /// session context SREJ-capable ([`super::mdl::begin_pre_connect_xid`]), emit our
+    /// XID *command* advertising that offer, and arm the [`XidProbe`] pending state —
+    /// but do NOT send SABM yet. The deferred SABM is driven later, by [`Self::post`]
+    /// on the peer's XID response (merge + connect) or by [`Self::xid_probe_timeout`]
+    /// (revert + connect). Mirrors the offer step of C#
+    /// `Ax25Listener.NegotiateSrejBeforeConnectAsync`. Returns the XID command frame
+    /// (or empty if the manager is full and `peer` has no slot). A no-op re-arm if a
+    /// probe is already pending — the caller should not double-probe.
+    pub fn begin_xid_probe(&mut self, local: Callsign, peer: Callsign) -> Vec<Vec<u8>> {
+        let Some(i) = self.ensure_slot(peer, local) else {
+            return Vec::new();
+        };
+        let slot = self.slots[i]
+            .as_mut()
+            .expect("slot just ensured to be present");
+        slot.sink.sent.clear();
+        // A mod-8 probe: the pre-SABM XID exchange only negotiates SREJ; the link
+        // stays mod-8 (the SABME path negotiates XID post-UA instead). Force mod-8
+        // before deriving the offer so it advertises modulo128 = false.
+        slot.session.context.is_extended = false;
+        let offered = super::mdl::begin_pre_connect_xid(&mut slot.session.context);
+        let info = info_field::encode(&offered);
+        // XID is a U-frame (1 octet in both modulos); keep the sink mod-8 regardless.
+        slot.sink.extended = false;
+        let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
+            is_command: true, // an initiator XID *command* (our offer)
+            pf: true,
+            info,
+        });
+        slot.sink.sent.push(bytes);
+        slot.xid_probe = Some(XidProbe { offered, local });
+        core::mem::take(&mut slot.sink.sent)
+    }
+
+    /// Whether an initiator pre-connect XID probe to `peer` is still awaiting its
+    /// response (the bounded-wait window is open). The firmware arms a timeout while
+    /// this is `true`, and clears it once [`Self::post`] resolves the probe.
+    pub fn xid_probe_pending(&self, peer: &Callsign) -> bool {
+        self.index_of(peer)
+            .and_then(|i| self.slots[i].as_ref())
+            .is_some_and(|slot| slot.xid_probe.is_some())
+    }
+
+    /// The bounded-wait expiry for a pending pre-connect XID probe to `peer`: no XID
+    /// response arrived in the budget, so revert the context to go-back-N
+    /// ([`super::mdl::revert_pre_connect_xid`] — never SREJ unilaterally) and proceed
+    /// to the deferred plain mod-8 SABM. Mirrors the `if (!confirmed)` fallback of C#
+    /// `NegotiateSrejBeforeConnectAsync` composed with the subsequent
+    /// `DL-CONNECT-request`. Returns the SABM frame(s); a no-op (empty) if no probe is
+    /// pending for `peer`. After this resolves the caller records the no-response
+    /// outcome (`dialed_pre_connect_xid = true`, `observed_srej_enabled = false`) into
+    /// the capability cache, so the peer is learned a non-answerer.
+    pub fn xid_probe_timeout(
+        &mut self,
+        peer: Callsign,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        let Some(i) = self.index_of(&peer) else {
+            return Vec::new();
+        };
+        let slot = self.slots[i]
+            .as_mut()
+            .expect("index_of returned Some");
+        let Some(probe) = slot.xid_probe.take() else {
+            return Vec::new(); // no probe pending — nothing to time out
+        };
+        super::mdl::revert_pre_connect_xid(&mut slot.session.context);
+        let local = probe.local;
+        // The slot borrow ends here; proceed to the deferred SABM.
+        self.post_with_local(local, peer, Event::DlConnectRequest, timers)
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -882,7 +1016,8 @@ mod tests {
     }
 
     /// A `connect_planned` dial honours the capability plan's extended choice:
-    /// an extended plan dials SABME, a mod-8 plan dials SABM.
+    /// an extended plan dials SABME, a mod-8 *no-probe* plan dials SABM straight.
+    /// (The `pre_connect_xid` probe leg is covered by the initiator-probe tests below.)
     #[test]
     fn connect_planned_honours_the_dial_plan_extended_choice() {
         use crate::sdl::capability::PeerDialPlan;
@@ -908,10 +1043,215 @@ mod tests {
             peer,
             PeerDialPlan {
                 extended: false,
-                pre_connect_xid: true,
+                pre_connect_xid: false, // fresh cache hit / known non-answerer: dial straight
             },
             &mut MockTimerService::new(),
         );
         assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+        assert!(!m8.xid_probe_pending(&peer), "no probe on a dial-straight plan");
+    }
+
+    // ─── Initiator pre-connect XID probe (mirrors NegotiateSrejBeforeConnectAsync) ─
+
+    const PROBE_PORT: u8 = 0;
+    const PROBE_T0: u64 = 1_000_000;
+
+    /// An XID *response* event offering mod-8 SREJ — what a BPQ-class peer answers a
+    /// pre-connect probe with (the mutual-SREJ path).
+    fn xid_response_offering_srej() -> Event {
+        use crate::ax25::xid::{info_field, HdlcOptionalFunctions, RejectMode, XidParameters};
+        let info = info_field::encode(&XidParameters {
+            hdlc_optional_functions: Some(HdlcOptionalFunctions {
+                reject: RejectMode::SelectiveReject,
+                modulo128: false,
+                srej_multiframe: true,
+                segmenter_reassembler: false,
+            }),
+            ..Default::default()
+        });
+        Event::XidReceived(FrameInfo {
+            poll_final: true,
+            is_command: false, // a *response*, not a command
+            info,
+            ..Default::default()
+        })
+    }
+
+    fn ua() -> Event {
+        Event::UaReceived(FrameInfo {
+            poll_final: true,
+            is_command: false,
+            ..Default::default()
+        })
+    }
+
+    /// (a) probe-out → inject XID response → merged params → the deferred connect
+    /// uses the negotiated mod-8/SREJ; (d) the negotiated SREJ then takes effect on
+    /// the established link (out-of-sequence I-frame ⇒ SREJ, not REJ). Full loop
+    /// through the capability cache: plan_dial → connect_planned → response → connect
+    /// → record_outcome learns the peer answers XID with SREJ.
+    #[test]
+    fn initiator_probe_response_negotiates_srej_connects_and_srej_activates() {
+        use crate::ax25::Frame;
+        use crate::sdl::capability::{PeerCapabilityCache, PeerDialPolicy};
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let mut t = MockTimerService::new();
+        let mut cache: PeerCapabilityCache<4> = PeerCapabilityCache::new();
+
+        // Cache miss + interlink ⇒ the plan probes (mod-8, pre_connect_xid).
+        let plan = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
+        assert!(!plan.extended);
+        assert!(plan.pre_connect_xid);
+
+        // connect_planned begins the probe: an XID *command* on the wire, NO SABM yet.
+        let out = mgr.connect_planned(local, peer, plan, &mut t);
+        assert_eq!(out.len(), 1, "one XID command on the wire");
+        let cmd = Frame::decode(&out[0]).expect("XID command decodes");
+        assert!(cmd.is_command(), "an initiator XID *command*");
+        assert!(matches!(classify(&out[0]), Event::XidReceived(_)));
+        assert!(mgr.xid_probe_pending(&peer), "probe pending until the response");
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected),
+            "no SABM yet — the connect is deferred behind the probe"
+        );
+
+        // The peer answers with an XID *response* offering SREJ ⇒ merge + deferred SABM.
+        let out = mgr.post(peer, xid_response_offering_srej(), &mut t);
+        assert!(
+            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "the deferred SABM fires on the XID response: {out:02x?}"
+        );
+        assert!(!mgr.xid_probe_pending(&peer), "probe resolved");
+        let s = mgr.session_for(&peer).unwrap();
+        assert_eq!(s.state, State::AwaitingConnection);
+        assert!(!s.context.is_extended, "a mod-8 probe never flips to mod-128");
+        assert!(s.context.srej_enabled, "both offered SREJ ⇒ negotiated on");
+
+        // The peer accepts (UA) ⇒ Connected, the SREJ carried into the link.
+        let _ = mgr.post(peer, ua(), &mut t);
+        let s = mgr.session_for(&peer).unwrap();
+        assert_eq!(s.state, State::Connected);
+        assert!(s.context.srej_enabled, "negotiated SREJ survives establishment");
+        let (obs_ext, obs_srej) = (s.context.is_extended, s.context.srej_enabled);
+
+        // record_outcome ⇒ the cache learns the peer answers XID with SREJ.
+        cache.record_outcome(
+            PROBE_PORT, peer, plan.extended, obs_ext, plan.pre_connect_xid, obs_srej, PROBE_T0,
+        );
+        assert_eq!(
+            cache.lookup(PROBE_PORT, &peer).unwrap().supports_srej_via_xid,
+            Some(true)
+        );
+
+        // (d) the negotiated SREJ actually takes effect: an out-of-sequence I-frame
+        // (expecting N(S)=0, receiving N(S)=1) provokes SREJ for the gap — not REJ.
+        let oos = Event::IReceived(FrameInfo {
+            ns: 1,
+            nr: 0,
+            pid: Some(crate::ax25::PID_NO_LAYER3),
+            info: alloc::vec![0x42],
+            is_command: true,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, oos, &mut t);
+        assert!(
+            out.iter().any(|b| matches!(classify(b), Event::SrejReceived(_))),
+            "the negotiated SREJ must emit an SREJ on the wire: {out:02x?}"
+        );
+        assert!(
+            !out.iter().any(|b| matches!(classify(b), Event::RejReceived(_))),
+            "a negotiated-SREJ link must not fall back to REJ: {out:02x?}"
+        );
+    }
+
+    /// (b) probe-out → timeout → correct fallback: revert to go-back-N + a plain
+    /// mod-8 SABM, and the cache records the no-response outcome so the next dial
+    /// skips the probe (a known non-answerer).
+    #[test]
+    fn initiator_probe_timeout_falls_back_to_go_back_n_and_cache_learns() {
+        use crate::ax25::Frame;
+        use crate::sdl::capability::{PeerCapabilityCache, PeerDialPolicy};
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let mut t = MockTimerService::new();
+        let mut cache: PeerCapabilityCache<4> = PeerCapabilityCache::new();
+
+        let plan = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
+        let out = mgr.connect_planned(local, peer, plan, &mut t);
+        assert!(Frame::decode(&out[0]).unwrap().is_command(), "XID command out");
+        assert!(mgr.xid_probe_pending(&peer));
+        // The context is optimistically SREJ-seeded while the probe is open.
+        assert!(mgr.session_for(&peer).unwrap().context.srej_enabled);
+
+        // No response in the budget ⇒ timeout: revert to go-back-N + the deferred SABM.
+        let out = mgr.xid_probe_timeout(peer, &mut t);
+        assert!(
+            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "the fallback SABM fires on timeout: {out:02x?}"
+        );
+        assert!(!mgr.xid_probe_pending(&peer), "probe cleared on timeout");
+        let s = mgr.session_for(&peer).unwrap();
+        assert_eq!(s.state, State::AwaitingConnection);
+        assert!(!s.context.srej_enabled, "silent peer ⇒ reverted to go-back-N");
+        assert!(s.context.implicit_reject);
+        let (obs_ext, obs_srej) = (s.context.is_extended, s.context.srej_enabled);
+
+        // record_outcome ⇒ the cache learns the peer is a non-answerer.
+        cache.record_outcome(
+            PROBE_PORT, peer, plan.extended, obs_ext, plan.pre_connect_xid, obs_srej, PROBE_T0,
+        );
+        assert_eq!(
+            cache.lookup(PROBE_PORT, &peer).unwrap().supports_srej_via_xid,
+            Some(false)
+        );
+        let next = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
+        assert!(!next.pre_connect_xid, "known non-answerer ⇒ skip the probe next time");
+
+        // Timing out with no probe pending is a no-op.
+        assert!(mgr.xid_probe_timeout(peer, &mut t).is_empty());
+    }
+
+    /// (c) a fresh cache hit ⇒ no probe: dial straight with the cached capabilities.
+    /// A learned non-answerer dials a plain SABM; a learned extended peer dials SABME.
+    #[test]
+    fn fresh_cache_hit_skips_the_probe_and_dials_straight() {
+        use crate::sdl::capability::{PeerCapabilityCache, PeerDialPolicy};
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+
+        // Fresh negative (probed XID, no SREJ) ⇒ plan skips the probe.
+        let mut cache: PeerCapabilityCache<4> = PeerCapabilityCache::new();
+        cache.record_outcome(PROBE_PORT, peer, false, false, true, false, PROBE_T0);
+        let plan = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
+        assert!(!plan.pre_connect_xid, "fresh non-answerer ⇒ no probe");
+
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let out = mgr.connect_planned(local, peer, plan, &mut MockTimerService::new());
+        assert!(
+            matches!(classify(&out[0]), Event::SabmReceived(_)),
+            "dials a plain SABM straight, no XID command"
+        );
+        assert!(!mgr.xid_probe_pending(&peer), "no probe on a fresh cache hit");
+
+        // Fresh extended positive ⇒ dials SABME straight (still no probe).
+        let mut cache2: PeerCapabilityCache<4> = PeerCapabilityCache::new();
+        cache2.record_outcome(PROBE_PORT, peer, true, true, false, false, PROBE_T0);
+        let plan2 = cache2.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::UserConnect, PROBE_T0);
+        assert!(plan2.extended);
+        assert!(!plan2.pre_connect_xid);
+        let mut mgr2: SessionManager<2> = SessionManager::new(local);
+        let out = mgr2.connect_planned(local, peer, plan2, &mut MockTimerService::new());
+        assert!(
+            matches!(classify(&out[0]), Event::SabmeReceived(_)),
+            "dials SABME straight from a learned-extended cache hit"
+        );
+        assert!(!mgr2.xid_probe_pending(&peer));
     }
 }
