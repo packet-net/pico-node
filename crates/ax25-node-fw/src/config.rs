@@ -27,6 +27,7 @@ pub struct NodeConfig {
     pub axudp: AxudpConfig,
     pub kiss_tcp: KissTcpConfig,
     pub kiss_serial: KissSerialConfig,
+    pub tait: TaitConfig,
     pub telnet: TelnetConfig,
     pub netrom: NetRomConfig,
     /// Optional `host[:port]` of an MQTT broker to publish logs/status to
@@ -88,6 +89,26 @@ pub struct KissTcpConfig {
 #[derive(Clone)]
 pub struct KissSerialConfig {
     pub baud: u32,
+    /// Optional NinoTNC operating mode to set at boot via KISS SETHW (RAM-only —
+    /// spares flash). `None` (the default) leaves the modem's own configured mode
+    /// untouched. From the build env `NINOTNC_MODE`; a §policy knob so the node can
+    /// force a known modem mode at startup. Values > 15 are rejected by SETHW.
+    pub startup_mode: Option<u8>,
+}
+
+/// CCDI-controlled Tait radio on a second UART (radio integration).
+#[derive(Clone)]
+pub struct TaitConfig {
+    /// CCDI serial rate. The radio's programmed rate wins; default
+    /// [`ax25_node_core::radio::tait::DEFAULT_BAUD`] (28 800). Overridable at build
+    /// time via `TAIT_BAUD`.
+    pub baud: u32,
+    /// Optional programmed channel to select at boot (GO_TO_CHANNEL). `None` leaves
+    /// the radio on its current channel. From the build env `TAIT_CHANNEL`.
+    pub channel: Option<u16>,
+    /// Seconds between RSSI polls — also the cadence at which interleaved
+    /// carrier-sense / PTT PROGRESS edges are drained.
+    pub rssi_poll_secs: u64,
 }
 
 /// Telnet command console (capability 4).
@@ -140,7 +161,18 @@ pub fn load() -> NodeConfig {
         kiss_tcp: KissTcpConfig {
             target: option_env!("KISS_TCP_TARGET"),
         },
-        kiss_serial: KissSerialConfig { baud: 57600 },
+        kiss_serial: KissSerialConfig {
+            baud: 57600,
+            startup_mode: option_env!("NINOTNC_MODE").and_then(|s| s.parse::<u8>().ok()),
+        },
+        tait: TaitConfig {
+            baud: parse_u32(
+                option_env!("TAIT_BAUD"),
+                ax25_node_core::radio::tait::DEFAULT_BAUD,
+            ),
+            channel: option_env!("TAIT_CHANNEL").and_then(|s| s.parse::<u16>().ok()),
+            rssi_poll_secs: 5,
+        },
         telnet: TelnetConfig { port: 8023 },
         netrom: NetRomConfig {
             originate: true,

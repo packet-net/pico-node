@@ -359,7 +359,9 @@ mod firmware {
         spawner.spawn(defmt::unwrap!(transports::kiss_tcp::task(
             stack,
             cfg.kiss_tcp.clone(),
+            cfg.netrom.clone(),
             cfg.identity.callsign,
+            cfg.identity.alias,
         )));
 
         // --- mDNS: make the node discoverable as <hostname>.local + _telnet._tcp ---
@@ -371,7 +373,35 @@ mod firmware {
             },
         )));
 
-        // GATE 6+ returns kiss_serial (needs a NinoTNC) + the session supervisor.
+        // --- GATE 6 (HW-BRINGUP.md §4): KISS-over-UART to a NinoTNC (capability 3).
+        // UART1 on GP20(TX)/GP21(RX), the NinoBLE Rev5 link pins. The task always
+        // spawns (there is no build-env target for a physical UART); it reads
+        // nothing until a NinoTNC is wired, but the read-only NET/ROM tap, NODES
+        // origination, obsolescence sweep and beacon all run. COMPILE-VALIDATED
+        // ONLY — the live exchange needs the NinoTNC on the bench (no hardware here).
+        spawner.spawn(defmt::unwrap!(transports::kiss_serial::task(
+            p.UART1,
+            p.PIN_20,
+            p.PIN_21,
+            cfg.kiss_serial.clone(),
+            cfg.netrom.clone(),
+            cfg.identity.callsign,
+            cfg.identity.alias,
+        )));
+
+        // --- Tait CCDI radio control on a SECOND UART: UART0 GP0(TX)/GP1(RX),
+        // distinct from the NinoTNC KISS link on UART1. Drives the core CCDI driver
+        // (RSSI / PTT / channel / carrier-sense). Always spawns (no build-env target
+        // for a physical UART); it self-quiets if no Tait radio answers. COMPILE-
+        // VALIDATED ONLY — the live exchange needs a Tait radio on GP0/GP1. ---
+        spawner.spawn(defmt::unwrap!(transports::tait_ccdi::task(
+            p.UART0,
+            p.PIN_0,
+            p.PIN_1,
+            cfg.tait.clone(),
+        )));
+
+        // The session supervisor (shared Sessions across transports) is the next seam.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {

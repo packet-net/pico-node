@@ -259,6 +259,12 @@ pub async fn task(
             netrom_cfg.nodes_interval_secs
         );
     }
+    // Obsolescence sweep cadence: age/purge the routing table once per NODES
+    // interval (the C# `NetRomService.OnInterval` sweep — see NetRomService.cs).
+    // Runs whether or not WE originate: obsolescence aging is about the table, and
+    // OBSINIT is calibrated to one broadcast period per decrement. First sweep after
+    // one interval (never age a freshly booted/flash-restored table immediately).
+    let mut next_sweep_at = Instant::now() + nodes_interval;
 
     // The connected-mode session layer for this port + per-peer link state.
     let mut sessions = session::new_sessions(my_call);
@@ -480,6 +486,23 @@ pub async fn task(
                             "axudp: INP3 neighbour {=str} down (silent {=u64}ms) — engine state reset (no table teardown wired)",
                             call_str(&down.neighbour, &mut name),
                             down.silent_for_ms
+                        );
+                    }
+                }
+
+                // Obsolescence sweep — age/purge routes once per NODES interval,
+                // BEFORE origination so a broadcast advertises the freshly-aged
+                // table (the C# `NetRomService.OnInterval` order: Sweep() then
+                // BroadcastNodes()). Drives the correctness path the recon flagged:
+                // without this, obsolescence never ages, dead routes never purge,
+                // and the OBSMIN advertise-gate never engages.
+                if Instant::now() >= next_sweep_at {
+                    next_sweep_at = Instant::now() + nodes_interval;
+                    let purged = netrom.sweep();
+                    if purged > 0 {
+                        defmt::info!(
+                            "netrom: obsolescence sweep purged {=usize} stale route(s)",
+                            purged
                         );
                     }
                 }

@@ -10,8 +10,13 @@ pub mod kiss_tcp;
 pub mod relay;
 pub mod telnet;
 // kiss_serial (NinoTNC over UART1 GP20/21 — NinoBLE Rev5; HARDWARE-NINOBLE.md).
-// Compiled + type-checked; not spawned until a NinoTNC is wired (HW-BRINGUP Gate 6).
+// Spawned; the read pump + NODES origination run, but the live exchange is
+// hardware-gated on a NinoTNC (HW-BRINGUP Gate 6). Compile-validated only.
 pub mod kiss_serial;
+// tait_ccdi (Tait TM8100/TM8200 over its CCDI control channel on UART0 GP0/GP1 —
+// a SECOND UART). Spawned; RSSI/PTT/channel/carrier-sense drive loop runs, but the
+// live exchange is hardware-gated on a Tait radio. Compile-validated only.
+pub mod tait_ccdi;
 
 use ax25_node_core::ax25::frame::CONTROL_UI;
 use ax25_node_core::ax25::{Address, Callsign, Frame};

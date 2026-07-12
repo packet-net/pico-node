@@ -1,4 +1,4 @@
-#![allow(dead_code)] // built + type-checked; the task is spawned at Gate 6 (a NinoTNC on GP20/21)
+#![allow(dead_code)] // spawned now; some core modem setters (params/ackmode) stay unused until a session supervisor drives outbound
 
 //! Capability 3 — KISS-over-serial to a NinoTNC.
 //!
@@ -19,24 +19,38 @@
 //! NinoBLE Rev5 carrier board (docs/HARDWARE-NINOBLE.md), our reference hardware.
 //!
 //! The UART layer below is real (embassy-rp 0.10 `BufferedUart`), so this module
-//! compiles and is type-checked by CI. HARDWARE-GATED for *running*: the live
-//! exchange needs a physical NinoTNC on GP20/21 — not present on the bare-Pico
-//! bench rig, so the task is not spawned yet (HW-BRINGUP Gate 6).
+//! compiles and is type-checked by CI. The task is spawned (mirroring the KISS-TCP
+//! transport: read-only NET/ROM tap + NODES origination + obsolescence sweep +
+//! beacon), but is HARDWARE-GATED for *running*: the live exchange needs a physical
+//! NinoTNC on GP20/21 — not present on the bare-Pico bench rig (HW-BRINGUP Gate 6).
+//! Everything here is COMPILE-VALIDATED ONLY until that hardware is attached.
 
+use ax25_node_core::ax25::{Callsign, PID_NO_LAYER3};
 use ax25_node_core::kiss::ninotnc::{self, NinoTncInboundEvent};
 use ax25_node_core::kiss::serial::ByteStream;
 use ax25_node_core::kiss::{classify::InboundEvent, SerialKissModem};
+use ax25_node_core::netrom::wire::Alias;
+use ax25_node_core::netrom::{
+    NetRomOriginator, NetRomOriginatorOptions, ObserveOutcome, PortId,
+};
 
+use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{PIN_20, PIN_21, UART1};
 use embassy_rp::uart::{
     BufferedInterruptHandler, BufferedUart, Config as UartConfig, Error as UartError,
 };
 use embassy_rp::Peri;
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_io_async::{Read, Write};
 use static_cell::StaticCell;
 
-use crate::config::KissSerialConfig;
+use crate::config::{KissSerialConfig, NetRomConfig};
+use crate::session;
+use crate::transports::{call_str, ui_frame};
+
+/// Seconds between beacon UI frames (mirrors the KISS-TCP transport's beacon).
+const BEACON_INTERVAL_SECS: u64 = 10;
 
 bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
@@ -77,6 +91,9 @@ pub async fn task(
     tx_pin: Peri<'static, PIN_20>,
     rx_pin: Peri<'static, PIN_21>,
     cfg: KissSerialConfig,
+    netrom_cfg: NetRomConfig,
+    my_call: Callsign,
+    node_alias: &'static str,
 ) {
     defmt::info!(
         "kiss-serial: UART1 GP20/21 @ {} baud (NinoTNC direct UART)",
@@ -84,61 +101,170 @@ pub async fn task(
     );
 
     let uart = configure_uart(uart, tx_pin, rx_pin, cfg.baud);
-
     let mut modem = SerialKissModem::new(UartByteStream::new(uart));
 
     // Optionally drive the NinoTNC into a known mode at startup (RAM-only, sparing
-    // flash). The C# node does this via NinoTncSerialPort.SetModeAsync. Example:
-    //   let _ = ninotnc::sethw::build_kiss_frame_into(&mut buf, 6, false, 0)
-    //               .map(|n| /* modem write */);
-    // Left to config policy; the helper is wired below so the import is load-bearing.
-    let _ = ninotnc::sethw::build_payload_byte;
-
-    // The read pump: pull each inbound KISS frame and classify it with NinoTNC
-    // awareness, then route. This mirrors NinoTncSerialPort.DispatchFramesAsync.
-    loop {
-        match modem.read_frame().await {
-            Ok(Some(frame)) => match ninotnc::classify(&frame) {
-                NinoTncInboundEvent::Generic(InboundEvent::Ax25 { ax25, .. }) => {
-                    // READ-ONLY NET/ROM TAP — every frame, BEFORE the address filter,
-                    // so NODES broadcasts (dest "NODES", not us) are heard. Then the
-                    // normal address-filtered routing to a session (same seam as the
-                    // kiss_tcp / axudp transports).
-                    //   session::observe_inbound(&mut netrom, &ax25, my_call, PortId::from_str_lossy("kiss-serial"));
-                    //   session::deliver_kiss(ax25).await;
-                    let _ = ax25;
-                }
-                NinoTncInboundEvent::TxTestDiagnostic { diagnostic, .. } => {
-                    // The on-demand modem diagnostic (button pressed on THIS NinoTNC):
-                    // firmware version, running mode, counters. Surface to the console.
-                    defmt::info!(
-                        "ninotnc tx-test: fw={=str} running-mode={:?}",
-                        diagnostic.firmware_version_raw.as_str(),
-                        diagnostic.running_mode.map(|m| m.mode)
-                    );
-                }
-                NinoTncInboundEvent::AirTest { air_test, .. } => {
-                    // Over-air TX-Test from ANOTHER NinoTNC operator — a link-quality
-                    // probe. Log the learned callsign + press counter.
-                    defmt::info!("ninotnc air-test: seq={}", air_test.sequence_counter);
-                }
-                NinoTncInboundEvent::Generic(InboundEvent::AckModeData { .. })
-                | NinoTncInboundEvent::Generic(InboundEvent::Unknown { .. }) => {
-                    // ACKMODE data / unrecognised — not part of the inbound AX.25 path.
-                }
-            },
-            // EOF / link-down: a buffered UART doesn't really "close", but on a read
-            // error or zero-read we yield and retry rather than spin.
-            Ok(None) => embassy_time::Timer::after_millis(10).await,
+    // flash) — the C# `NinoTncSerialPort.SetModeAsync` equivalent, gated on config
+    // policy. `None` (the default) leaves the modem's own mode untouched.
+    if let Some(mode) = cfg.startup_mode {
+        match modem.set_mode(mode, false).await {
+            Ok(()) => defmt::info!("kiss-serial: NinoTNC mode set to {=u8} (RAM-only)", mode),
             Err(e) => {
-                defmt::warn!("kiss-serial read error: {}", defmt::Debug2Format(&e));
-                embassy_time::Timer::after_millis(100).await;
+                defmt::warn!("kiss-serial: set mode failed: {}", defmt::Debug2Format(&e))
             }
         }
-        // Outbound is symmetric: the session layer hands an AX.25 body to
-        //   modem.send_frame(&ax25_bytes).await
-        // (or modem.send_kiss(Command::AckMode, &payload) for ACKMODE), with the
-        // SETHW / parameter setters available on the same `modem`.
+    }
+
+    // Read-only NET/ROM tap + NODES origination + obsolescence sweep — the same
+    // wiring the KISS-TCP transport uses, now over real RF (Gap A + Gap B). Each
+    // transport owns its own routing table (the single-transport-ownership model;
+    // the shared session/routing supervisor seam is deferred).
+    let mut netrom = session::new_netrom();
+    let port_id = PortId::from_str_lossy("kiss-serial");
+    let originator = NetRomOriginator::new(NetRomOriginatorOptions {
+        enabled: netrom_cfg.originate,
+        alias: Some(Alias::from_str_lossy(node_alias)),
+        node_call: Some(my_call),
+        obsolete_minimum: None,
+    });
+    let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
+    let mut next_nodes_at = Instant::now(); // announce on the first tick
+    let mut next_sweep_at = Instant::now() + nodes_interval;
+    if netrom_cfg.originate {
+        defmt::info!(
+            "kiss-serial: NODES origination on, every {=u32}s",
+            netrom_cfg.nodes_interval_secs
+        );
+    }
+
+    let mut ticker = Ticker::every(Duration::from_secs(BEACON_INTERVAL_SECS));
+    let mut src_buf = [0u8; 16];
+    let mut dst_buf = [0u8; 16];
+
+    // The pump: wake on either an inbound KISS frame or the periodic tick.
+    // `SerialKissModem::read_frame` is cancel-safe — its only await is the UART
+    // read, and the decode state lives in the modem — so dropping it when the
+    // ticker wins loses no buffered bytes.
+    loop {
+        match select(modem.read_frame(), ticker.next()).await {
+            Either::First(read) => match read {
+                Ok(Some(frame)) => match ninotnc::classify(&frame) {
+                    NinoTncInboundEvent::Generic(InboundEvent::Ax25 { ax25, .. }) => {
+                        // READ-ONLY NET/ROM TAP — every frame, BEFORE any address
+                        // filter, so NODES broadcasts (dest "NODES", not us) are heard.
+                        // The same FrameTraced-equivalent point as axudp / kiss_tcp.
+                        let outcome =
+                            session::observe_inbound(&mut netrom, &ax25, my_call, port_id);
+                        if let ObserveOutcome::Ingested { .. } = outcome {
+                            defmt::info!(
+                                "kiss-serial: NODES broadcast ingested ({=u32} destinations known)",
+                                netrom.destination_count() as u32
+                            );
+                        }
+                        defmt::info!(
+                            "kiss-serial: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B",
+                            call_str(&ax25.source.callsign, &mut src_buf),
+                            call_str(&ax25.destination.callsign, &mut dst_buf),
+                            ax25.control,
+                            ax25.info.len(),
+                        );
+                        // Address-filtered connected-mode session routing: the
+                        // session-supervisor seam (the same deferred point kiss_tcp
+                        // leaves — the SDL engine is host-tested in core; only the
+                        // socket/UART wiring is hardware-gated).
+                    }
+                    NinoTncInboundEvent::TxTestDiagnostic { diagnostic, .. } => {
+                        // The on-demand modem diagnostic (button pressed on THIS
+                        // NinoTNC): firmware version, running mode, counters.
+                        defmt::info!(
+                            "ninotnc tx-test: fw={=str} running-mode={:?}",
+                            diagnostic.firmware_version_raw.as_str(),
+                            diagnostic.running_mode.map(|m| m.mode)
+                        );
+                    }
+                    NinoTncInboundEvent::AirTest { air_test, .. } => {
+                        // Over-air TX-Test from ANOTHER NinoTNC operator — a
+                        // link-quality probe. Log the learned callsign + press counter.
+                        defmt::info!("ninotnc air-test: seq={}", air_test.sequence_counter);
+                    }
+                    NinoTncInboundEvent::StatusReport { status, .. } => {
+                        // Periodic numeric =II: diagnostic-register beacon (or a
+                        // GETALL reply) — modem telemetry, not an inbound AX.25 frame.
+                        defmt::info!(
+                            "ninotnc status: fw={=str}",
+                            status.firmware_version_raw.as_str()
+                        );
+                    }
+                    NinoTncInboundEvent::RssiReading { rssi, .. } => {
+                        // A GETRSSI reply — RX-audio level, not an inbound AX.25 frame.
+                        defmt::info!("ninotnc rssi: {=i32} centi-dB", rssi.centi_db);
+                    }
+                    NinoTncInboundEvent::Generic(InboundEvent::AckModeData { .. })
+                    | NinoTncInboundEvent::Generic(InboundEvent::Unknown { .. }) => {
+                        // ACKMODE data / unrecognised — not part of the inbound AX.25 path.
+                    }
+                },
+                // EOF / link-down: a buffered UART doesn't really "close", but on a
+                // read error or zero-read we yield and retry rather than spin.
+                Ok(None) => Timer::after_millis(10).await,
+                Err(e) => {
+                    defmt::warn!("kiss-serial read error: {}", defmt::Debug2Format(&e));
+                    Timer::after_millis(100).await;
+                }
+            },
+            Either::Second(()) => {
+                // The periodic tick drains outbound to the UART: beacon, then (on the
+                // NODES interval) the obsolescence sweep and NODES origination. This
+                // mirrors the KISS-TCP tick branch; a session supervisor will later
+                // add connected-mode I-frame outbound through the same `modem`.
+                let beacon = ui_frame(
+                    my_call,
+                    Callsign::parse("IDENT").expect("static"),
+                    PID_NO_LAYER3,
+                    b"pico-node KISS-serial beacon (HW-BRINGUP Gate 6)",
+                );
+                if let Err(e) = modem.send_frame(&beacon.encode()).await {
+                    defmt::warn!("kiss-serial: beacon send failed: {}", defmt::Debug2Format(&e));
+                }
+
+                // Obsolescence sweep — age/purge once per NODES interval, before
+                // origination (the C# `NetRomService.OnInterval` order).
+                if Instant::now() >= next_sweep_at {
+                    next_sweep_at = Instant::now() + nodes_interval;
+                    let purged = netrom.sweep();
+                    if purged > 0 {
+                        defmt::info!(
+                            "kiss-serial: obsolescence sweep purged {=usize} stale route(s)",
+                            purged
+                        );
+                    }
+                }
+
+                // NODES origination — build our broadcasts from the live table, wrap
+                // each as a UI frame (dest NODES, PID 0xCF), and send it to the UART.
+                if netrom_cfg.originate && Instant::now() >= next_nodes_at {
+                    next_nodes_at = Instant::now() + nodes_interval;
+                    let payloads = originator.broadcast_nodes(netrom.table());
+                    let dest = NetRomOriginator::nodes_destination();
+                    let mut sent = 0usize;
+                    for payload in &payloads {
+                        let frame = ui_frame(my_call, dest, NetRomOriginator::PID, payload);
+                        if let Err(e) = modem.send_frame(&frame.encode()).await {
+                            defmt::warn!(
+                                "kiss-serial: NODES send failed: {}",
+                                defmt::Debug2Format(&e)
+                            );
+                            continue;
+                        }
+                        sent += 1;
+                    }
+                    defmt::info!(
+                        "kiss-serial: NODES broadcast sent ({=usize} frame(s))",
+                        sent
+                    );
+                }
+            }
+        }
     }
 }
 
