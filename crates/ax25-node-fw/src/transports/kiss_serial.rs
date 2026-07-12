@@ -122,6 +122,18 @@ pub async fn task(
                     // probe. Log the learned callsign + press counter.
                     defmt::info!("ninotnc air-test: seq={}", air_test.sequence_counter);
                 }
+                NinoTncInboundEvent::StatusReport { status, .. } => {
+                    // Periodic numeric =II: diagnostic-register beacon (or a GETALL
+                    // reply) — modem telemetry, not an inbound AX.25 frame.
+                    defmt::info!(
+                        "ninotnc status: fw={=str}",
+                        status.firmware_version_raw.as_str()
+                    );
+                }
+                NinoTncInboundEvent::RssiReading { rssi, .. } => {
+                    // A GETRSSI reply — RX-audio level, not an inbound AX.25 frame.
+                    defmt::info!("ninotnc rssi: {=i32} centi-dB", rssi.centi_db);
+                }
                 NinoTncInboundEvent::Generic(InboundEvent::AckModeData { .. })
                 | NinoTncInboundEvent::Generic(InboundEvent::Unknown { .. }) => {
                     // ACKMODE data / unrecognised — not part of the inbound AX.25 path.
