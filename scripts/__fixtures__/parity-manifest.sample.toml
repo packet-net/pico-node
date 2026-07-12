@@ -1,0 +1,98 @@
+# parity-manifest.sample.toml — FIXTURE COPY of the pico-node parity manifest.
+#
+# This is a self-test fixture for scripts/parity-check.mjs living on the
+# feat/parity-ci-drift-guard branch. The REAL manifest (repo-root
+# parity-manifest.toml) is produced on the sibling branch (capability
+# manifest + golden-vector runner) and merges alongside this file. Until
+# then, run the checker against this fixture:
+#
+#     node scripts/parity-check.mjs --manifest scripts/__fixtures__/parity-manifest.sample.toml
+#
+# Keep this fixture schema-identical to the real manifest so a checker that
+# passes here passes there. See parity/README.md.
+#
+# Contract: pico-node's declared position in the three-stack parity contract
+# (C# Packet.* authoritative <-> TS @packet-net/ax25 <-> Rust pico-node).
+# Every codec/behaviour set is EITHER opted-in (the shared corpus runs and CI
+# fails on mismatch) OR declared-out with a reason — no silent holes.
+
+schema    = 1
+stack     = "pico-node"
+reference = "packet-net/packet.net"   # C# is the reference runtime
+
+[sdl]
+# Session/connected-mode vectors are only meaningful if all three stacks drive
+# the SAME SDL version. Surface the pin here so a skew is a visible, reviewable
+# diff. (C# NuGet Packet.Ax25.Sdl and the Rust ax25sdl crate must agree.)
+crate   = "ax25sdl"
+repo    = "packet-net/ax25sdl"
+version = "0.8.0"
+pin     = "crate-v0.8.0"              # pin a tag, not `main`
+
+# ─── opted-IN: pico-node runs the shared corpus for these; CI fails on any
+# mismatch. `capabilities` carries negotiate-down degradations as first-class
+# entries so a vector can require one and the runner can skip-with-note a
+# vector whose capability the manifest does not claim.
+
+[vector_sets.ax25_mod8]
+in           = true
+capabilities = ["mod8"]
+
+[vector_sets.ax25_mod128]
+in           = true
+capabilities = ["mod128", "negotiate-down-from-mod128"]
+
+[vector_sets.kiss]
+in           = true
+capabilities = ["kiss"]
+
+[vector_sets.axudp]
+in           = true
+capabilities = ["axudp"]
+
+[vector_sets.netrom_quality]
+in           = true
+capabilities = ["netrom-quality"]
+
+[vector_sets.netrom_nodes]
+in           = true
+capabilities = ["netrom-nodes"]
+
+[vector_sets.netrom_l4]
+in           = true
+capabilities = ["netrom-l4"]
+
+[vector_sets.srej]
+in           = true
+capabilities = ["srej", "negotiate-down-from-srej"]
+
+[vector_sets.xid]
+in           = true
+capabilities = ["xid"]
+
+# ─── DECLARED-OUT / deferred: a missing runner here is a reviewed decision,
+# not a hole. Each carries a reason; the checker requires it.
+
+[vector_sets.sdm_telegram]
+in     = false
+reason = "SDM telegram codec in progress; runner lands with the feature"
+
+[vector_sets.agwpe]
+in     = false
+reason = "AGWPE not implemented on pico-node"
+
+[vector_sets.rhpv2]
+in     = false
+reason = "RHPv2 server is node-host-only; out of embedded scope"
+
+[vector_sets.mqtt]
+in     = false
+reason = "MQTT emission is node-host telemetry, not an on-air codec"
+
+[vector_sets.aprs]
+in     = false
+reason = "APRS parse/build not ported to pico-node"
+
+[vector_sets.headend]
+in     = false
+reason = "split-station head-end is a separate daemon; no pico-node codec"

@@ -1,0 +1,36 @@
+# Cross-stack parity drift guard for pico-node.
+#
+# Asserts C#-inventory ⊆ pico-node-declared: every named flag / quirk / preset /
+# listener capability in the C# reference (packet-net/packet.net, vendored into
+# parity/expected-inventory.json) is EITHER covered by an opted-in vector_set in
+# parity-manifest.toml, OR recorded as a reviewed exception in
+# parity-exceptions.json. Any undocumented gap fails the build.
+#
+# Self-hosted only. This project has NO GitHub-hosted-runner budget — every job
+# targets [self-hosted, Linux, X64], matching ci.yml. Do not change this label.
+#
+# The guard is source-only (no cargo, no cross-repo token): it reads three
+# checked-in files with /usr/bin/node. Refreshing the C# snapshot is a manual,
+# reviewed step — see parity/README.md.
+name: parity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node version
+        run: node --version
+
+      # Runs against the repo-root parity-manifest.toml. Until the sibling
+      # manifest branch merges that file, the checker falls back to the sample
+      # fixture (loudly labelled) so the guard still runs green.
+      - name: parity drift guard (C# ⊆ pico-node-declared)
+        run: node scripts/parity-check.mjs

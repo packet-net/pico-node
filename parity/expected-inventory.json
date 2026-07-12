@@ -1,0 +1,77 @@
+{
+  "$comment": "VENDORED SNAPSHOT of the C# reference named-flag / quirk / preset / listener inventory, extracted from packet-net/packet.net src/Packet.Core + src/Packet.Ax25. This is the C# side of the pico-node parity contract, checked in so scripts/parity-check.mjs runs on a self-hosted runner with NO cross-repo token. Refresh it when the C# inventory changes — see parity/README.md. Each item is either mapped to an opted-in manifest vector_set (coverage) OR must be listed in parity-exceptions.json with a reason; the checker fails on any item that is neither.",
+  "source": {
+    "repo": "packet-net/packet.net",
+    "commit": "9b59ed1",
+    "extractedOn": "2026-07-12",
+    "files": {
+      "parseOptions": "src/Packet.Core/Ax25ParseOptions.cs",
+      "quirks": "src/Packet.Ax25/Session/Ax25SessionQuirks.cs",
+      "xid": "src/Packet.Ax25/Xid/XidParseOptions.cs",
+      "listener": "src/Packet.Ax25/Session/Ax25Listener.cs"
+    },
+    "extraction": "regex-over-source, mirroring ax25-ts scripts/parity-check.mjs: `public bool X { get;` flags, `public static <Type> X { get;` presets, `public T X { get;` listener options within the Ax25ListenerOptions class body, `public (async)? T X(` methods + `public event T X;` events within the Ax25Listener class body."
+  },
+  "coverageLegend": {
+    "coverage": "{ set: <manifest vector_set name>, capability?: <capability that set must declare> } — the item is covered iff that set is in=true (and, when a capability is named, that set declares it).",
+    "unmapped": "an item with no `coverage` MUST appear in parity-exceptions.json (inventoryExceptions[section][name]) with a reason, or the checker fails."
+  },
+  "items": [
+    { "section": "parseOptionFlags", "name": "AllowEmptyCallsignBase", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "AX.25 address-slot parse leniency; exercised by mod-8 frame vectors." },
+    { "section": "parseOptionFlags", "name": "AllowInfoOnSupervisoryFrames", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "S-frame trailing-info acceptance; mod-8 frame parse." },
+    { "section": "parseOptionFlags", "name": "AllowCommandFrameAsResponse", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "v1.x C-bit leniency on SABM/SABME/DISC; mod-8 frame parse." },
+
+    { "section": "parsePresets", "name": "Strict", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Parse-option preset over the AX.25 frame parser." },
+    { "section": "parsePresets", "name": "Lenient", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Parse-option preset over the AX.25 frame parser." },
+    { "section": "parsePresets", "name": "Bpq", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Peer-specific parse preset (BPQ)." },
+    { "section": "parsePresets", "name": "Xrouter", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Peer-specific parse preset (Xrouter)." },
+    { "section": "parsePresets", "name": "Direwolf", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Peer-specific parse preset (Direwolf)." },
+
+    { "section": "quirkFlags", "name": "SegmentFirstCarriesL3Pid", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode segmentation/reassembly PID placement." },
+    { "section": "quirkFlags", "name": "Ax25Spec38SrejSelectiveRetransmit", "coverage": { "set": "srej", "capability": "srej" }, "note": "SREJ selective retransmit." },
+    { "section": "quirkFlags", "name": "Ax25Spec40DiscardOutOfWindowIFrames", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode I-frame window handling." },
+    { "section": "quirkFlags", "name": "Ax25Spec41KarnSrtSampling", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "T1/RTT (Karn) timer sampling in connected mode." },
+    { "section": "quirkFlags", "name": "Ax25Spec42SrejTargetsGap", "coverage": { "set": "srej", "capability": "srej" }, "note": "SREJ gap-targeting behaviour." },
+    { "section": "quirkFlags", "name": "Ax25Spec43DlFlowOffEntersBusy", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "DL-flow-off -> RNR/busy connected-mode behaviour." },
+    { "section": "quirkFlags", "name": "Ax25Spec44Mod128ConnectRoutesToV22", "coverage": { "set": "ax25_mod128", "capability": "negotiate-down-from-mod128" }, "note": "Mod-128 (SABME) connect routing / v2.2 selection." },
+    { "section": "quirkFlags", "name": "Ax25Spec45FrmrFallbackReestablishesV20", "coverage": { "set": "ax25_mod128", "capability": "negotiate-down-from-mod128" }, "note": "FRMR fallback re-establishes as v2.0 (mod-8): a negotiate-down." },
+    { "section": "quirkFlags", "name": "Ax25Spec48DmRejectionDegradesToV20", "coverage": { "set": "ax25_mod128", "capability": "negotiate-down-from-mod128" }, "note": "DM rejection degrades v2.2 -> v2.0 (mod-8): a negotiate-down." },
+    { "section": "quirkFlags", "name": "Ax25Spec47TimerRecoveryDrainAdvancesVR", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Timer-recovery drain advances V(R); connected mode." },
+    { "section": "quirkFlags", "name": "Ax25Spec9AckProgressResetsRc", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Ack progress resets retry counter; connected mode." },
+    { "section": "quirkFlags", "name": "Ax25Spec13ClampSrejWindowToHalfModulus", "coverage": { "set": "srej", "capability": "srej" }, "note": "Clamp SREJ outstanding window to half the modulus." },
+
+    { "section": "quirkPresets", "name": "Default", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Session-quirks preset over connected-mode behaviour." },
+    { "section": "quirkPresets", "name": "StrictlyFaithful", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Session-quirks preset over connected-mode behaviour." },
+
+    { "section": "xidFlags", "name": "AllowGroupLengthOverrun", "coverage": { "set": "xid", "capability": "xid" }, "note": "XID Group-Length overrun leniency." },
+    { "section": "xidFlags", "name": "AllowTruncatedParameter", "coverage": { "set": "xid", "capability": "xid" }, "note": "XID truncated trailing-parameter leniency." },
+
+    { "section": "listenerOptions", "name": "MyCall", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode session identity; drives address fields." },
+    { "section": "listenerOptions", "name": "T1V", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "T1 timer value; connected-mode timing behaviour." },
+    { "section": "listenerOptions", "name": "T2", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "T2 timer value; connected-mode timing behaviour." },
+    { "section": "listenerOptions", "name": "T3", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "T3 timer value; connected-mode timing behaviour." },
+    { "section": "listenerOptions", "name": "N2", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "N2 retry count; connected-mode behaviour." },
+    { "section": "listenerOptions", "name": "K", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Window size K; connected-mode behaviour (mod-8/mod-128)." },
+    { "section": "listenerOptions", "name": "ParseOptions", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Passthrough of Ax25ParseOptions into the frame parser." },
+    { "section": "listenerOptions", "name": "Quirks", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Passthrough of Ax25SessionQuirks into the session FSM." },
+    { "section": "listenerOptions", "name": "PreferExtendedConnect", "coverage": { "set": "ax25_mod128", "capability": "negotiate-down-from-mod128" }, "note": "Chooses SABME (mod-128) vs SABM (mod-8) on connect." },
+    { "section": "listenerOptions", "name": "PreConnectXidNegotiatesSrej", "coverage": { "set": "xid", "capability": "xid" }, "note": "Pre-connect XID negotiation of SREJ capability." },
+    { "section": "listenerOptions", "name": "MaxCachedPeers" },
+    { "section": "listenerOptions", "name": "ConfigureSession" },
+    { "section": "listenerOptions", "name": "CarrierSense" },
+    { "section": "listenerOptions", "name": "RestartT1OnTxComplete" },
+
+    { "section": "listenerSurface", "name": "ConnectAsync", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode establishment (SABM/SABME -> UA)." },
+    { "section": "listenerSurface", "name": "SendUiAsync", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "UI-frame transmit; mod-8 frame codec." },
+    { "section": "listenerSurface", "name": "SendTestAsync", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "TEST-frame transmit; mod-8 frame codec." },
+    { "section": "listenerSurface", "name": "SendData", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode I-frame data transmit." },
+    { "section": "listenerSurface", "name": "StartAsync" },
+    { "section": "listenerSurface", "name": "StopAsync" },
+    { "section": "listenerSurface", "name": "DisposeAsync" },
+    { "section": "listenerSurface", "name": "UpdateSessionParameters" },
+    { "section": "listenerSurface", "name": "AddLocalAlias" },
+    { "section": "listenerSurface", "name": "RemoveLocalAlias" },
+    { "section": "listenerSurface", "name": "FrameTraced" },
+    { "section": "listenerSurface", "name": "SessionAccepted" }
+  ]
+}
