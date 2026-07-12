@@ -132,6 +132,12 @@ impl<const N: usize> SessionManager<N> {
             .as_mut()
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
+        // Track the link's negotiated modulo so the sink emits 2-octet extended
+        // control on an I/S frame once the session is mod-128 (SABME-established).
+        // is_extended is settled before any I/S frame is emitted (it is set on the
+        // connect request / adopted from an inbound SABM/SABME, all of which emit
+        // only U frames), so reading it here — before dispatch — is correct.
+        slot.sink.extended = slot.session.context.is_extended;
         slot.session.post_event(event, timers, &mut slot.sink);
 
         // Grant LM-SEIZE immediately: the node's wire transports (AXUDP,

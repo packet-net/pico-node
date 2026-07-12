@@ -8,11 +8,20 @@
 //! ```
 //!
 //! Modulo-8 control is one octet; an extended (modulo-128) I/S frame has a second
-//! control octet. The transport layer can't know the link's modulo from the bytes
-//! alone (matching the C# `AxudpSocket.ReceiveAsync` remark), so [`Frame::decode`]
-//! decodes the modulo-8 view and exposes the raw control octet; a session-aware
-//! caller re-parses at the negotiated modulo. The frame-type discriminator bits
+//! control octet (Fig 4.1b: 7-bit N(S)/N(R), P/F at bit 0 of the second octet).
+//! The transport layer can't know the link's modulo from the bytes alone (matching
+//! the C# `AxudpSocket.ReceiveAsync` remark), so the caller picks the decode entry
+//! point for the link's negotiated modulo: [`Frame::decode`] for modulo-8, and
+//! [`Frame::decode_with_modulo`] for a link that may be extended (it consumes the
+//! second octet on I/S frames and returns it). The frame-type discriminator bits
 //! live in the first control octet in both modes, so classification is reliable.
+//!
+//! The second control octet is *not* stored on [`Frame`] — the struct stays the
+//! modulo-8 envelope every transport in the crate constructs. It is threaded
+//! explicitly: returned by [`Frame::decode_with_modulo`], read back through the
+//! mode-aware [`Frame::nr_with`] / [`Frame::ns_with`] / [`Frame::poll_final_with`]
+//! accessors, and supplied to [`Frame::encode_extended`]. The wire bytes are
+//! byte-for-byte identical to the C# `Ax25Frame` extended codec.
 //!
 //! `alloc`-gated for the owned digipeater list + info buffer; a heapless variant
 //! (fixed `MAX_DIGIPEATERS` array + an info slice into the caller's buffer) is the
@@ -91,6 +100,46 @@ impl Frame {
         (self.control & 0x10) != 0
     }
 
+    // ─── Mode-aware control accessors (mod-8 / mod-128) ─────────────────────
+    //
+    // The extended (mod-128) second control octet is NOT stored on this struct —
+    // `Frame` stays the mod-8 envelope every transport in the crate constructs.
+    // A modulo-aware caller threads the second octet (from [`Frame::decode_with_modulo`]
+    // or the [`crate::sdl::bridge`] build path) into these accessors, which mirror
+    // `Ax25Frame.Nr` / `Ax25Frame.Ns` / `Ax25Frame.PollFinal` (Ax25Frame.cs:96-119)
+    // byte-for-byte. Pass `None` for a mod-8 frame (3-bit fields, P/F at bit 4);
+    // `Some(ext)` for an extended I/S frame (7-bit fields, P/F at bit 0 of octet 2).
+
+    /// N(R), mode-aware. `control_extension` is the second control octet of an
+    /// extended (mod-128) I/S frame, or `None` for mod-8. 3-bit in mod-8 (control
+    /// bits 7-5); 7-bit in mod-128 (second octet bits 7-1). Meaningless on U frames.
+    pub fn nr_with(&self, control_extension: Option<u8>) -> u8 {
+        match control_extension {
+            Some(ext) => (ext >> 1) & 0x7F,
+            None => (self.control >> 5) & 0x07,
+        }
+    }
+
+    /// N(S), mode-aware. 3-bit in mod-8 (control bits 3-1); 7-bit in mod-128 (first
+    /// control octet bits 7-1). Meaningful only on I frames — on an S frame the same
+    /// bits encode the supervisory type, so the caller must check the frame type first.
+    pub fn ns_with(&self, control_extension: Option<u8>) -> u8 {
+        match control_extension {
+            Some(_) => (self.control >> 1) & 0x7F,
+            None => (self.control >> 1) & 0x07,
+        }
+    }
+
+    /// The P/F bit, mode-aware. In mod-8 (and any U frame, 1 octet in both modes)
+    /// it is bit 4 of the control octet; in an extended I/S frame it migrates to
+    /// bit 0 of the second control octet (Fig 4.1b).
+    pub fn poll_final_with(&self, control_extension: Option<u8>) -> bool {
+        match control_extension {
+            Some(ext) => (ext & 0x01) != 0,
+            None => (self.control & 0x10) != 0,
+        }
+    }
+
     /// Command/response per §6.1.2: command = dest C-bit set, source C-bit clear.
     pub fn is_command(&self) -> bool {
         self.destination.crh && !self.source.crh
@@ -101,8 +150,30 @@ impl Frame {
         !self.destination.crh && self.source.crh
     }
 
-    /// Decode a KISS-delivered AX.25 frame (no flags, no FCS).
+    /// Decode a KISS-delivered AX.25 frame (no flags, no FCS), assuming modulo-8
+    /// (a 1-octet control field). Use [`Frame::decode_with_modulo`] to decode a
+    /// frame on a link operating at a known (possibly extended) modulo.
     pub fn decode(bytes: &[u8]) -> Result<Self, ParseError> {
+        Self::decode_inner(bytes, false).map(|(frame, _)| frame)
+    }
+
+    /// Decode a KISS-delivered frame for a link at a known modulo. When `extended`,
+    /// an I or S frame carries a 2-octet control field (Fig 4.1b); the second octet
+    /// is consumed and returned alongside the frame. U frames are 1 octet in both
+    /// modes, so the second octet is `None` for them and for every modulo-8 frame.
+    /// The width is *not* derivable from the octets alone — the receive path, which
+    /// knows the session's negotiated modulo, supplies `extended`. Mirrors
+    /// `Ax25Frame.TryParse(..., bool extended, ...)` (Ax25Frame.cs:358-438).
+    pub fn decode_with_modulo(
+        bytes: &[u8],
+        extended: bool,
+    ) -> Result<(Self, Option<u8>), ParseError> {
+        Self::decode_inner(bytes, extended)
+    }
+
+    /// Shared decode body. Returns the decoded frame plus the extended control
+    /// octet (`Some` only for an extended I/S frame).
+    fn decode_inner(bytes: &[u8], extended: bool) -> Result<(Self, Option<u8>), ParseError> {
         // Two mandatory address slots.
         if bytes.len() < ADDRESS_LEN * 2 {
             return Err(ParseError::TooShort);
@@ -144,6 +215,21 @@ impl Frame {
         let control = bytes[offset];
         offset += 1;
 
+        // Extended (modulo-128) I and S frames carry a 2-octet control field
+        // (Fig 4.1b); U frames are 1 octet in both modes. The width can't be told
+        // from the first octet alone, so the caller supplies the link's modulo via
+        // `extended`. Frame-type discriminator: bits 1-0 = 11 → U. Mirrors
+        // Ax25Frame.TryParse (Ax25Frame.cs:425-438).
+        let is_u_frame = (control & 0x03) == 0x03;
+        let mut control_extension = None;
+        if extended && !is_u_frame {
+            if bytes.len() < offset + 1 {
+                return Err(ParseError::MissingControl);
+            }
+            control_extension = Some(bytes[offset]);
+            offset += 1;
+        }
+
         // PID present on I and UI frames. I = bit0 clear; UI = (ctrl & 0xEF)==0x03.
         let is_i = (control & 0x01) == 0;
         let is_ui = (control & 0xEF) == CONTROL_UI;
@@ -168,14 +254,17 @@ impl Frame {
             d.extension = false;
         }
 
-        Ok(Self {
-            destination,
-            source,
-            digipeaters,
-            control,
-            pid,
-            info,
-        })
+        Ok((
+            Self {
+                destination,
+                source,
+                digipeaters,
+                control,
+                pid,
+                info,
+            },
+            control_extension,
+        ))
     }
 
     /// Number of bytes [`Frame::encode_into`] will write.
@@ -183,14 +272,16 @@ impl Frame {
         ADDRESS_LEN * (2 + self.digipeaters.len()) + 1 + self.pid.map_or(0, |_| 1) + self.info.len()
     }
 
-    /// Encode this frame (KISS body form) into `dst`. Returns bytes written, or
-    /// `None` if `dst` is too small. Sets the extension bits so the last address
-    /// slot terminates the address field correctly.
-    pub fn encode_into(&self, dst: &mut [u8]) -> Option<usize> {
-        let n = self.encoded_len();
-        if dst.len() < n {
-            return None;
-        }
+    /// Number of bytes [`Frame::encode_extended_into`] will write — as
+    /// [`Frame::encoded_len`] but with the second (modulo-128) control octet.
+    pub fn encoded_extended_len(&self) -> usize {
+        ADDRESS_LEN * (2 + self.digipeaters.len()) + 2 + self.pid.map_or(0, |_| 1) + self.info.len()
+    }
+
+    /// Write the address field (destination + source + digipeaters) into `dst`,
+    /// setting the extension bits so the last slot terminates the field. Returns
+    /// the number of octets written. Shared by the modulo-8 and extended encoders.
+    fn write_address_field(&self, dst: &mut [u8]) -> Option<usize> {
         let mut off = 0;
 
         // Destination: extension clear iff there is no source after it — there
@@ -208,6 +299,18 @@ impl Frame {
             write_addr(&mut dst[off..], digi, more)?;
             off += ADDRESS_LEN;
         }
+        Some(off)
+    }
+
+    /// Encode this frame (KISS body form, modulo-8: 1 control octet) into `dst`.
+    /// Returns bytes written, or `None` if `dst` is too small. Sets the extension
+    /// bits so the last address slot terminates the address field correctly.
+    pub fn encode_into(&self, dst: &mut [u8]) -> Option<usize> {
+        let n = self.encoded_len();
+        if dst.len() < n {
+            return None;
+        }
+        let mut off = self.write_address_field(dst)?;
 
         dst[off] = self.control;
         off += 1;
@@ -223,10 +326,51 @@ impl Frame {
         Some(off)
     }
 
-    /// Encode and return the bytes.
+    /// Encode this frame as an extended (modulo-128) I/S frame into `dst`:
+    /// `self.control` is the first control octet (I: `(N(S) << 1)`; S: the base
+    /// SS/"01" octet with high nibble zero), and `control_extension` the second
+    /// (`(N(R) << 1) | P/F`, Fig 4.1b). Address / PID / info handling is identical
+    /// to [`Frame::encode_into`]. The two control octets are transmitted first
+    /// octet first (Ax25Frame.WriteTo, Ax25Frame.cs:303-312). Returns bytes written,
+    /// or `None` if `dst` is too small.
+    pub fn encode_extended_into(&self, control_extension: u8, dst: &mut [u8]) -> Option<usize> {
+        let n = self.encoded_extended_len();
+        if dst.len() < n {
+            return None;
+        }
+        let mut off = self.write_address_field(dst)?;
+
+        dst[off] = self.control;
+        off += 1;
+        dst[off] = control_extension;
+        off += 1;
+
+        if let Some(pid) = self.pid {
+            dst[off] = pid;
+            off += 1;
+        }
+
+        dst[off..off + self.info.len()].copy_from_slice(&self.info);
+        off += self.info.len();
+
+        Some(off)
+    }
+
+    /// Encode and return the bytes (modulo-8, 1 control octet).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; self.encoded_len()];
         let n = self.encode_into(&mut buf).expect("buffer is exactly sized");
+        buf.truncate(n);
+        buf
+    }
+
+    /// Encode and return the bytes as an extended (modulo-128) I/S frame, with the
+    /// supplied second control octet. See [`Frame::encode_extended_into`].
+    pub fn encode_extended(&self, control_extension: u8) -> Vec<u8> {
+        let mut buf = alloc::vec![0u8; self.encoded_extended_len()];
+        let n = self
+            .encode_extended_into(control_extension, &mut buf)
+            .expect("buffer is exactly sized");
         buf.truncate(n);
         buf
     }
@@ -361,5 +505,134 @@ mod tests {
         let wire = f.encode();
         let g = Frame::decode(&wire).unwrap();
         assert!(g.poll_final());
+    }
+
+    // ─── Extended (modulo-128) control codec ────────────────────────────────
+
+    /// Build the mod-128 first control octet for an I frame: `(N(S) << 1)`, bit0=0.
+    fn ext_i_octet0(ns: u8) -> u8 {
+        (ns & 0x7F) << 1
+    }
+    /// Build the mod-128 second control octet: `(N(R) << 1) | P/F` (Fig 4.1b).
+    fn ext_octet1(nr: u8, pf: bool) -> u8 {
+        ((nr & 0x7F) << 1) | if pf { 0x01 } else { 0 }
+    }
+
+    #[test]
+    fn extended_i_frame_round_trips_with_7bit_seqs() {
+        // N(S)=100, N(R)=50 — both beyond the mod-8 3-bit range, so this can only
+        // round-trip through the 2-octet extended control field.
+        let ns = 100u8;
+        let nr = 50u8;
+        let f = Frame {
+            destination: addr("M0LTE", true),
+            source: addr("G7XYZ", false),
+            digipeaters: Vec::new(),
+            control: ext_i_octet0(ns),
+            pid: Some(PID_NO_LAYER3),
+            info: b"extended payload".to_vec(),
+        };
+        let wire = f.encode_extended(ext_octet1(nr, true));
+
+        let (g, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
+        assert!(ext.is_some(), "extended I frame must yield a second octet");
+        assert!(g.is_information());
+        assert_eq!(g.ns_with(ext), ns);
+        assert_eq!(g.nr_with(ext), nr);
+        assert!(g.poll_final_with(ext));
+        assert_eq!(g.pid, Some(PID_NO_LAYER3));
+        assert_eq!(g.info, b"extended payload");
+    }
+
+    #[test]
+    fn extended_supervisory_frames_round_trip() {
+        // Each S type carries only N(R) + P/F in the extended form. Base octet0 is
+        // the SS/"01" nibble with the high nibble zero (§4.3.2 / Fig 4.3b).
+        for (base, is_srej) in [(0x01u8, false), (0x05, false), (0x09, false), (0x0D, true)] {
+            let nr = 99u8; // > 7: exercises the 7-bit field
+            let f = Frame {
+                destination: addr("M0LTE", false),
+                source: addr("G7XYZ", true),
+                digipeaters: Vec::new(),
+                control: base,
+                pid: None,
+                info: Vec::new(),
+            };
+            let wire = f.encode_extended(ext_octet1(nr, false));
+
+            let (g, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
+            assert!(ext.is_some());
+            assert!(g.is_supervisory());
+            assert_eq!(g.control & 0x0F, base, "S base octet survives");
+            assert_eq!(g.nr_with(ext), nr);
+            assert!(!g.poll_final_with(ext));
+            assert_eq!(g.pid, None);
+            assert!(g.info.is_empty());
+            // mod-128 SREJ is just the extended form of the SREJ base — no separate path.
+            assert_eq!(is_srej, (base == 0x0D));
+        }
+    }
+
+    #[test]
+    fn extended_sequence_wraps_at_127_to_0() {
+        // The 7-bit field must carry 127 and 0 as distinct values (a mod-8 decode
+        // would collapse them). Round-trip both boundaries for I (N(S)) and S (N(R)).
+        for seq in [0u8, 127u8] {
+            // I frame N(S)=seq, N(R)=seq.
+            let f = Frame {
+                destination: addr("A", true),
+                source: addr("B", false),
+                digipeaters: Vec::new(),
+                control: ext_i_octet0(seq),
+                pid: Some(PID_NO_LAYER3),
+                info: b"x".to_vec(),
+            };
+            let wire = f.encode_extended(ext_octet1(seq, false));
+            let (g, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
+            assert_eq!(g.ns_with(ext), seq);
+            assert_eq!(g.nr_with(ext), seq);
+        }
+        // 127 and 0 must not alias: their encoded second octets differ.
+        assert_ne!(ext_octet1(127, false), ext_octet1(0, false));
+        assert_eq!(ext_octet1(127, false), 254); // (127<<1)
+        assert_eq!(ext_octet1(0, false), 0);
+    }
+
+    #[test]
+    fn mod8_decode_of_extended_i_frame_misreads_it() {
+        // Demonstrates why decode is modulo-aware: a mod-8 decode of an extended
+        // I frame swallows the second control octet as the PID (the latent bug the
+        // extended path fixes). N(S)=10 (>7) also can't survive a 3-bit read.
+        let f = Frame {
+            destination: addr("A", true),
+            source: addr("B", false),
+            digipeaters: Vec::new(),
+            control: ext_i_octet0(10),
+            pid: Some(PID_NO_LAYER3),
+            info: b"hi".to_vec(),
+        };
+        let wire = f.encode_extended(ext_octet1(3, false));
+
+        // Correct (extended) decode.
+        let (g_ext, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
+        assert_eq!(g_ext.ns_with(ext), 10);
+        assert_eq!(g_ext.pid, Some(PID_NO_LAYER3));
+        assert_eq!(g_ext.info, b"hi");
+
+        // Wrong (mod-8) decode: the extended second octet is mistaken for the PID.
+        let g_mod8 = Frame::decode(&wire).unwrap();
+        assert_eq!(g_mod8.pid, Some(ext_octet1(3, false)));
+        assert_ne!(g_mod8.info, b"hi");
+    }
+
+    #[test]
+    fn extended_u_frame_has_no_second_octet() {
+        // U frames are 1 octet in both modes — decode_with_modulo(extended) must
+        // NOT consume a second octet for them.
+        let f = ui_frame();
+        let wire = f.encode();
+        let (g, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
+        assert!(ext.is_none(), "U frame carries no extended control octet");
+        assert_eq!(g, f);
     }
 }

@@ -10,13 +10,16 @@
 //!
 //! ## Modulo
 //!
-//! Control-octet construction here is **modulo-8** (AX.25 v2.2 §4.3.3) — the one-
-//! octet control field. The node is mod-128-*capable* at the session level (the
-//! runtime tracks `is_extended`, the establishment paths negotiate it), but the
-//! two-octet extended control framing is a documented follow-up in
-//! [`crate::ax25::frame`] (the extended frame format the codec doesn't model yet).
-//! [`WireSink::new`] therefore takes the link's local/remote callsigns + the
-//! digipeater path and builds mod-8 frames; an extended-mode build asserts.
+//! Control-octet construction follows the link's modulo. A [`WireSink`] carries an
+//! [`extended`](WireSink::extended) flag: when clear (the default) it builds the
+//! one-octet **modulo-8** control field (AX.25 v2.2 §4.3.3); when set it builds the
+//! two-octet **modulo-128** extended control field (Fig 4.1b/4.3b) for I and S
+//! frames — 7-bit N(S)/N(R), the mod-128 SREJ falling out of the S path — via
+//! [`crate::ax25::Frame::encode_extended`]. U frames (SABM/SABME/DISC/UA/DM/UI) are
+//! one octet in both modes, so the flag only affects I/S frames. The owning
+//! [`super::manager::SessionManager`] sets the flag from the session's negotiated
+//! `is_extended` before each dispatch. The inbound counterpart,
+//! [`classify_incoming_modulo`], reads the mode-aware sequence fields the same way.
 //!
 //! `no_std` + `alloc`.
 
@@ -70,6 +73,11 @@ pub struct WireSink {
     local: Callsign,
     remote: Callsign,
     digipeaters: Vec<Callsign>,
+    /// Modulo of the link: `false` = modulo-8 (1-octet control), `true` =
+    /// modulo-128 (2-octet extended control on I/S frames, Fig 4.1b). Set by the
+    /// owning [`super::manager::SessionManager`] from the session's negotiated
+    /// `is_extended` before each dispatch. Defaults to modulo-8.
+    pub extended: bool,
     /// Encoded frames produced, in emission order.
     pub sent: Vec<Vec<u8>>,
     /// DL signals raised upward, in order.
@@ -82,11 +90,13 @@ pub struct WireSink {
 
 impl WireSink {
     /// A sink for the `local ↔ remote` link with an optional digipeater path.
+    /// Builds modulo-8 frames until [`WireSink::extended`] is set.
     pub fn new(local: Callsign, remote: Callsign, digipeaters: Vec<Callsign>) -> Self {
         Self {
             local,
             remote,
             digipeaters,
+            extended: false,
             sent: Vec::new(),
             upward: Vec::new(),
             seize_pending: false,
@@ -151,6 +161,54 @@ impl WireSink {
         }
     }
 
+    /// Encode a [`FrameSpec`] to wire bytes at this sink's modulo. For modulo-8 —
+    /// and for U/UI frames in either modulo — this is [`WireSink::build_frame`]
+    /// followed by `encode()`. For an extended (modulo-128) link, I and S frames
+    /// get the 2-octet control field (Fig 4.1b / 4.3b) with 7-bit N(S)/N(R) via
+    /// [`Frame::encode_extended`]; the mod-128 SREJ is simply the extended form of
+    /// the SREJ base. Mirrors the C# `Ax25Frame.I(...extended)` /
+    /// `SFrameAt(...extended)` factories (Ax25Frame.Factories.cs:149-192) byte-for-byte.
+    pub fn encode_spec(&self, spec: &FrameSpec) -> Vec<u8> {
+        if self.extended {
+            match spec {
+                FrameSpec::Information {
+                    p,
+                    nr,
+                    ns,
+                    pid,
+                    info,
+                } => {
+                    // Fig 4.1b: octet0 = (N(S) << 1) | 0; octet1 = (N(R) << 1) | P.
+                    let first = (ns & 0x7F) << 1;
+                    let second = ((nr & 0x7F) << 1) | if *p { 0x01 } else { 0 };
+                    let frame = self.frame(true, first, Some(*pid), info.clone());
+                    return frame.encode_extended(second);
+                }
+                FrameSpec::Supervisory {
+                    kind,
+                    is_command,
+                    nr,
+                    pf,
+                } => {
+                    // Fig 4.3b: octet0 = the SS/"01" base (high nibble zero);
+                    // octet1 = (N(R) << 1) | P/F.
+                    let base = match kind {
+                        SupervisoryKind::Rr => sctl::RR,
+                        SupervisoryKind::Rnr => sctl::RNR,
+                        SupervisoryKind::Rej => sctl::REJ,
+                        SupervisoryKind::Srej => sctl::SREJ,
+                    };
+                    let second = ((nr & 0x7F) << 1) | if *pf { 0x01 } else { 0 };
+                    let frame = self.frame(*is_command, base, None, Vec::new());
+                    return frame.encode_extended(second);
+                }
+                // U and UI frames are 1 octet in both modes — fall through.
+                _ => {}
+            }
+        }
+        self.build_frame(spec).encode()
+    }
+
     /// Construct the addressed frame (we are the source; the peer the destination).
     fn frame(&self, is_command: bool, control: u8, pid: Option<u8>, info: Vec<u8>) -> Frame {
         // §6.1.2 command/response: command ⇒ dest C-bit set, source C-bit clear.
@@ -189,8 +247,8 @@ impl WireSink {
 
 impl SessionSink for WireSink {
     fn send_frame(&mut self, spec: FrameSpec) {
-        let frame = self.build_frame(&spec);
-        self.sent.push(frame.encode());
+        let bytes = self.encode_spec(&spec);
+        self.sent.push(bytes);
     }
     fn send_upward(&mut self, signal: DataLinkSignal) {
         self.upward.push(signal);
@@ -206,18 +264,29 @@ impl SessionSink for WireSink {
     fn send_internal(&mut self, _signal: InternalSignal) {}
 }
 
-/// Classify a received (modulo-8) [`Frame`] into the runtime [`Event`] that should
-/// be posted for it, extracting the mode-aware [`FrameInfo`]. Returns `None` for a
+/// Classify a received **modulo-8** [`Frame`] into the runtime [`Event`] that should
+/// be posted for it. Convenience wrapper over [`classify_incoming_modulo`] with no
+/// extended control octet — the entry point for links known to be modulo-8.
+pub fn classify_incoming(frame: &Frame) -> Option<Event> {
+    classify_incoming_modulo(frame, None)
+}
+
+/// Classify a received [`Frame`] at a known modulo into the runtime [`Event`],
+/// extracting the mode-aware [`FrameInfo`]. `control_extension` is the second
+/// control octet from [`Frame::decode_with_modulo`] on an extended (modulo-128)
+/// I/S frame, or `None` for a modulo-8 frame (and for U frames, which are 1 octet
+/// in both modes). N(S)/N(R)/P-F are read through the mode-aware [`Frame`]
+/// accessors so a 7-bit sequence survives on an extended link. Returns `None` for a
 /// frame whose control octet doesn't map to a known event (the caller can post
 /// [`Event::ControlFieldError`]). This is the inbound counterpart of
-/// [`WireSink::build_frame`] — the firmware transports call it on each decoded
-/// wire frame before handing the event to the session.
-pub fn classify_incoming(frame: &Frame) -> Option<Event> {
+/// [`WireSink::encode_spec`] — the transports call it on each decoded wire frame
+/// before handing the event to the session.
+pub fn classify_incoming_modulo(frame: &Frame, control_extension: Option<u8>) -> Option<Event> {
     let control = frame.control;
-    let poll_final = (control & PF_BIT) != 0;
+    let poll_final = frame.poll_final_with(control_extension);
     let is_command = frame.is_command();
-    let nr = (control >> 5) & 0x07;
-    let ns = (control >> 1) & 0x07;
+    let nr = frame.nr_with(control_extension);
+    let ns = frame.ns_with(control_extension);
     let info = FrameInfo {
         nr,
         ns,

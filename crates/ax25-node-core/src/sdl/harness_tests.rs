@@ -182,6 +182,128 @@ fn round_trip_frame_octets_decode_to_the_same_event_kind() {
     }
 }
 
+/// A modulo-128 sink: `local ↔ remote` with the extended flag set, so I/S specs
+/// encode the 2-octet control field.
+fn extended_sink() -> WireSink {
+    let mut sink = WireSink::new(
+        Callsign::parse("M0LTE-1").unwrap(),
+        Callsign::parse("M0LTE-2").unwrap(),
+        Vec::new(),
+    );
+    sink.extended = true;
+    sink
+}
+
+#[test]
+fn extended_i_frame_encodes_and_classifies_with_7bit_seqs() {
+    // N(S)=120, N(R)=65 — both beyond mod-8's 3-bit range. The whole bridge round
+    // trip (encode_spec → decode_with_modulo → classify_incoming_modulo) must
+    // carry them intact, which only the 2-octet extended control field can do.
+    let sink = extended_sink();
+    let spec = FrameSpec::Information {
+        p: true,
+        nr: 65,
+        ns: 120,
+        pid: crate::ax25::PID_NO_LAYER3,
+        info: vec![0xDE, 0xAD],
+    };
+    let bytes = sink.encode_spec(&spec);
+    let (frame, ext) = Frame::decode_with_modulo(&bytes, true).expect("decodes extended");
+    assert!(ext.is_some(), "extended I frame carries a second control octet");
+    let event = classify_incoming_modulo(&frame, ext).expect("classifies");
+    match event {
+        Event::IReceived(f) => {
+            assert_eq!(f.ns, 120);
+            assert_eq!(f.nr, 65);
+            assert!(f.poll_final);
+            assert_eq!(f.info, vec![0xDE, 0xAD]);
+        }
+        other => panic!("expected IReceived, got {other:?}"),
+    }
+}
+
+#[test]
+fn extended_supervisory_frames_encode_and_classify() {
+    // Each S type (RR/RNR/REJ/SREJ) at N(R)=100 (> 7) — mod-128 SREJ falls out of
+    // the same path with no separate codec.
+    let sink = extended_sink();
+    for kind in [
+        SupervisoryKind::Rr,
+        SupervisoryKind::Rnr,
+        SupervisoryKind::Rej,
+        SupervisoryKind::Srej,
+    ] {
+        let spec = FrameSpec::Supervisory {
+            kind,
+            is_command: false,
+            nr: 100,
+            pf: true,
+        };
+        let bytes = sink.encode_spec(&spec);
+        let (frame, ext) = Frame::decode_with_modulo(&bytes, true).expect("decodes extended");
+        assert!(ext.is_some(), "extended S frame carries a second control octet");
+        let event = classify_incoming_modulo(&frame, ext).expect("classifies");
+        // The classified event kind must match the S type we asked for — mod-128
+        // SREJ included (it rides the same extended S path, no separate codec).
+        let matches_kind = match kind {
+            SupervisoryKind::Rr => matches!(event, Event::RrReceived(_)),
+            SupervisoryKind::Rnr => matches!(event, Event::RnrReceived(_)),
+            SupervisoryKind::Rej => matches!(event, Event::RejReceived(_)),
+            SupervisoryKind::Srej => matches!(event, Event::SrejReceived(_)),
+        };
+        assert!(matches_kind, "wrong S-type for {kind:?}: {event:?}");
+        let f = event.frame().expect("S frame has FrameInfo");
+        assert_eq!(f.nr, 100, "N(R) survives the 7-bit extended field for {kind:?}");
+        assert!(f.poll_final);
+    }
+}
+
+#[test]
+fn extended_sequence_wrap_127_to_0_survives_the_bridge() {
+    // The 7-bit field must keep 127 and 0 distinct through the bridge (a mod-8
+    // encode/decode would alias them). Round-trip both boundaries on an I frame.
+    let sink = extended_sink();
+    for seq in [0u8, 127u8] {
+        let spec = FrameSpec::Information {
+            p: false,
+            nr: seq,
+            ns: seq,
+            pid: crate::ax25::PID_NO_LAYER3,
+            info: vec![seq],
+        };
+        let bytes = sink.encode_spec(&spec);
+        let (frame, ext) = Frame::decode_with_modulo(&bytes, true).expect("decodes");
+        let event = classify_incoming_modulo(&frame, ext).expect("classifies");
+        match event {
+            Event::IReceived(f) => {
+                assert_eq!(f.ns, seq, "N(S)={seq} survives");
+                assert_eq!(f.nr, seq, "N(R)={seq} survives");
+            }
+            other => panic!("expected IReceived, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn mod8_sink_is_unchanged_by_the_extended_field() {
+    // Regression guard: a default (extended = false) sink still emits 1-octet
+    // control — encode_spec must be byte-identical to build_frame().encode().
+    let sink = WireSink::new(
+        Callsign::parse("A").unwrap(),
+        Callsign::parse("B").unwrap(),
+        Vec::new(),
+    );
+    assert!(!sink.extended);
+    let spec = FrameSpec::Information {
+        p: false,
+        nr: 2,
+        ns: 3,
+        pid: crate::ax25::PID_NO_LAYER3,
+        info: vec![9, 9],
+    };
+    assert_eq!(sink.encode_spec(&spec), sink.build_frame(&spec).encode());
+}
+
 /// Build two sessions already Connected back-to-back (post-handshake).
 fn connected_pair() -> (Station, Station) {
     let mut a = Station::new("M0LTE-1", "M0LTE-2");
