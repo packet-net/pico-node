@@ -153,10 +153,9 @@ impl MeterReport {
             } else if let Some(text) = try_field(part, "rssi:", "r") {
                 rssi = parse_db_tenths_opt(text);
             } else {
-                match try_field(part, "lvl:", "l") {
-                    Some(text) => level = parse_db_tenths_opt(text),
-                    None => return None, // unknown field — not an MS args string
-                }
+                // must be the lvl: field, else this isn't an MS args string
+                let text = try_field(part, "lvl:", "l")?;
+                level = parse_db_tenths_opt(text);
             }
         }
 
