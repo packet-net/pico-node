@@ -56,13 +56,15 @@ pub struct SessionManager<const N: usize> {
 
 impl<const N: usize> SessionManager<N> {
     /// Build a manager for the node's own `local` callsign with all slots free.
-    /// A plain [`Self::connect`] dials mod-8 (SABM) by default; see
+    /// A plain [`Self::connect`] dials mod-128 (SABME) by default — matching C#
+    /// `Ax25ListenerOptions.PreferExtendedConnect = true` — with automatic degrade
+    /// to mod-8 SABM if the peer refuses (FRMR #45 or DM #48); see
     /// [`Self::with_prefer_extended_connect`]. No carrier-sense source is wired
     /// (always-clear); see [`Self::set_carrier_sense`].
     pub fn new(local: Callsign) -> Self {
         Self {
             local,
-            prefer_extended_connect: false,
+            prefer_extended_connect: true,
             carrier: None,
             // `Option<Slot>` isn't `Copy`, so build the array element-by-element.
             slots: core::array::from_fn(|_| None),
@@ -97,13 +99,13 @@ impl<const N: usize> SessionManager<N> {
 
     /// Set whether a plain [`Self::connect`] prefers a mod-128 (SABME) dial with
     /// SABM/mod-8 fallback on refusal, returning `self` for chaining. Mirrors the
-    /// listener option `Ax25ListenerOptions.PreferExtendedConnect` (Ax25Listener.cs:1712)
-    /// — but where the C# default is `true`, pico defaults **false** to preserve the
-    /// historical mod-8 dial: the SABME→SABM degrade is only half-wired (FRMR
-    /// fallback #45 is present; the DM-refusal degrade #48 is owned by another track),
-    /// so a mod-128-preferred default could strand a connect to a DM-refusing peer
-    /// until #48 lands. Callers opt in per manager here, or per dial via
-    /// [`Self::connect_extended`].
+    /// listener option `Ax25ListenerOptions.PreferExtendedConnect` (Ax25Listener.cs:1712),
+    /// and — now that both refusal degrades are present on the session (FRMR
+    /// fallback #45 and the DM-refusal degrade #48) — pico matches the C# default of
+    /// **true**: a v2.2-preferred dial that a pre-v2.2 peer refuses with FRMR or DM
+    /// degrades to a mod-8 SABM re-establishment instead of stranding. Pass `false`
+    /// here (or dial mod-8 explicitly via [`Self::connect_extended`]) to force the
+    /// historical mod-8 dial.
     pub fn with_prefer_extended_connect(mut self, prefer: bool) -> Self {
         self.prefer_extended_connect = prefer;
         self
@@ -510,18 +512,56 @@ mod tests {
         let mut t = MockTimerService::new();
         let peer = call("G7XYZ");
 
-        // Default (false) ⇒ mod-8 SABM — preserves historical pico behaviour.
+        // Default (true, matching C# PreferExtendedConnect) ⇒ mod-128 SABME.
         let mut mgr_default: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
-        assert!(!mgr_default.prefer_extended_connect());
+        assert!(mgr_default.prefer_extended_connect());
         let out = mgr_default.connect(peer, &mut t);
-        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
-
-        // Opt in ⇒ mod-128 SABME.
-        let mut mgr_ext: SessionManager<2> =
-            SessionManager::new(call("M0LTE-1")).with_prefer_extended_connect(true);
-        assert!(mgr_ext.prefer_extended_connect());
-        let out = mgr_ext.connect(peer, &mut t);
         assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+
+        // Opt out ⇒ mod-8 SABM.
+        let mut mgr_m8: SessionManager<2> =
+            SessionManager::new(call("M0LTE-1")).with_prefer_extended_connect(false);
+        assert!(!mgr_m8.prefer_extended_connect());
+        let out = mgr_m8.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+    }
+
+    /// The safety net that makes the SABME-first default safe: a plain
+    /// (default-preference) connect to a peer that refuses SABME with **DM** must
+    /// degrade to a mod-8 SABM re-establishment (#48 DM-degrade), not strand the
+    /// connect in Disconnected. This is the DM analogue of the FRMR-degrade test,
+    /// and the reason the default could be flipped to true.
+    #[test]
+    fn default_extended_connect_degrades_to_mod8_sabm_on_dm_refusal() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // Plain connect uses the new default (SABME-first).
+        let out = mgr.connect(peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+        assert!(mgr.session_for(&peer).unwrap().context.is_extended);
+        assert_eq!(
+            mgr.session_for(&peer).unwrap().state,
+            State::AwaitingV22Connection
+        );
+
+        // Pre-v2.2 peer (XRouter-class) refuses SABME with DM (F=1).
+        let dm = Event::DmReceived(FrameInfo {
+            poll_final: true,
+            is_command: false,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, dm, &mut t);
+
+        // #48: degraded to mod-8 and a SABM re-establishment emitted — NOT stranded.
+        let s = mgr.session_for(&peer).unwrap();
+        assert!(!s.context.is_extended, "DM degraded the link to mod-8");
+        assert_eq!(s.state, State::AwaitingConnection);
+        assert!(
+            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "expected a mod-8 SABM re-establishment after the DM: {out:02x?}"
+        );
     }
 
     #[test]
