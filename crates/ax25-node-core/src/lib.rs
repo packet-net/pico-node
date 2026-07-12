@@ -41,6 +41,7 @@ pub mod crc;
 pub mod kiss;
 pub mod netrom;
 pub mod sdl;
+pub mod tune;
 
 /// The node software version, surfaced by the `Info` console command (mirrors
 /// `NodeCommandService.Version` in the C# host).
