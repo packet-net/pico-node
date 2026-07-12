@@ -40,6 +40,7 @@ pub mod console;
 pub mod crc;
 pub mod kiss;
 pub mod netrom;
+pub mod radio;
 pub mod sdl;
 pub mod tune;
 
