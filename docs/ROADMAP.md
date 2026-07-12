@@ -45,6 +45,15 @@ The In/Yes picks that had slipped to follow-up were then landed:
 
 This retires the earlier "SREJ / v2.2 shipped but dormant" caveat: SREJ now activates on a negotiated link, and pico dials SABME-first by default. **724 core tests** on `main`; both fw `--locked` gates + drift-guard green.
 
+### Shipped — SDL pin + L4 compression (PRs #67–#68)
+
+| Area | What shipped | PR |
+|---|---|---|
+| SDL | Pin ax25sdl to a reproducible latest commit (stop floating `main`) + correct the manifest `[sdl]` block. The "0.8.0 Rust vs 0.10.0 C#" was a version-*scheme* confusion (Rust crate vs git-tag/NuGet), not a lag — pico-node is behaviourally SDL-aligned with C#, already on the latest source | #67 |
+| B · NET/ROM | LinBPQ **L4 payload compression** — a compact hand-rolled `no_std` zlib (**~7 KiB vs miniz_oxide's ~37 KiB** on thumbv6m), behind the `netrom-compress` feature (default-off, zero default flash), oracle-proven both directions; negotiation + the `0x10` compressed flag + fragment/reassemble mirror C# byte-for-byte | #68 |
+
+NODESPACLEN was investigated and **deliberately left out** — a BPQ-ism (not in the NET/ROM spec); with fixed 21-octet entries, uniform chunking is byte-identical to BPQ's greedy pack, so there's no non-trivial version to build, and pico-node's existing 11-entries/frame already matches C#'s default.
+
 ### 3-way parity mirror (cross-repo — merged)
 `interop.yml` (packet.net **#605**) and `parity-check.mjs` + `ci.yml` (ax25-ts **#73**) gained a `--rust` leg so the mirror is a true 3-way gate — C# `Packet.*` ⊆ TS `@packet-net/ax25` ⊆ Rust pico-node, drift failing on whichever side introduces it. Reuses the live C# extraction (single source of truth) against pico-node's manifest/exceptions. **Both merged** (validated locally: three legs green, backward-compatible, and the Rust leg bites on injected drift).
 
@@ -54,9 +63,9 @@ This retires the earlier "SREJ / v2.2 shipped but dormant" caveat: SREJ now acti
 - **XID / MDL responder + `preConnectXid` cache** (decided In) shipped in #63, and the **initiator pre-connect XID probe** in #65 — the XID pick is complete. **SDM link** (decided Yes) shipped in #62.
 
 ### Still open (follow-ups)
-- **SDL version skew** — Rust `ax25sdl` 0.8.0 vs C# `Packet.Ax25.Sdl` 0.10.0, pico floats on `main`. Recorded in `parity-manifest.toml [sdl]`; pin to a matching `crate-v*` tag. Only bites SDL-*driven* session vectors, not pure codecs.
-- **fw bench validation** — everything in #60 is compile-only; sweep timing, on-air NODES visibility, the `kiss_serial` pump under live NinoTNC traffic, and the Tait CCDI transact/demux all need the hardware-bringup session.
-- **Optional NET/ROM parity** — L4 payload compression (needs a `no_std` deflate — a dependency decision) and NODESPACLEN per-port fragmentation; both default-off in C#, so interop is unaffected today.
+- **fw bench validation** — the fw wiring (#60) + the XID-probe timer are compile-only; sweep timing, on-air NODES visibility, the `kiss_serial` pump under live NinoTNC traffic, and the Tait CCDI transact/demux all need the hardware-bringup session.
+- **ax25sdl release-tag hygiene (cross-repo)** — the SDL pin (#67) uses a reproducible `main` SHA because ax25sdl's release tags still carry the pre-no_std Rust crate (0.7.0). A proper ax25sdl Rust-crate tag would let all three stacks pin a clean version instead of a SHA — ax25sdl-repo work.
+- **L4-compression golden vectors** — the codec is oracle-proven (miniz_oxide, dev-only) and the L4 path is host-tested; a shared cross-stack golden-vector set for the compressed wire form would extend the parity corpus.
 
 ## Parity discipline
 
@@ -91,7 +100,7 @@ This retires the earlier "SREJ / v2.2 shipped but dormant" caveat: SREJ now acti
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | In · ✅ **already built** (recon); RF-wired #60 |
+| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | In · ✅ **already built** (recon); RF-wired #60; BPQ L4-compression #68 (default-off) |
 | **NODES origination / broadcast scheduler** | NONE | 🔒 | In | In · ✅ **already built**; sweep-fix + RF origination #60 |
 | **INP3** routing overlay | NONE (future, all-stack) | 🔒 | Later (not shipped anywhere yet) | Later, leave a seam · ✅ **already built, runtime-gated off** (not cargo-gated — would diverge from C#) |
 
@@ -147,4 +156,4 @@ Two caveats that keep a "skipped" 🔒 item honest:
 
 ---
 
-*Living document. The **decision** columns are the calls made; a ✅ marks what shipped (pico-node PRs #53–#63; cross-repo mirror #605/#73, merged). Last updated 2026-07-12 against the fresh recon, the two merged waves, and packet.net's parity discipline.*
+*Living document. The **decision** columns are the calls made; a ✅ marks what shipped (pico-node PRs #53–#68; cross-repo mirror #605/#73, merged). Last updated 2026-07-12 against the fresh recon, the merged waves, and packet.net's parity discipline.*
