@@ -99,6 +99,11 @@ pub struct Session {
     pub state: State,
     /// The mutable per-connection context.
     pub context: SessionContext,
+    /// #9 (ack_progress_resets_rc): set when a committed transition advances V(A)
+    /// (the peer acknowledged new data); consumed at the next T1 expiry to clamp RC.
+    /// Session-scoped, not part of the SDL context — mirrors the C# `Ax25Session`
+    /// private `vaAdvancedSinceT1Expiry` field.
+    va_advanced_since_t1_expiry: bool,
 }
 
 impl Default for Session {
@@ -113,6 +118,7 @@ impl Session {
         Self {
             state: State::Disconnected,
             context: SessionContext::new(),
+            va_advanced_since_t1_expiry: false,
         }
     }
 
@@ -121,6 +127,7 @@ impl Session {
         Self {
             state,
             context: SessionContext::new(),
+            va_advanced_since_t1_expiry: false,
         }
     }
 
@@ -144,6 +151,21 @@ impl Session {
         timers: &mut dyn TimerService,
         sink: &mut dyn SessionSink,
     ) {
+        // #9 ack-progress-resets-RC (step 2 of 2): the figures only reset RC on the
+        // fully-acked Timer-Recovery checkpoint, so a transfer that lives in Timer
+        // Recovery with frames always in flight ratchets RC across a WORKING link and
+        // dies at the N2'th *lifetime* T1 hiccup. If V(A) advanced since the last T1
+        // expiry, the link is demonstrably alive, so this expiry is the FIRST of a new
+        // consecutive-failure run: clamp RC to 1 before the RCEqN2 guard is evaluated.
+        // Clamp (not zero) keeps Select_T1's RC==0 Karn branch meaningful. Ports the
+        // `PreClampRetryCountOnT1Expiry` block in `Ax25Session.DispatchEvent`.
+        if matches!(event, Event::T1Expiry) && self.context.quirks.ack_progress_resets_rc {
+            if self.va_advanced_since_t1_expiry && self.context.rc > 1 {
+                self.context.rc = 1;
+            }
+            self.va_advanced_since_t1_expiry = false;
+        }
+
         let on = event.to_sdl();
         let page = self.state.page();
 
@@ -184,10 +206,20 @@ impl Session {
         // on a pre-v2.2 peer's FRMR/DM.
         self.apply_pre_execution_quirks(t, &event);
 
+        // #9 ack-progress-resets-RC (step 1 of 2): snapshot V(A) so we can tell
+        // whether this transition advances it (the peer acked NEW data). The RC clamp
+        // itself is deferred to the next T1 expiry (above); RC is NOT zeroed here
+        // because RC==0 is also Select_T1's Karn "clean round-trip" signal.
+        let va_before = self.context.va;
+
         // Run the action chain (with its loop_while ranges) against the context.
         {
             let mut tx = Tx::new(&mut self.context, timers, sink, event);
             execute_actions(t.actions, t.loops, &mut tx);
+        }
+
+        if self.context.va != va_before {
+            self.va_advanced_since_t1_expiry = true;
         }
 
         // Advance state — `next`, with the #44 mod-128 connect-routing fix.

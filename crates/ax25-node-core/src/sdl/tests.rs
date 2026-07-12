@@ -457,6 +457,61 @@ fn extended_dm_refusal_tears_down_with_quirk_off() {
     assert!(r.unnumbered().is_empty());
 }
 
+// ─── Quirk: #9 ack progress resets RC (survives a working link) ─────────────
+
+#[test]
+fn ack_progress_resets_rc_survives_working_link_with_quirk_on() {
+    // A bulk transfer living in Timer Recovery: RC has ratcheted to N2 but the peer
+    // just acked NEW data (V(A) advanced), so the link is alive. With #9 on the next
+    // T1 expiry clamps RC below N2 and keeps recovering instead of dying.
+    let mut s = Session::in_state(State::TimerRecovery);
+    s.context.reset_state();
+    s.context.n2 = 2;
+    s.context.k = 7;
+    s.context.vs = 2; // two I-frames outstanding; V(A)=0, so V(S) != V(A)
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // Peer acks frame 0 (RR response, F=0, N(R)=1): V(A) advances 0→1 = progress.
+    s.post_event(Event::RrReceived(rx_s(1, false, false)), &mut t, &mut r);
+    assert_eq!(s.context.va, 1);
+    assert_eq!(s.state, State::TimerRecovery);
+
+    // Prior T1 hiccups pushed RC to the ceiling.
+    s.context.rc = s.context.n2;
+    r.upward.clear();
+
+    // Next T1 expiry: progress was recorded, so RC is clamped below N2 → the
+    // t21_t1_expiry_no retransmit branch fires, NOT the t21_t1_expiry_yes_no death.
+    s.post_event(Event::T1Expiry, &mut t, &mut r);
+    assert_eq!(s.state, State::TimerRecovery);
+    assert!(!r.upward.contains(&DataLinkSignal::DisconnectIndication));
+}
+
+#[test]
+fn rc_ratchets_and_kills_working_link_with_quirk_off() {
+    let mut s = Session::in_state(State::TimerRecovery);
+    s.context.reset_state();
+    s.context.quirks = Quirks::strictly_faithful();
+    s.context.n2 = 2;
+    s.context.k = 7;
+    s.context.vs = 2;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // Same forward progress...
+    s.post_event(Event::RrReceived(rx_s(1, false, false)), &mut t, &mut r);
+    assert_eq!(s.context.va, 1);
+    s.context.rc = s.context.n2;
+    r.upward.clear();
+
+    // ...but with #9 off RC stays at N2, so the T1 expiry declares the (still-alive)
+    // link dead — the false-N2-death the quirk fixes.
+    s.post_event(Event::T1Expiry, &mut t, &mut r);
+    assert_eq!(s.state, State::Disconnected);
+    assert!(r.upward.contains(&DataLinkSignal::DisconnectIndication));
+}
+
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
 
 #[test]

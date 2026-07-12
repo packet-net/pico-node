@@ -64,6 +64,15 @@ pub struct Quirks {
     /// `+ 1`. The drain must ADVANCE V(R) past each delivered stored frame; rewrite
     /// the decrement to an increment (ax25spec#47, packet.net#247).
     pub timer_recovery_drain_advances_vr: bool,
+    /// The figures only reset RC on the fully-acked Timer-Recovery checkpoint, so a
+    /// sustained transfer that lives in Timer Recovery with frames always in flight
+    /// ratchets RC across a WORKING link and dies at the N2'th *lifetime* T1 hiccup
+    /// (not N2 *consecutive* failures). When a T1 expiry follows V(A)-advancing
+    /// progress since the previous expiry, clamp RC to 1 before the `RC == N2?` guard
+    /// — the peer acking new data proves the link is alive, so this starts a fresh
+    /// consecutive-failure run. Clamp to 1 (not 0) so Select_T1's RC==0 Karn branch
+    /// still means "no retransmission in progress" (ax25spec#9, packet.net LinkBench).
+    pub ack_progress_resets_rc: bool,
 }
 
 impl Default for Quirks {
@@ -79,6 +88,7 @@ impl Default for Quirks {
             frmr_fallback_reestablishes_v20: true,
             dm_rejection_degrades_to_v20: true,
             timer_recovery_drain_advances_vr: true,
+            ack_progress_resets_rc: true,
         }
     }
 }
@@ -96,6 +106,7 @@ impl Quirks {
             frmr_fallback_reestablishes_v20: false,
             dm_rejection_degrades_to_v20: false,
             timer_recovery_drain_advances_vr: false,
+            ack_progress_resets_rc: false,
         }
     }
 }
