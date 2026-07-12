@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use crate::ax25::Callsign;
 
 use super::bridge::WireSink;
+use super::capability::PeerDialPlan;
 use super::carrier::CarrierSense;
 use super::event::Event;
 use super::session::Session;
@@ -316,6 +317,34 @@ impl<const N: usize> SessionManager<N> {
             .context
             .is_extended = extended;
         self.post_with_local(local, peer, Event::DlConnectRequest, timers)
+    }
+
+    /// Dial `peer` from `local` per a capability-cache [`PeerDialPlan`] — the
+    /// dial-time seam that supplies a peer's learned XID capabilities. The plan's
+    /// [`extended`](PeerDialPlan::extended) selects SABME vs SABM (via
+    /// [`Self::connect_extended`]). Pair with
+    /// [`PeerCapabilityCache::plan_dial`](super::capability::PeerCapabilityCache::plan_dial)
+    /// upstream and
+    /// [`PeerCapabilityCache::record_outcome`](super::capability::PeerCapabilityCache::record_outcome)
+    /// once the dial resolves (extended-vs-degraded observable from the session's
+    /// `is_extended`, SREJ from `srej_enabled`).
+    ///
+    /// NOTE: the plan's [`pre_connect_xid`](PeerDialPlan::pre_connect_xid) probe (an
+    /// *initiator* XID command sent before the SABM, then a bounded wait for the
+    /// response — the C# `NegotiateSrejBeforeConnectAsync` fast-probe) is NOT driven
+    /// here: it is an inherently async, multi-step flow above the synchronous
+    /// per-`post` core. The *responder* half is complete (see
+    /// [`super::mdl::respond_pre_session_xid`]), and the merge
+    /// ([`super::mdl::apply_negotiated`]) is available for a fw-side initiator MDL to
+    /// drive; this method honours the extended choice today.
+    pub fn connect_planned(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        plan: PeerDialPlan,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        self.connect_extended(local, peer, plan.extended, timers)
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -810,5 +839,39 @@ mod tests {
         assert!(mgr
             .take_upward(&peer)
             .contains(&DataLinkSignal::ConnectIndication));
+    }
+
+    /// A `connect_planned` dial honours the capability plan's extended choice:
+    /// an extended plan dials SABME, a mod-8 plan dials SABM.
+    #[test]
+    fn connect_planned_honours_the_dial_plan_extended_choice() {
+        use crate::sdl::capability::PeerDialPlan;
+
+        let peer = call("G7XYZ");
+        let local = call("M0LTE-1");
+
+        let mut ext: SessionManager<2> = SessionManager::new(local);
+        let out = ext.connect_planned(
+            local,
+            peer,
+            PeerDialPlan {
+                extended: true,
+                pre_connect_xid: false,
+            },
+            &mut MockTimerService::new(),
+        );
+        assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
+
+        let mut m8: SessionManager<2> = SessionManager::new(local);
+        let out = m8.connect_planned(
+            local,
+            peer,
+            PeerDialPlan {
+                extended: false,
+                pre_connect_xid: true,
+            },
+            &mut MockTimerService::new(),
+        );
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
     }
 }
