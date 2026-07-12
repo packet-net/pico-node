@@ -54,23 +54,23 @@ capabilities = ["mod128", "negotiate-down-from-mod128"]
 
 [vector_sets.kiss]
 in           = true
-capabilities = []
+capabilities = ["kiss"]
 
 [vector_sets.axudp]
 in           = true
-capabilities = []
+capabilities = ["axudp"]
 
 [vector_sets.netrom_quality]
 in           = true
-capabilities = []   # FNV-1a flow-hash + quality formula (a*b+128)/256
+capabilities = ["netrom-quality"]   # FNV-1a flow-hash + quality formula (a*b+128)/256
 
 [vector_sets.netrom_nodes]
 in           = true
-capabilities = []
+capabilities = ["netrom-nodes"]
 
 [vector_sets.netrom_l4]
 in           = true
-capabilities = []
+capabilities = ["netrom-l4"]
 
 [vector_sets.srej]
 in           = true
@@ -78,7 +78,7 @@ capabilities = ["srej", "negotiate-down-from-srej"]
 
 [vector_sets.xid]
 in           = true
-capabilities = []
+capabilities = ["xid"]
 
 # ---------------------------------------------------------------------------
 # DECLARED-OUT / deferred: a missing runner here is a reviewed decision, not a
