@@ -373,7 +373,23 @@ mod firmware {
             },
         )));
 
-        // GATE 6+ returns kiss_serial (needs a NinoTNC) + the session supervisor.
+        // --- GATE 6 (HW-BRINGUP.md §4): KISS-over-UART to a NinoTNC (capability 3).
+        // UART1 on GP20(TX)/GP21(RX), the NinoBLE Rev5 link pins. The task always
+        // spawns (there is no build-env target for a physical UART); it reads
+        // nothing until a NinoTNC is wired, but the read-only NET/ROM tap, NODES
+        // origination, obsolescence sweep and beacon all run. COMPILE-VALIDATED
+        // ONLY — the live exchange needs the NinoTNC on the bench (no hardware here).
+        spawner.spawn(defmt::unwrap!(transports::kiss_serial::task(
+            p.UART1,
+            p.PIN_20,
+            p.PIN_21,
+            cfg.kiss_serial.clone(),
+            cfg.netrom.clone(),
+            cfg.identity.callsign,
+            cfg.identity.alias,
+        )));
+
+        // The session supervisor (shared Sessions across transports) is the next seam.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {

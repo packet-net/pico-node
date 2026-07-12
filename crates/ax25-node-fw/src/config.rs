@@ -88,6 +88,11 @@ pub struct KissTcpConfig {
 #[derive(Clone)]
 pub struct KissSerialConfig {
     pub baud: u32,
+    /// Optional NinoTNC operating mode to set at boot via KISS SETHW (RAM-only —
+    /// spares flash). `None` (the default) leaves the modem's own configured mode
+    /// untouched. From the build env `NINOTNC_MODE`; a §policy knob so the node can
+    /// force a known modem mode at startup. Values > 15 are rejected by SETHW.
+    pub startup_mode: Option<u8>,
 }
 
 /// Telnet command console (capability 4).
@@ -140,7 +145,10 @@ pub fn load() -> NodeConfig {
         kiss_tcp: KissTcpConfig {
             target: option_env!("KISS_TCP_TARGET"),
         },
-        kiss_serial: KissSerialConfig { baud: 57600 },
+        kiss_serial: KissSerialConfig {
+            baud: 57600,
+            startup_mode: option_env!("NINOTNC_MODE").and_then(|s| s.parse::<u8>().ok()),
+        },
         telnet: TelnetConfig { port: 8023 },
         netrom: NetRomConfig {
             originate: true,
