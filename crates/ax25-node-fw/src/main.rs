@@ -359,7 +359,9 @@ mod firmware {
         spawner.spawn(defmt::unwrap!(transports::kiss_tcp::task(
             stack,
             cfg.kiss_tcp.clone(),
+            cfg.netrom.clone(),
             cfg.identity.callsign,
+            cfg.identity.alias,
         )));
 
         // --- mDNS: make the node discoverable as <hostname>.local + _telnet._tcp ---

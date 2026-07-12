@@ -14,16 +14,19 @@
 //! stretch (HW-BRINGUP §6); the session hand-off is the supervisor seam.
 
 use ax25_node_core::kiss::{self, Decoder};
-use ax25_node_core::netrom::{ObserveOutcome, PortId};
+use ax25_node_core::netrom::wire::Alias;
+use ax25_node_core::netrom::{
+    NetRomOriginator, NetRomOriginatorOptions, ObserveOutcome, PortId,
+};
 
 use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 
 use ax25_node_core::ax25::Callsign;
 
-use crate::config::KissTcpConfig;
+use crate::config::{KissTcpConfig, NetRomConfig};
 use crate::session;
 use crate::transports::{call_str, parse_endpoint, tcp_write_all, ui_frame};
 
@@ -33,7 +36,13 @@ const BEACON_INTERVAL_SECS: u64 = 10;
 const KISS_PORT: u8 = 0;
 
 #[embassy_executor::task]
-pub async fn task(stack: Stack<'static>, cfg: KissTcpConfig, my_call: Callsign) {
+pub async fn task(
+    stack: Stack<'static>,
+    cfg: KissTcpConfig,
+    netrom_cfg: NetRomConfig,
+    my_call: Callsign,
+    node_alias: &'static str,
+) {
     // §5: the endpoint is a LAN detail from the build env; absent ⇒ disabled.
     let Some(target) = cfg.target.and_then(parse_endpoint) else {
         defmt::info!("kiss-tcp: no KISS_TCP_TARGET set — disabled");
@@ -61,7 +70,7 @@ pub async fn task(stack: Stack<'static>, cfg: KissTcpConfig, my_call: Callsign) 
         backoff_secs = 1;
         defmt::info!("kiss-tcp: connected to {:?}", target);
 
-        serve(&mut socket, my_call).await;
+        serve(&mut socket, my_call, &netrom_cfg, node_alias).await;
 
         socket.close();
         let _ = socket.flush().await;
@@ -71,10 +80,40 @@ pub async fn task(stack: Stack<'static>, cfg: KissTcpConfig, my_call: Callsign) 
 }
 
 /// One connection: beacon ticker + read pump, until the peer goes away.
-async fn serve(socket: &mut TcpSocket<'_>, my_call: Callsign) {
+async fn serve(
+    socket: &mut TcpSocket<'_>,
+    my_call: Callsign,
+    netrom_cfg: &NetRomConfig,
+    node_alias: &str,
+) {
     // The read-only NET/ROM tap — same FrameTraced-equivalent point as axudp.
     let mut netrom = session::new_netrom();
     let port_id = PortId::from_str_lossy("kiss-tcp");
+
+    // NODES origination over this KISS port (Gap B — the node becomes VISIBLE on
+    // the emulated-RF channel, not AXUDP-only). Mirrors the axudp originator: the
+    // header alias is the node's mnemonic, falling back to the callsign base when
+    // empty. The routing table is per-connection here (recreated on each reconnect,
+    // like `netrom`), so a fresh connection announces itself with a header-only
+    // "I'm here" frame until it hears its first NODES broadcast.
+    let originator = NetRomOriginator::new(NetRomOriginatorOptions {
+        enabled: netrom_cfg.originate,
+        alias: Some(Alias::from_str_lossy(node_alias)),
+        node_call: Some(my_call),
+        obsolete_minimum: None,
+    });
+    let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
+    let mut next_nodes_at = Instant::now(); // announce on the first tick
+    // Obsolescence sweep on the same NODES interval (Gap A parity with axudp): age
+    // BEFORE origination so a broadcast reflects the freshly-aged table. First sweep
+    // after one interval.
+    let mut next_sweep_at = Instant::now() + nodes_interval;
+    if netrom_cfg.originate {
+        defmt::info!(
+            "kiss-tcp: NODES origination on, every {=u32}s",
+            netrom_cfg.nodes_interval_secs
+        );
+    }
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 512];
@@ -104,6 +143,42 @@ async fn serve(socket: &mut TcpSocket<'_>, my_call: Callsign) {
                     "kiss-tcp: beacon sent ({=usize} KISS bytes)",
                     kiss_bytes.len()
                 );
+
+                // Obsolescence sweep — age/purge once per NODES interval, before
+                // origination (the C# `NetRomService.OnInterval` order).
+                if Instant::now() >= next_sweep_at {
+                    next_sweep_at = Instant::now() + nodes_interval;
+                    let purged = netrom.sweep();
+                    if purged > 0 {
+                        defmt::info!(
+                            "kiss-tcp: obsolescence sweep purged {=usize} stale route(s)",
+                            purged
+                        );
+                    }
+                }
+
+                // NODES origination — build our broadcasts from the live table, wrap
+                // each as a UI frame (dest NODES, PID 0xCF), KISS-frame it, and send.
+                if netrom_cfg.originate && Instant::now() >= next_nodes_at {
+                    next_nodes_at = Instant::now() + nodes_interval;
+                    let payloads = originator.broadcast_nodes(netrom.table());
+                    let dest = NetRomOriginator::nodes_destination();
+                    let mut sent = 0usize;
+                    for payload in &payloads {
+                        let frame = ui_frame(my_call, dest, NetRomOriginator::PID, payload);
+                        let Some(kiss_bytes) =
+                            kiss::encode(KISS_PORT, kiss::Command::Data, &frame.encode())
+                        else {
+                            defmt::warn!("kiss-tcp: NODES encode failed");
+                            continue;
+                        };
+                        if !tcp_write_all(socket, &kiss_bytes).await {
+                            return;
+                        }
+                        sent += 1;
+                    }
+                    defmt::info!("kiss-tcp: NODES broadcast sent ({=usize} frame(s))", sent);
+                }
             }
             Either::Second(Ok(0)) => return, // EOF
             Either::Second(Ok(n)) => {
