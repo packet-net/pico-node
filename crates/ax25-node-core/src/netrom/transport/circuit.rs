@@ -27,6 +27,8 @@ use alloc::vec::Vec;
 use super::circuit_options::NetRomCircuitOptions;
 use super::circuit_state::{NetRomCircuitCloseReason, NetRomCircuitState};
 use crate::ax25::Callsign;
+#[cfg(feature = "netrom-compress")]
+use crate::netrom::wire::{ConnectAckInfo, CONNECT_REQUEST_INFO_EXTENDED_LEN, FLAG_COMPRESSED};
 use crate::netrom::wire::{
     ConnectRequestInfo, NetRomNetworkHeader, NetRomOpcode, NetRomPacket, NetRomTransportHeader,
     FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK,
@@ -73,6 +75,10 @@ struct Unacked {
     sequence: u8,
     payload: Vec<u8>,
     more_follows: bool,
+    /// This fragment's payload is part of a compressed logical frame — carries the
+    /// [`FLAG_COMPRESSED`] flag on (re)transmit. Gated behind `netrom-compress`.
+    #[cfg(feature = "netrom-compress")]
+    compressed: bool,
     sent_at: u64,
     retries: u8,
 }
@@ -81,6 +87,9 @@ struct Unacked {
 struct Fragment {
     bytes: Vec<u8>,
     more_follows: bool,
+    /// This fragment belongs to a compressed logical send — see [`Unacked::compressed`].
+    #[cfg(feature = "netrom-compress")]
+    compressed: bool,
 }
 
 /// One end of a NET/ROM L4 virtual circuit.
@@ -107,6 +116,17 @@ pub struct NetRomCircuit {
     // Receive side.
     vr: u8,
     reassembly: Vec<u8>,
+
+    // Compression negotiation (BPQ L4Compress). `compression_enabled` is the settled
+    // per-circuit result — true only when BOTH ends advertised compression at connect
+    // time; until then it is false (send raw, the always-safe path).
+    // `reassembly_compressed` tracks whether the more-follows fragments currently
+    // being accumulated were flagged compressed, so the whole logical frame is
+    // inflated exactly once at the end. Gated behind `netrom-compress`.
+    #[cfg(feature = "netrom-compress")]
+    compression_enabled: bool,
+    #[cfg(feature = "netrom-compress")]
+    reassembly_compressed: bool,
 
     // Flow control.
     peer_choked: bool,
@@ -150,6 +170,10 @@ impl NetRomCircuit {
             unacked: Vec::new(),
             vr: 0,
             reassembly: Vec::new(),
+            #[cfg(feature = "netrom-compress")]
+            compression_enabled: false,
+            #[cfg(feature = "netrom-compress")]
+            reassembly_compressed: false,
             peer_choked: false,
             local_choked: false,
             pending_deliveries: 0,
@@ -187,6 +211,15 @@ impl NetRomCircuit {
     /// True while the peer has us choked (we are holding Information back).
     pub fn peer_choked(&self) -> bool {
         self.peer_choked
+    }
+    /// True once the circuit is connected and *both* ends negotiated LinBPQ-style L4
+    /// payload compression — i.e. outbound data is being zlib-compressed and flagged
+    /// [`FLAG_COMPRESSED`]. False (the safe default) when either end declined, in
+    /// which case data is sent raw. Gated behind `netrom-compress`. Mirrors C#
+    /// `NetRomCircuit.CompressionNegotiated`.
+    #[cfg(feature = "netrom-compress")]
+    pub fn compression_negotiated(&self) -> bool {
+        self.compression_enabled
     }
     /// Send-side V(s): the next send sequence to allocate (mod 256).
     pub fn send_state(&self) -> u8 {
@@ -238,14 +271,43 @@ impl NetRomCircuit {
         if self.state != NetRomCircuitState::Connected || data.is_empty() {
             return;
         }
+
+        // When compression is negotiated on this circuit, compress the WHOLE logical
+        // send into one zlib stream, then fragment that stream. Every fragment of a
+        // compressed frame carries the Compressed flag; the receiver reassembles all
+        // its more-follows fragments and inflates the concatenation once. Falls back
+        // to raw when compression would not shrink the data (BPQ does the same:
+        // "if complen >= dataLen … just send") — no point paying the zlib header for
+        // an expansion, and raw is always decodable (the flag is per-frame).
+        #[cfg(feature = "netrom-compress")]
+        let compressed_buf: Option<Vec<u8>> = if self.compression_enabled {
+            let z = super::compression::compress(data);
+            if z.len() < data.len() {
+                Some(z)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "netrom-compress")]
+        let (body, compressed): (&[u8], bool) = match &compressed_buf {
+            Some(z) => (z.as_slice(), true),
+            None => (data, false),
+        };
+        #[cfg(not(feature = "netrom-compress"))]
+        let body: &[u8] = data;
+
         let frag = self.options.fragment_size.max(1);
         let mut offset = 0;
-        while offset < data.len() {
-            let take = frag.min(data.len() - offset);
-            let more = offset + take < data.len();
+        while offset < body.len() {
+            let take = frag.min(body.len() - offset);
+            let more = offset + take < body.len();
             self.send_queue.push_back(Fragment {
-                bytes: data[offset..offset + take].to_vec(),
+                bytes: body[offset..offset + take].to_vec(),
                 more_follows: more,
+                #[cfg(feature = "netrom-compress")]
+                compressed,
             });
             offset += take;
         }
@@ -279,7 +341,12 @@ impl NetRomCircuit {
         let t = packet.transport;
         match NetRomOpcode::from_nibble(t.opcode) {
             Some(NetRomOpcode::ConnectRequest) => self.on_connect_request(),
-            Some(NetRomOpcode::ConnectAcknowledge) => self.on_connect_acknowledge(&t, now_ms),
+            Some(NetRomOpcode::ConnectAcknowledge) => self.on_connect_acknowledge(
+                &t,
+                #[cfg(feature = "netrom-compress")]
+                packet.payload,
+                now_ms,
+            ),
             Some(NetRomOpcode::DisconnectRequest) => self.on_disconnect_request(),
             Some(NetRomOpcode::DisconnectAcknowledge) => self.on_disconnect_acknowledge(),
             Some(NetRomOpcode::Information) => self.on_information(&t, packet.payload, now_ms),
@@ -293,7 +360,13 @@ impl NetRomCircuit {
     /// Accept an inbound circuit: adopt the peer's index/id + proposed window, move
     /// to Connected, and send the Connect Acknowledge. (Owner-driven, for an
     /// incoming connect.)
-    pub fn accept_inbound(&mut self, peer_index: u8, peer_id: u8, proposed_window: u8) {
+    pub fn accept_inbound(
+        &mut self,
+        peer_index: u8,
+        peer_id: u8,
+        proposed_window: u8,
+        #[cfg(feature = "netrom-compress")] peer_offers_compression: bool,
+    ) {
         self.remote_index = peer_index;
         self.remote_id = peer_id;
         let proposed = if proposed_window == 0 {
@@ -302,6 +375,15 @@ impl NetRomCircuit {
             proposed_window
         };
         self.window = proposed.min(self.options.window_size).clamp(1, 127);
+
+        // Compression is enabled on this circuit only if BOTH ends advertised it:
+        // the peer's Connect Request carried the offer AND our options enable it. The
+        // Connect Acknowledge mirrors the agreement back so the originator knows.
+        #[cfg(feature = "netrom-compress")]
+        {
+            self.compression_enabled = self.options.compression_enabled && peer_offers_compression;
+        }
+
         self.state = NetRomCircuitState::Connected;
         self.send_connect_acknowledge(false);
         self.fire_connected();
@@ -347,18 +429,25 @@ impl NetRomCircuit {
                     return;
                 }
                 // Go-back style: retransmit every in-flight frame, bumping timers.
-                let frames: Vec<(u8, Vec<u8>, bool)> = self
-                    .unacked
-                    .iter()
-                    .map(|u| (u.sequence, u.payload.clone(), u.more_follows))
-                    .collect();
-                for (seq, payload, more) in &frames {
-                    self.send_information(*seq, payload, *more);
+                // Take the list out so each frame can be borrowed while calling
+                // `&mut self.send_information`, then put it back with bumped timers
+                // (behaviour-identical to the prior clone-into-tuple, and it avoids
+                // cloning every payload on each retransmit).
+                let mut frames = core::mem::take(&mut self.unacked);
+                for u in &frames {
+                    self.send_information(
+                        u.sequence,
+                        &u.payload,
+                        u.more_follows,
+                        #[cfg(feature = "netrom-compress")]
+                        u.compressed,
+                    );
                 }
-                for u in &mut self.unacked {
+                for u in &mut frames {
                     u.sent_at = now_ms;
                     u.retries += 1;
                 }
+                self.unacked = frames;
             }
         }
     }
@@ -376,7 +465,12 @@ impl NetRomCircuit {
 
     // ─── FSM handlers ───────────────────────────────────────────────────
 
-    fn on_connect_acknowledge(&mut self, t: &NetRomTransportHeader, now_ms: u64) {
+    fn on_connect_acknowledge(
+        &mut self,
+        t: &NetRomTransportHeader,
+        #[cfg(feature = "netrom-compress")] info: &[u8],
+        now_ms: u64,
+    ) {
         if self.state != NetRomCircuitState::Connecting {
             return;
         }
@@ -388,6 +482,16 @@ impl NetRomCircuit {
         if t.choke() {
             self.close(NetRomCircuitCloseReason::Refused);
             return;
+        }
+
+        // Compression negotiation: enable only if WE offered (options.compression_enabled)
+        // AND the peer's Connect Acknowledge mirrored the agreement back. A peer that
+        // ignored our offer (or that we never offered to) replies with the vanilla
+        // empty/short ack ⇒ compression_enabled stays false ⇒ we send raw, always safe.
+        #[cfg(feature = "netrom-compress")]
+        {
+            self.compression_enabled =
+                self.options.compression_enabled && ConnectAckInfo::agrees_compression(info);
         }
 
         self.state = NetRomCircuitState::Connected;
@@ -427,10 +531,38 @@ impl NetRomCircuit {
         if t.tx_sequence == self.vr {
             self.vr = self.vr.wrapping_add(1);
             if !payload.is_empty() {
+                // Track whether this logical frame is a compressed stream. BPQ sets
+                // the Compressed flag on every fragment, so the FIRST fragment is
+                // authoritative; read it at the start of accumulation and hold it
+                // until the frame completes.
+                #[cfg(feature = "netrom-compress")]
+                if self.reassembly.is_empty() {
+                    self.reassembly_compressed = t.compressed();
+                }
                 self.reassembly.extend_from_slice(payload);
             }
             if !t.more_follows() && !self.reassembly.is_empty() {
                 let whole = core::mem::take(&mut self.reassembly);
+
+                // Inflate first if the logical frame was sent compressed. A
+                // corrupt/undecodable stream is dropped (fail closed) — but still
+                // acked so the sender advances (a NAK can't recover a bad zlib
+                // stream), never delivered as garbage and never panicking.
+                #[cfg(feature = "netrom-compress")]
+                let whole = if self.reassembly_compressed {
+                    self.reassembly_compressed = false;
+                    match super::compression::try_decompress(&whole) {
+                        Some(w) => w,
+                        None => {
+                            self.send_information_acknowledge(false);
+                            self.pump_send_queue(now_ms);
+                            return;
+                        }
+                    }
+                } else {
+                    whole
+                };
+
                 if self.options.choke_threshold > 0 {
                     self.pending_deliveries += 1;
                 }
@@ -481,12 +613,27 @@ impl NetRomCircuit {
             Some(u) if !u.base().is_empty() => u,
             _ => self.local_node,
         };
-        let mut info = [0u8; crate::netrom::wire::CONNECT_REQUEST_INFO_LEN];
         let cri = ConnectRequestInfo {
             proposed_window: self.options.window_size.clamp(1, 127),
             originating_user: user,
             originating_node: self.local_node,
         };
+
+        // When compression is enabled we OFFER it via the LinBPQ extended-connect form
+        // (canonical 15 octets + a 2-octet timer trailer carrying the compress bit). A
+        // peer that ignores the trailer just sees a normal Connect Request, so offering
+        // is interop-safe; we only actually compress once the peer's Connect
+        // Acknowledge confirms it agreed. Compression off ⇒ canonical 15-octet form.
+        #[cfg(feature = "netrom-compress")]
+        if self.options.compression_enabled {
+            let mut info = [0u8; CONNECT_REQUEST_INFO_EXTENDED_LEN];
+            cri.encode_extended(&mut info, self.options.proposed_timer_seconds, true)
+                .expect("17-byte buffer");
+            self.emit(t, &info);
+            return;
+        }
+
+        let mut info = [0u8; crate::netrom::wire::CONNECT_REQUEST_INFO_LEN];
         cri.encode(&mut info).expect("15-byte buffer");
         self.emit(t, &info);
     }
@@ -500,6 +647,21 @@ impl NetRomCircuit {
             opcode: NetRomOpcode::ConnectAcknowledge.as_u8(),
             flags: if refused { FLAG_CHOKE } else { 0 },
         };
+
+        // Mirror the compression agreement back to the originator (LinBPQ extended
+        // Connect Acknowledge) only when compression was actually agreed; otherwise
+        // the canonical empty-info Connect Acknowledge is sent, so a non-compressing
+        // circuit is byte-for-byte vanilla NET/ROM.
+        #[cfg(feature = "netrom-compress")]
+        if !refused && self.compression_enabled {
+            if let Some(info) =
+                ConnectAckInfo::encode(self.window, self.options.time_to_live, true)
+            {
+                self.emit(t, &info);
+                return;
+            }
+        }
+
         self.emit(t, &[]);
     }
 
@@ -527,10 +689,20 @@ impl NetRomCircuit {
         self.emit(t, &[]);
     }
 
-    fn send_information(&mut self, seq: u8, payload: &[u8], more_follows: bool) {
+    fn send_information(
+        &mut self,
+        seq: u8,
+        payload: &[u8],
+        more_follows: bool,
+        #[cfg(feature = "netrom-compress")] compressed: bool,
+    ) {
         let mut flags = 0u8;
         if more_follows {
             flags |= FLAG_MORE_FOLLOWS;
+        }
+        #[cfg(feature = "netrom-compress")]
+        if compressed {
+            flags |= FLAG_COMPRESSED;
         }
         if self.local_choked {
             flags |= FLAG_CHOKE;
@@ -588,11 +760,19 @@ impl NetRomCircuit {
             let fragment = self.send_queue.pop_front().unwrap();
             let seq = self.vs;
             self.vs = self.vs.wrapping_add(1);
-            self.send_information(seq, &fragment.bytes, fragment.more_follows);
+            self.send_information(
+                seq,
+                &fragment.bytes,
+                fragment.more_follows,
+                #[cfg(feature = "netrom-compress")]
+                fragment.compressed,
+            );
             self.unacked.push(Unacked {
                 sequence: seq,
                 payload: fragment.bytes,
                 more_follows: fragment.more_follows,
+                #[cfg(feature = "netrom-compress")]
+                compressed: fragment.compressed,
                 sent_at: now_ms,
                 retries: 0,
             });
@@ -615,21 +795,28 @@ impl NetRomCircuit {
     }
 
     fn retransmit_from(&mut self, seq: u8, now_ms: u64) {
-        let to_send: Vec<(u8, Vec<u8>, bool)> = self
-            .unacked
-            .iter()
-            .filter(|u| u.sequence == seq || mod256_after(u.sequence, seq))
-            .map(|u| (u.sequence, u.payload.clone(), u.more_follows))
-            .collect();
-        for (s, payload, more) in &to_send {
-            self.send_information(*s, payload, *more);
+        // Take the in-flight list out so each matching frame can be borrowed while
+        // calling `&mut self.send_information`, then put it back with bumped timers
+        // (behaviour-identical to the prior clone-into-tuple).
+        let mut frames = core::mem::take(&mut self.unacked);
+        for u in &frames {
+            if u.sequence == seq || mod256_after(u.sequence, seq) {
+                self.send_information(
+                    u.sequence,
+                    &u.payload,
+                    u.more_follows,
+                    #[cfg(feature = "netrom-compress")]
+                    u.compressed,
+                );
+            }
         }
-        for u in &mut self.unacked {
+        for u in &mut frames {
             if u.sequence == seq || mod256_after(u.sequence, seq) {
                 u.sent_at = now_ms;
                 u.retries += 1;
             }
         }
+        self.unacked = frames;
     }
 
     // ─── Choke ──────────────────────────────────────────────────────────
@@ -677,6 +864,11 @@ impl NetRomCircuit {
         self.unacked.clear();
         self.send_queue.clear();
         self.reassembly.clear();
+        #[cfg(feature = "netrom-compress")]
+        {
+            self.reassembly_compressed = false;
+            self.compression_enabled = false;
+        }
         self.fire_closed(reason);
     }
 
@@ -755,6 +947,8 @@ mod tests {
             req.transport.circuit_index,
             req.transport.circuit_id,
             cri.proposed_window,
+            #[cfg(feature = "netrom-compress")]
+            false,
         );
         assert_eq!(b.state(), NetRomCircuitState::Connected);
         assert!(b.take_events().contains(&CircuitEvent::Connected));
@@ -786,5 +980,309 @@ mod tests {
         assert!(a
             .take_events()
             .contains(&CircuitEvent::Closed(NetRomCircuitCloseReason::Normal)));
+    }
+}
+
+// ─── L4 compression (BPQ L4Compress) — negotiation + send/recv, feature-gated ───
+#[cfg(all(test, feature = "netrom-compress"))]
+mod compression_tests {
+    use super::*;
+    use crate::ax25::Callsign;
+    use crate::netrom::transport::compression;
+    use crate::netrom::wire::{
+        ConnectAckInfo, ConnectRequestInfo, CONNECT_REQUEST_INFO_EXTENDED_LEN,
+        CONNECT_REQUEST_INFO_LEN, FLAG_COMPRESSED, MAX_PAYLOAD,
+    };
+
+    const NOW: u64 = 1_000;
+
+    fn cs(b: &[u8]) -> Callsign {
+        Callsign::new(b, 0).unwrap()
+    }
+
+    fn on() -> NetRomCircuitOptions {
+        NetRomCircuitOptions {
+            compression_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn off() -> NetRomCircuitOptions {
+        NetRomCircuitOptions::default()
+    }
+
+    /// Feed a batch of a peer's outbound datagrams into `to`.
+    fn feed(pkts: &[OutboundPacket], to: &mut NetRomCircuit) {
+        for p in pkts {
+            let pkt = NetRomPacket {
+                network: p.network,
+                transport: p.transport,
+                payload: &p.payload,
+            };
+            to.on_packet(&pkt, NOW);
+        }
+    }
+
+    /// Bring up an A→B circuit under the given options, running the full connect
+    /// handshake (offer/agree wired through as A's Connect Request advertised).
+    /// Returns both connected ends. A = index 1/id 7, B = index 2/id 9.
+    fn connected_pair(
+        opts_a: NetRomCircuitOptions,
+        opts_b: NetRomCircuitOptions,
+    ) -> (NetRomCircuit, NetRomCircuit) {
+        let (na, nb) = (cs(b"GB7AAA"), cs(b"GB7BBB"));
+        let mut a = NetRomCircuit::new(1, 7, na, nb, opts_a);
+        let mut b = NetRomCircuit::new(2, 9, nb, na, opts_b);
+
+        a.connect(cs(b"M0LTE"), NOW);
+        let creq = a.take_outbox().remove(0);
+        let cri = ConnectRequestInfo::decode(&creq.payload).unwrap();
+        let offered = ConnectRequestInfo::offers_compression(&creq.payload);
+        b.accept_inbound(
+            creq.transport.circuit_index,
+            creq.transport.circuit_id,
+            cri.proposed_window,
+            offered,
+        );
+        // Deliver B's Connect Acknowledge back to A so A settles its side.
+        let cack = b.take_outbox();
+        feed(&cack, &mut a);
+        (a, b)
+    }
+
+    // ── Negotiation ────────────────────────────────────────────────────
+
+    #[test]
+    fn offers_via_extended_connect_when_enabled() {
+        let mut a = NetRomCircuit::new(1, 7, cs(b"GB7AAA"), cs(b"GB7BBB"), on());
+        a.connect(cs(b"M0LTE"), NOW);
+        let creq = a.take_outbox().remove(0);
+        assert_eq!(creq.payload.len(), CONNECT_REQUEST_INFO_EXTENDED_LEN);
+        assert!(ConnectRequestInfo::offers_compression(&creq.payload));
+    }
+
+    #[test]
+    fn sends_canonical_connect_when_disabled() {
+        // Feature compiled in, but the option off ⇒ byte-identical plain NET/ROM.
+        let mut a = NetRomCircuit::new(1, 7, cs(b"GB7AAA"), cs(b"GB7BBB"), off());
+        a.connect(cs(b"M0LTE"), NOW);
+        let creq = a.take_outbox().remove(0);
+        assert_eq!(creq.payload.len(), CONNECT_REQUEST_INFO_LEN);
+        assert!(!ConnectRequestInfo::offers_compression(&creq.payload));
+    }
+
+    #[test]
+    fn both_ends_offer_and_agree_enables_compression() {
+        let (a, b) = connected_pair(on(), on());
+        assert_eq!(a.state(), NetRomCircuitState::Connected);
+        assert_eq!(b.state(), NetRomCircuitState::Connected);
+        assert!(a.compression_negotiated(), "originator settled compression on");
+        assert!(b.compression_negotiated(), "acceptor settled compression on");
+    }
+
+    #[test]
+    fn responder_declining_leaves_both_ends_plain() {
+        // A offers, B has compression disabled ⇒ B replies with the vanilla empty
+        // Connect Acknowledge, and neither end compresses.
+        let (na, nb) = (cs(b"GB7AAA"), cs(b"GB7BBB"));
+        let mut a = NetRomCircuit::new(1, 7, na, nb, on());
+        let mut b = NetRomCircuit::new(2, 9, nb, na, off());
+        a.connect(cs(b"M0LTE"), NOW);
+        let creq = a.take_outbox().remove(0);
+        let cri = ConnectRequestInfo::decode(&creq.payload).unwrap();
+        b.accept_inbound(
+            creq.transport.circuit_index,
+            creq.transport.circuit_id,
+            cri.proposed_window,
+            ConnectRequestInfo::offers_compression(&creq.payload),
+        );
+        let cack = b.take_outbox();
+        assert_eq!(cack.len(), 1);
+        assert!(
+            cack[0].payload.is_empty(),
+            "a declining Connect Acknowledge is the vanilla empty-info form"
+        );
+        assert!(!ConnectAckInfo::agrees_compression(&cack[0].payload));
+        feed(&cack, &mut a);
+        assert!(!a.compression_negotiated());
+        assert!(!b.compression_negotiated());
+    }
+
+    #[test]
+    fn initiator_declining_leaves_both_ends_plain() {
+        // A never offers (canonical connect); B is willing but has nothing to agree
+        // to ⇒ both stay plain.
+        let (a, b) = connected_pair(off(), on());
+        assert!(!a.compression_negotiated());
+        assert!(!b.compression_negotiated());
+    }
+
+    // ── Send / receive ─────────────────────────────────────────────────
+
+    /// A moderately compressible ~4 KiB payload (repeated text + a little entropy)
+    /// whose zlib stream exceeds the 236-byte fragment size, forcing a multi-fragment
+    /// compressed logical send. Stays under the 8 KiB decompress cap.
+    fn multi_fragment_payload() -> Vec<u8> {
+        let mut rng: u32 = 0x1234_5678;
+        let mut data = Vec::new();
+        for _ in 0..70 {
+            data.extend_from_slice(b"GB7RDG NET/ROM node broadcast quality 192 via GB7RDG-7 ");
+            for _ in 0..8 {
+                rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                data.push((rng >> 24) as u8);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn compressed_logical_send_round_trips_through_fragment_reassemble_inflate() {
+        let original = multi_fragment_payload();
+        let z = compression::compress(&original);
+        assert!(z.len() < original.len(), "payload must actually compress");
+        assert!(
+            z.len() > MAX_PAYLOAD,
+            "compressed stream must span >1 fragment (got {})",
+            z.len()
+        );
+
+        // A window wide enough to emit every fragment in one burst (so the whole
+        // logical frame is in the outbox to inspect + deliver at once).
+        let opts = NetRomCircuitOptions {
+            compression_enabled: true,
+            window_size: 32,
+            ..Default::default()
+        };
+        let (mut a, mut b) = connected_pair(opts, opts);
+        a.send(&original, NOW);
+        let frames = a.take_outbox();
+
+        // Every fragment of a compressed logical send carries the Compressed flag;
+        // all but the last carry more-follows.
+        assert!(frames.len() >= 2, "expected multiple fragments");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                NetRomOpcode::from_nibble(f.transport.opcode),
+                Some(NetRomOpcode::Information)
+            );
+            assert!(f.transport.compressed(), "fragment {i} lacks the Compressed flag");
+            let last = i == frames.len() - 1;
+            assert_eq!(f.transport.more_follows(), !last, "more-follows on fragment {i}");
+        }
+
+        feed(&frames, &mut b);
+        let events = b.take_events();
+        let received: Vec<Vec<u8>> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                CircuitEvent::DataReceived(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received.len(), 1, "reassembled to a single logical frame");
+        assert_eq!(received[0], original, "inflated payload matches the original");
+    }
+
+    #[test]
+    fn incompressible_payload_uses_the_raw_per_send_fallback() {
+        // High-entropy data zlib cannot shrink ⇒ sent raw, Compressed flag clear,
+        // even though the circuit negotiated compression.
+        let mut rng: u32 = 0xDEAD_BEEF;
+        let mut payload = Vec::new();
+        for _ in 0..48 {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            payload.push((rng >> 24) as u8);
+        }
+        assert!(
+            compression::compress(&payload).len() >= payload.len(),
+            "test precondition: payload must not compress"
+        );
+
+        let (mut a, mut b) = connected_pair(on(), on());
+        assert!(a.compression_negotiated());
+        a.send(&payload, NOW);
+        let frames = a.take_outbox();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            !frames[0].transport.compressed(),
+            "raw fallback must leave the Compressed flag clear"
+        );
+
+        feed(&frames, &mut b);
+        let received: Vec<Vec<u8>> = b
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                CircuitEvent::DataReceived(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received, alloc::vec![payload]);
+    }
+
+    #[test]
+    fn disabled_circuit_never_sets_the_compressed_flag() {
+        // Feature compiled in, both ends' option off ⇒ behaves like plain NET/ROM:
+        // no negotiation, no Compressed flag, data flows raw.
+        let (mut a, mut b) = connected_pair(off(), off());
+        assert!(!a.compression_negotiated());
+        let payload = b"plain netrom data, no compression on this circuit";
+        a.send(payload, NOW);
+        let frames = a.take_outbox();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            !frames[0].transport.compressed(),
+            "a disabled circuit must not compress"
+        );
+        feed(&frames, &mut b);
+        let received: Vec<Vec<u8>> = b
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                CircuitEvent::DataReceived(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received, alloc::vec![payload.to_vec()]);
+    }
+
+    #[test]
+    fn a_corrupt_compressed_frame_is_dropped_but_still_acked() {
+        // Fail-closed: an undecodable zlib payload flagged Compressed must not be
+        // delivered as garbage nor panic — it is dropped, and still acked so the
+        // sender advances (a NAK can't recover a bad zlib stream).
+        let (_a, mut b) = connected_pair(on(), on());
+        // Craft an Information frame addressed to B (its local key 2/9), sequence 0,
+        // flagged Compressed, with a payload that is not a valid zlib stream.
+        let garbage = OutboundPacket {
+            network: NetRomNetworkHeader {
+                origin: cs(b"GB7AAA"),
+                destination: cs(b"GB7BBB"),
+                time_to_live: 10,
+            },
+            transport: NetRomTransportHeader {
+                circuit_index: 2,
+                circuit_id: 9,
+                tx_sequence: 0,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::Information.as_u8(),
+                flags: FLAG_COMPRESSED,
+            },
+            payload: alloc::vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        };
+        feed(&[garbage], &mut b);
+
+        // No data delivered upward…
+        let delivered = b
+            .take_events()
+            .into_iter()
+            .any(|e| matches!(e, CircuitEvent::DataReceived(_)));
+        assert!(!delivered, "a corrupt compressed frame must not be delivered");
+        // …but an Information Acknowledge was still emitted.
+        let acked = b.take_outbox().into_iter().any(|p| {
+            NetRomOpcode::from_nibble(p.transport.opcode)
+                == Some(NetRomOpcode::InformationAcknowledge)
+        });
+        assert!(acked, "the dropped frame is still acked so the sender advances");
     }
 }

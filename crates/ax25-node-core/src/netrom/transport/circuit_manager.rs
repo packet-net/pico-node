@@ -50,6 +50,13 @@ pub struct IncomingCircuit {
     pub peer_id: u8,
     /// The window size the peer proposed in its Connect Request.
     pub proposed_window: u8,
+    /// Whether the peer's Connect Request offered LinBPQ L4 compression (the
+    /// extended-connect compress bit). Passed to
+    /// [`NetRomCircuit::accept_inbound`](super::circuit::NetRomCircuit::accept_inbound)
+    /// so compression enables only when both ends advertise. Gated behind
+    /// `netrom-compress`.
+    #[cfg(feature = "netrom-compress")]
+    pub offered_compression: bool,
 }
 
 struct Managed {
@@ -204,6 +211,8 @@ impl CircuitManager {
                 incoming.peer_index,
                 incoming.peer_id,
                 incoming.proposed_window,
+                #[cfg(feature = "netrom-compress")]
+                incoming.offered_compression,
             );
         }
     }
@@ -264,6 +273,10 @@ impl CircuitManager {
             proposed_window = info.proposed_window;
             originating_user = info.originating_user;
         }
+        // Read the peer's compression offer off the (extended) Connect Request. The
+        // canonical decode above ignores the trailer, so this is a separate read.
+        #[cfg(feature = "netrom-compress")]
+        let offered_compression = ConnectRequestInfo::offers_compression(request.payload);
 
         let peer_key = (remote_node, t.circuit_index, t.circuit_id);
         let (index, id) = self.allocate_key();
@@ -279,6 +292,8 @@ impl CircuitManager {
             peer_index: t.circuit_index,
             peer_id: t.circuit_id,
             proposed_window,
+            #[cfg(feature = "netrom-compress")]
+            offered_compression,
         });
     }
 
@@ -1008,5 +1023,73 @@ mod tests {
             NetRomOpcode::from_nibble(sent[0].transport.opcode),
             Some(NetRomOpcode::DisconnectAcknowledge)
         );
+    }
+
+    // ─── L4 compression negotiation through the manager (feature-gated) ──
+
+    /// A compressible multi-fragment payload (compresses under the fragment size
+    /// yet stays under the 8 KiB decompress cap).
+    #[cfg(feature = "netrom-compress")]
+    fn compressible_payload() -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..60 {
+            data.extend_from_slice(b"GB7RDG NET/ROM node broadcast quality 192 via GB7RDG-7 more follows\n");
+        }
+        data
+    }
+
+    #[cfg(feature = "netrom-compress")]
+    #[test]
+    fn both_ends_negotiate_and_a_compressed_send_round_trips_through_the_manager() {
+        let mut h = Harness::with_both(NetRomCircuitOptions {
+            compression_enabled: true,
+            window_size: 8,
+            ..Default::default()
+        });
+        h.auto_accept_on_b();
+        let a = h.open_from_a();
+        h.connect_a(a, user());
+        h.pump();
+        let b = h.accepted(0);
+
+        assert!(
+            h.a.circuit_mut(a).unwrap().compression_negotiated(),
+            "originator negotiated compression via the manager accept path"
+        );
+        assert!(
+            h.b.circuit_mut(b).unwrap().compression_negotiated(),
+            "acceptor negotiated compression"
+        );
+
+        // End-to-end: a compressed logical send fragments, reassembles, inflates.
+        let payload = compressible_payload();
+        h.send_a(a, &payload);
+        h.pump();
+        assert_eq!(h.cap_b(b).received_bytes(), payload);
+    }
+
+    #[cfg(feature = "netrom-compress")]
+    #[test]
+    fn either_end_declining_leaves_the_manager_circuit_plain() {
+        // A offers, B declines (compression off) ⇒ neither compresses; data still flows.
+        let mut h = Harness::with_options(
+            NetRomCircuitOptions {
+                compression_enabled: true,
+                ..Default::default()
+            },
+            NetRomCircuitOptions::default(),
+        );
+        h.auto_accept_on_b();
+        let a = h.open_from_a();
+        h.connect_a(a, user());
+        h.pump();
+        let b = h.accepted(0);
+
+        assert!(!h.a.circuit_mut(a).unwrap().compression_negotiated());
+        assert!(!h.b.circuit_mut(b).unwrap().compression_negotiated());
+
+        h.send_a(a, b"still flows uncompressed");
+        h.pump();
+        assert_eq!(h.cap_b(b).received_bytes(), b"still flows uncompressed");
     }
 }

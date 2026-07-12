@@ -18,6 +18,11 @@
 
 pub mod broadcast;
 pub mod callsign;
+/// The LinBPQ extended Connect Acknowledge info field (window / TTL + the
+/// compression-agreed bit). Gated behind `netrom-compress`. Mirrors C#
+/// `Packet.NetRom.Wire.ConnectAckInfo`.
+#[cfg(feature = "netrom-compress")]
+pub mod connect_ack_info;
 pub mod connect_request_info;
 pub mod entry;
 pub mod inp3_l3rtt;
@@ -33,6 +38,10 @@ pub use broadcast::NodesBroadcast;
 pub use callsign::{
     read_alias, try_read_shifted, write_alias, write_shifted, Alias, ALIAS_LENGTH, SHIFTED_LENGTH,
 };
+#[cfg(feature = "netrom-compress")]
+pub use connect_ack_info::{ConnectAckInfo, CONNECT_ACK_INFO_EXTENDED_LEN};
+#[cfg(feature = "netrom-compress")]
+pub use connect_request_info::CONNECT_REQUEST_INFO_EXTENDED_LEN;
 pub use connect_request_info::{ConnectRequestInfo, CONNECT_REQUEST_INFO_LEN};
 pub use entry::NodesRoutingEntry;
 pub use network_header::{NetRomNetworkHeader, DEFAULT_TIME_TO_LIVE, NETWORK_HEADER_LEN};
@@ -41,6 +50,8 @@ pub use nodes_broadcast_builder::{
 };
 pub use options::NetRomParseOptions;
 pub use packet::{NetRomPacket, MAX_PAYLOAD, PACKET_HEADER_LEN};
+#[cfg(feature = "netrom-compress")]
+pub use transport_header::FLAG_COMPRESSED;
 pub use transport_header::{
     NetRomOpcode, NetRomTransportHeader, FLAGS_MASK, FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK,
     OPCODE_MASK, TRANSPORT_HEADER_LEN,
