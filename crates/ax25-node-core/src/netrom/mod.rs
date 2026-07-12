@@ -1,9 +1,13 @@
-//! # NET/ROM — read-only "NET/ROM aware" slice
+//! # NET/ROM — full L3 + L4 slice
 //!
 //! The Rust port of the C# `Packet.NetRom` library + `Packet.Node.Core.NetRom`
-//! service (packet.net PR #303), brought to the embedded node: **hear NODES
-//! broadcasts, build a routing table, surface it** — and **originate nothing on
-//! the air** (no TX, no L4 circuits, no NODES origination).
+//! service (packet.net PR #303), brought to the embedded node: **hear *and*
+//! originate NODES broadcasts, maintain and age a routing table, forward L3, and
+//! carry L4 circuits** (connect-by-alias + interlink transit). INP3 (RIF / L3RTT /
+//! SNTT) is present and byte-identical to the reference, **runtime-gated off by
+//! default** so the wire form degrades exactly to plain NET/ROM when disabled.
+//! The firmware drives origination + the obsolescence sweep on each NODES
+//! interval; [`NetRomService`] itself stays a pure observer (below).
 //!
 //! ## Layout (mirrors the C# split)
 //!
@@ -20,9 +24,12 @@
 //!   table, plus the [`NetRomRoutingView`] read accessor (the
 //!   `INetRomRoutingView` equivalent).
 //!
-//! ## The read-only guarantee
+//! ## The observation tap
 //!
-//! The service's only interaction with a port is observing inbound frames via
+//! [`NetRomService`] itself is a pure observer — origination ([`NetRomOriginator`]),
+//! L3 forwarding ([`decide_forward`]), and L4 circuits ([`CircuitManager`]) are
+//! separate components the firmware drives on the NODES interval. The service's
+//! only interaction with a port is observing inbound frames via
 //! [`NetRomService::observe_frame`] — a pure observation tap, called by the
 //! firmware *before* address filtering (so it hears NODES broadcasts, which are
 //! addressed to the literal text callsign `NODES`, not to us). It never gates,

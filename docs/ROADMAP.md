@@ -4,28 +4,63 @@ Companion to [`PLAN.md`](PLAN.md) (architecture, module map, build/flash/test cy
 
 pico-node is node **firmware people build a real node with** — so radios (a NinoTNC behind KISS, a Tait driven directly over CCDI, a radio's own FFSK modem, or a *remote* radio reached over a head-end) are core candidate scope, not out of scope.
 
-## Where it stands today (protocol baseline ~2026-06-04)
+## Where it stands today (2026-07-12, after the Fable wave)
 
-Implemented + host-tested in `crates/ax25-node-core` (154 host tests; builds `thumbv6m-none-eabi` `no_std`+`alloc`):
-- **AX.25 v2.2 connected-mode** — the full SDL link-layer runtime (SABM/UA/I/RR/REJ/**SREJ**/T1–T3), the figc4.x spec-defect quirks **#38, #40–#45, #47**, off the generated SDL typed tables.
-- **KISS** codec, **AXUDP** framing, AX.25 frame/address/callsign codec, **CRC-16/X.25** FCS, telnet/command console.
-- **NET/ROM — read-only:** hears NODES broadcasts, builds a fixed-capacity routing table, surfaces it. **No** origination, **no** L4 circuits/`connect`, **no** interlinks.
-- Firmware crate (`ax25-node-fw`) cross-compiles; the **binary is at the hardware gate** — the WiFi/CYW43 bring-up + the transport sockets (AXUDP / KISS-TCP / KISS-serial) are stubs that need a physical Pico W + debug probe. UI (connectionless) frames can move end-to-end; connected-mode needs the (now-written) runtime + the transports filled.
+`crates/ax25-node-core` builds `thumbv6m-none-eabi` `no_std`+`alloc`; the `ax25-node-fw` crate cross-compiles. Health on `main`: **632 core host tests** green, `clippy -D warnings` clean, the `no_std` build clean, both fw `--locked` gates green, and the parity drift-guard passing (0 gaps).
+
+> **The old June "current state" in this doc was stale.** A fresh recon (2026-07-12) found the tree far more complete than recorded — full detail in **[Delivered — 2026-07-12 Fable wave](#delivered--2026-07-12-fable-wave)**. In brief: NET/ROM L4 + NODES origination + INP3 were *already* built (not "read-only"); mod-128 was genuinely missing *at the wire codec* (now shipped); the radio stack was greenfield (now shipped); no shared golden vectors existed (now built).
+
+## Delivered — 2026-07-12 Fable wave
+
+A parallel implementation wave — recon fan-out → 7 isolated git worktrees → merge, each track gated on `clippy -D warnings` + `cargo test` — landed most of tables A–E. Baseline 470 → **632 core tests**; the fw crate now cross-builds.
+
+**Ground-truth correction (recon 2026-07-12)** — the tree had drifted *ahead* of this doc, not behind:
+- **NET/ROM L4 transport, NODES origination, and INP3 were already fully built** and byte-identical to C#. What made it look "read-only": [`NetRomService`] is a pure observer; origination / L4 circuits / forwarding are separate components the firmware drives — and, pre-wave, only wired on the AXUDP/LAN path.
+- **mod-128 was genuinely MISSING at the wire codec** — `sdl/bridge.rs` was hard-coded modulo-8, silently mis-encoding extended I/S frames past N(S)=7, even though the session tracked `is_extended` and did SABME establishment.
+- **The radio stack (Tait CCDI, FFSK, SDM, RSSI) was greenfield** (0 files).
+- **No shared golden vectors existed anywhere** — "vector-enforced parity" was aspirational; the corpus + runner + drift-guard had to be built.
+
+### Shipped to pico-node `main` (PRs #53–#60)
+
+| Area | What shipped | PR |
+|---|---|---|
+| A · mod-128 | extended-control wire codec (fixes the mod-8 mis-encode); mod-128 SREJ falls out of it; `Ax25ParseOptions` strict scaffold; v2.2-preferred connect; carrier-sense seam | #56 |
+| A · quirks | session quirks #48 DM-degrade, #9 ack-progress-resets-RC, #13 clamp-SREJ-window → **11/12** of C#'s `Ax25SessionQuirks` | #55 |
+| C · radio | Tait CCDI codec + driver (RSSI/PTT/channel + PROGRESS demux) + integer-EMA RSSI tagging + FFSK-transparent | #54 |
+| D · SDM | SDM tuning-telegram + meter-report codec (parity-locked; codec only — the link is a follow-up) | #59 |
+| C/E · KISS | ACKMODE echo-correlator, NinoTNC status/RSSI parsers + CQBEEP builder, portable reconnect backoff | #58 |
+| parity | capability manifest + golden-vector runner (`tests/golden_vectors.rs` **round-trips C#'s golden UI bytes exactly**) | #57 |
+| parity CI | cross-stack drift-guard: `scripts/parity-check.mjs` + vendored 50-item C# inventory + `parity-exceptions.json` + self-hosted `.github/workflows/parity.yml` | #53 |
+| fw wiring | NODES obsolescence-sweep fix, origination + RX-observe on RF, `kiss_serial` pump+spawn, new Tait CCDI transport — **compile-validated only, no hardware run** (also repaired a fw-build break from #58's new enum variants) | #60 |
+
+### 3-way parity mirror (cross-repo, in review)
+`interop.yml` (packet.net **#605**) and `parity-check.mjs` + `ci.yml` (ax25-ts **#73**) gain a `--rust` leg so the mirror is a true 3-way gate — C# `Packet.*` ⊆ TS `@packet-net/ax25` ⊆ Rust pico-node, drift failing on whichever side introduces it. Reuses the live C# extraction (single source of truth) against pico-node's manifest/exceptions. Held pending their own CI.
+
+### Decision reconciliations
+- **INP3 (decided "Later, leave a seam")** — it turned out *fully built and byte-identical*. Retroactively cargo-gating it would **diverge from the C# reference** (which also ships it always-compiled, runtime-gated). Resolution: **left as-is — present, runtime-gated *off* by default**; the wire form degrades exactly to plain NET/ROM when disabled, which honours "leave a seam" without divergence.
+- **`prefer_extended_connect`** shipped **default-off** (pico keeps dialing mod-8) because #48 DM-degrade wasn't co-landed in the codec branch. Both are on `main` now, so a follow-up can flip it to C#'s default-on with a DM-refusing-peer regression test.
+
+### Still open (follow-ups — not this wave)
+- **XID / MDL pre-session responder + per-call `preConnectXid` capability cache** (table A) — deferred: entangled in `bridge.rs`/`context.rs`/`manager.rs`, best as its own focused branch atop the mod-128 codec.
+- **SDL version skew** — Rust `ax25sdl` 0.8.0 vs C# `Packet.Ax25.Sdl` 0.10.0, pico floats on `main`. Recorded in `parity-manifest.toml [sdl]`; pin to a matching `crate-v*` tag. Only bites SDL-*driven* session vectors, not pure codecs.
+- **fw bench validation** — everything in #60 is compile-only; sweep timing, on-air NODES visibility, the `kiss_serial` pump under live NinoTNC traffic, and the Tait CCDI transact/demux all need the hardware-bringup session.
+- **SDM *link*** (`SdmTuningLink` retry/dedupe) — the telegram codec shipped; the link rides the now-present CCDI driver and is a clean follow-up.
+- **Optional NET/ROM parity** — L4 payload compression (needs a `no_std` deflate — a dependency decision) and NODESPACLEN per-port fragmentation; both default-off in C#, so interop is unaffected today.
 
 ## Parity discipline
 
-- **Build order, every increment: C# reference (`m0lte/packet.net`) → TypeScript (`packet-net/ax25-ts`) → Rust (pico-node).** The C# codec/behaviour is authoritative; the other two mirror it 1:1. ax25-ts is the closest port model (TS→Rust is easier than C#→Rust) and is the *only* one of the three currently under CI-enforced parity.
-- **SDL state-machine tables** come from **`packethacking/ax25spec`** (the canonical home; formerly `m0lte/ax25sdl`).
-- **Byte-identical codecs** across all three, enforced by **shared golden vectors** (FNV-1a flow hash, NET/ROM quality formula, NODES vectors, session/wire vectors).
+- **Build order, every increment: C# reference (`packet-net/packet.net`) → TypeScript (`packet-net/ax25-ts`) → Rust (pico-node).** The C# codec/behaviour is authoritative; the other two mirror it 1:1. ax25-ts is the closest port model (TS→Rust is easier than C#→Rust).
+- **SDL state-machine tables** come from the **`ax25sdl`** Rust crate in **`packet-net/ax25sdl`** (`spec/rust`), consumed as a local sibling path-dependency. (Note: `packethacking/ax25spec` is the *prose* spec — PDFs of AX.25/KISS/IL2P — and has **no** Rust crate; the SDL tables live in `packet-net/ax25sdl`. A version pin is a tracked follow-up — see above.)
+- **Byte-identical codecs** across all three, enforced by **shared golden vectors** (FNV-1a flow hash, NET/ROM quality formula, NODES vectors, session/wire vectors). As of 2026-07-12 pico-node ships the first vector set + runner + drift-guard (below); the shared corpus grows from here.
 - **Rust stays `no_std`-clean:** integer-only maths (the M0+ has no FPU), fixed-capacity const-generic state (no heap maps), `u64` monotonic ticks.
-- **Named flags / quirks default-off**, preserving prior behaviour (mirrors `Ax25ParseOptions` / `Ax25SessionQuirks` / `NetRomParseOptions`).
+- **Named flags / quirks default to preserving prior behaviour** (mirrors `Ax25ParseOptions` / `Ax25SessionQuirks` / `NetRomParseOptions`).
 
 ## Legend
 
-- **Status** — in pico-node today: `HAS` / `PARTIAL` / `NONE` (`check`/`audit` = confirm against the code).
+- **Status** — in pico-node today: `HAS` / `PARTIAL` / `NONE` (`check`/`audit` = confirm against the code). *(These are the pre-wave values; see [Delivered](#delivered--2026-07-12-fable-wave) for current.)*
 - **Class** — **🔒** parity-locked shared codec/behaviour (golden-vector territory) · **🔧** node feature (parity only if it speaks a wire protocol shared with other pdn stacks).
 - **Fit** — feasibility on the RP2040 (264 KB RAM, dual M0+, no FPU, WiFi via CYW43).
-- **Rec** — `In` / `Decide` / `Later` / `Skip` (a starting recommendation; the *decision* column is filled as we go).
+- **Rec** — `In` / `Decide` / `Later` / `Skip` (a starting recommendation); **decision** = the call made; a ✅ marks what shipped in the 2026-07-12 wave.
 
 ---
 
@@ -33,48 +68,48 @@ Implemented + host-tested in `crates/ax25-node-core` (154 host tests; builds `th
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **mod-128 (extended) framing** — SABME/extended control octets | NONE (its own flagged follow-up) | 🔒 | In | In |
-| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | In |
-| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | In |
-| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | In |
-| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | In |
-| **Carrier-sense (CSMA) seam** (`ICarrierSense` parity) | NONE | 🔒/🔧 | In (needed for any keyed modem) | In |
-| **figc4.x quirks added after #47** (if any landed) | HAS #38–47 | 🔒 | In (audit) | In (audit) |
+| **mod-128 (extended) framing** — SABME/extended control octets | NONE (its own flagged follow-up) | 🔒 | In | In · ✅ #56 |
+| **v2.2-preferred CONNECT** (SABME-first, SABM fallback) | check | 🔒 | In | In · ✅ #56 (`prefer_extended_connect` default-off pending #48 co-land) |
+| **SREJ-to-BPQ interop** tweaks (the working-SREJ leg) | PARTIAL (has SREJ) | 🔒 | In | In · ✅ mod-128 SREJ #56 + #55 clamp |
+| **Pre-session XID responder** + mod-8 interlinks + fast-probe fallback | NONE | 🔒 | In | In · ⏳ follow-up (entangled; own branch) |
+| **Per-call preConnectXid / peer-capability cache** dial param | NONE | 🔒 | Decide | In · ⏳ follow-up (rides XID) |
+| **Carrier-sense (CSMA) seam** (`ICarrierSense` parity) | NONE | 🔒/🔧 | In (needed for any keyed modem) | In · ✅ #56 (default always-clear) |
+| **figc4.x quirks added after #47** (if any landed) | HAS #38–47 | 🔒 | In (audit) | In (audit) · ✅ #55 adds #48/#9/#13 → 11/12 |
 
 ## B. NET/ROM — beyond read-only
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | In |
-| **NODES origination / broadcast scheduler** | NONE | 🔒 | In | In |
-| **INP3** routing overlay | NONE (future, all-stack) | 🔒 | Later (not shipped anywhere yet) | Later, leave a seam |
+| **L4 transport** — CircuitManager, `connect <alias>`, interlink sessions | NONE (read-only only) | 🔒 | In (makes it a *usable* node) | In · ✅ **already built** (recon); RF-wired #60 |
+| **NODES origination / broadcast scheduler** | NONE | 🔒 | In | In · ✅ **already built**; sweep-fix + RF origination #60 |
+| **INP3** routing overlay | NONE (future, all-stack) | 🔒 | Later (not shipped anywhere yet) | Later, leave a seam · ✅ **already built, runtime-gated off** (not cargo-gated — would diverge from C#) |
 
 ## C. Radio integration
 
 | feature | status | class | fit | rec | decision |
 |---|---|---|---|---|---|
-| **KISS-over-serial to a NinoTNC** (direct UART) | PARTIAL (codec done, transport stubbed) | 🔧 | good | In (planned cap #3) | In |
-| **Direct Tait CCDI radio control** (RSSI, DCD/carrier-sense, PTT, channel, mode) over a UART | NONE | 🔧 (CCDI is a wire protocol) | good | In — the "radios are integral" core | In |
-| **Tait FFSK transparent-mode modem** (AX.25 over the radio's own modem, no TNC) | NONE | 🔒 (SLIP-over-FFSK) | good | Decide | In |
+| **KISS-over-serial to a NinoTNC** (direct UART) | PARTIAL (codec done, transport stubbed) | 🔧 | good | In (planned cap #3) | In · ✅ pump+spawn #60 (compile-only) |
+| **Direct Tait CCDI radio control** (RSSI, DCD/carrier-sense, PTT, channel, mode) over a UART | NONE | 🔧 (CCDI is a wire protocol) | good | In — the "radios are integral" core | In · ✅ codec+driver #54, fw transport #60 |
+| **Tait FFSK transparent-mode modem** (AX.25 over the radio's own modem, no TNC) | NONE | 🔒 (SLIP-over-FFSK) | good | Decide | In · ✅ #54 |
 | **Head-end *client*** (adopt a *remote* radio over TCP + inventory + line-control) | NONE | 🔧 | good (WiFi TCP) | Decide — lets a tiny Pico reach a shared radio | Out |
-| **RSSI/SNR per-frame tagging** (RssiTaggingTransport) | NONE | 🔧 | good | In (pairs with CCDI) | In |
+| **RSSI/SNR per-frame tagging** (RssiTaggingTransport) | NONE | 🔧 | good | In (pairs with CCDI) | In · ✅ #54 |
 | **IL2P / FX.25 FEC framing** | NONE | 🔒 | RAM? | Decide (NinoTNC does IL2P today; only if pico drives a bare modem) | Out - done by modem |
 
 ## D. Radio coordination / tuning (the SDM stack)
 
 | feature | status | class | rec | decision |
 |---|---|---|---|---|
-| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | Yes |
+| **SDM side channel** (Tait CCDI short-data telegrams) | NONE | 🔒 (telegram wire form) | Decide | Yes · ✅ telegram+meter codec #59 (link = follow-up) |
 | **Mode coordination / TXDELAY-min / station-hail / deviation assist** | NONE | 🔒 (telegrams) 🔧 | Later — nice but heavy; depends on C + SDM | Later |
 
 ## E. Node-host services
 
 | feature | status | class | fit | rec | decision |
 |---|---|---|---|---|---|
-| KISS-over-TCP (net-sim) · AXUDP · telnet console | PARTIAL (codecs done, transports stubbed) | 🔧 | good | In (existing caps 1/2/4) | Needs more breakdown |
+| KISS-over-TCP (net-sim) · AXUDP · telnet console | PARTIAL (codecs done, transports stubbed) | 🔧 | good | In (existing caps 1/2/4) | Needs more breakdown · AXUDP/telnet already whole; KISS-TCP origination+sweep wired #60 |
 | **AGWPE server** (TCP) | NONE | 🔧 (wire protocol) | ok | Decide | Defer |
 | **RHPv2** (XRouter protocol) | NONE | 🔧 | RAM-heavy | Later | Defer |
-| **MQTT frame emitter** (kissproxy-compatible tracing) | NONE | 🔧 | ok | Decide | Defer |
+| **MQTT frame emitter** (kissproxy-compatible tracing) | NONE | 🔧 | ok | Decide | Defer (telemetry MQTT already present; per-frame emitter deferred) |
 | **Web config/monitor panel** | HAS (provisioning/AP panel) | 🔧 | ok | keep as-is | Extend as necessary |
 | **OTA self-update** | HAS | 🔧 | ok | keep | keep |
 | **APRS** (APRS101) | NONE | 🔒 | ok | Later | Defer |
@@ -84,19 +119,21 @@ Implemented + host-tested in `crates/ax25-node-core` (154 host tests; builds `th
 
 ## How deferred / skipped 🔒 items affect the parity CI
 
+**Status: implemented (2026-07-12).** pico-node now carries `parity-manifest.toml` (opted-in / declared-out sets + capabilities), a golden-vector runner (`crates/ax25-node-core/tests/golden_vectors.rs`, auto-run by the existing self-hosted `cargo test`), and a drift-guard (`scripts/parity-check.mjs` + a vendored C# inventory snapshot + `parity-exceptions.json` + `.github/workflows/parity.yml`). The 3-way mirror into packet.net `interop.yml` + ax25-ts is in review (PRs above). The mechanism below is what all of that enforces.
+
 Short version: **deferring a 🔒 feature costs nothing in parity CI, provided the omission is *declared*.** The CI enforces *"what you implement is byte-correct, and what you skip is intentional"* — not *"you implement everything."* **Silence is the only failure mode.** Two complementary mechanisms:
 
-1. **Shared golden vectors → per-stack capability manifest (opt-in).** Each stack declares which vector-sets it participates in (`ax25-mod8`, `kiss`, `axudp`, `netrom-read`, `netrom-l4`, `ax25-mod128`, `sdm-telegram`, …). The CI runs **only the declared sets** against that stack. A deferred 🔒 item = a set pico-node doesn't opt into = **no test, no failure**. A failure fires only when a stack opts *in* and produces different bytes — i.e. a real drift/bug.
+1. **Shared golden vectors → per-stack capability manifest (opt-in).** Each stack declares which vector-sets it participates in (`ax25_mod8`, `ax25_mod128`, `kiss`, `axudp`, `netrom_quality`, `netrom_nodes`, `netrom_l4`, `srej`, `xid`, `sdm_telegram`, …). The CI runs **only the declared sets** against that stack. A deferred 🔒 item = a set pico-node doesn't opt into = **no test, no failure**. A failure fires only when a stack opts *in* and produces different bytes — i.e. a real drift/bug.
 
-2. **Inventory comparison (the ax25-ts `parity-check.mjs` model) → documented exceptions.** It compares named-flag/quirk inventories and fails on **undocumented** gaps. A deliberate omission is a **reviewed exception** (ax25-ts uses `scripts/parity-exceptions.json`) — recorded with a reason, CI green. An *undocumented* gap fails — which is the whole point: it catches *silent* drift, not intentional scope.
+2. **Inventory comparison (the ax25-ts `parity-check.mjs` model) → documented exceptions.** It compares named-flag/quirk inventories and fails on **undocumented** gaps. A deliberate omission is a **reviewed exception** (`parity-exceptions.json`) — recorded with a reason, CI green. An *undocumented* gap fails — which is the whole point: it catches *silent* drift, not intentional scope.
 
 Two caveats that keep a "skipped" 🔒 item honest:
 
-- **Negotiation boundary — skipping a feature ≠ skipping the obligation to say so correctly.** mod-128 (via XID), v2.2 CONNECT (via SABME), capabilities (via XID) all *negotiate*. If pico-node doesn't do mod-128 it must still **advertise mod-8 only and negotiate a mod-128 peer *down* correctly**; if it doesn't do SREJ it must **not claim it in XID**. So a skipped feature leaves a small, real parity surface — the *degradation* behaviour — which pico-node **does** implement and **does** opt into. The manifest is therefore finer-grained than feature-on/off: e.g. `"ax25: mod8 + negotiate-down-from-mod128"` is a distinct, testable capability. Golden-vector sets should include those degradation vectors.
+- **Negotiation boundary — skipping a feature ≠ skipping the obligation to say so correctly.** mod-128 (via XID), v2.2 CONNECT (via SABME), capabilities (via XID) all *negotiate*. If pico-node doesn't do mod-128 it must still **advertise mod-8 only and negotiate a mod-128 peer *down* correctly**; if it doesn't do SREJ it must **not claim it in XID**. So a skipped feature leaves a small, real parity surface — the *degradation* behaviour — which pico-node **does** implement and **does** opt into. The manifest is therefore finer-grained than feature-on/off: e.g. `ax25_mod128` carries a `negotiate-down-from-mod128` capability. Golden-vector sets should include those degradation vectors.
 - **Interop obligation is separate from parity.** Even a fully-declared skip must still *interop* — a BPQ/XRouter peer that offers mod-128 or SREJ must get a clean, spec-legal refusal/fallback, not a hang. That's covered by the shared AXUDP interop harness (LinBPQ/XRouter/direwolf), which pico-node runs once hardware is up, independently of the vector CI.
 
-**Implication for wiring pico-node in:** the shared-vector job should be built around a **capability manifest + documented exceptions from day one** (the same discipline ax25-ts already uses). That's exactly what lets pico-node be a deliberate, evolving *subset* of the reference without false failures. It's worth wiring in as soon as pico-node shares *any* 🔒 codec — and it already shares AX.25 (mod-8), KISS, AXUDP, and read-only NET/ROM. The manifest then grows with each pick in tables A/B/C/D/F; you never have to implement a 🔒 item just to keep CI green.
+**Where this landed:** the capability manifest + documented exceptions are live as of the 2026-07-12 wave, and pico-node already shares AX.25 (mod-8 + mod-128), KISS, AXUDP, NET/ROM (quality/NODES/L4), SREJ, and XID vector sets. The manifest grows with each pick in tables A/B/C/D/E; you never have to implement a 🔒 item just to keep CI green.
 
 ---
 
-*Living document. Recommendations are a starting point; the **decision** columns get filled as choices are made (some picked now, some deferred). Grounded 2026-07-09 from the packet.net side against pico-node's `PLAN.md`, the ax25-ts commit history, and packet.net's parity discipline.*
+*Living document. The **decision** columns are the calls made; a ✅ marks what shipped in the 2026-07-12 Fable wave (pico-node PRs #53–#60, cross-repo mirror #605/#73). Last updated 2026-07-12 against the fresh recon, the merged wave, and packet.net's parity discipline.*
