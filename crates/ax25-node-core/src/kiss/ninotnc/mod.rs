@@ -15,6 +15,11 @@
 //! - [`txtest`] — the synthetic host-side TX-Test *diagnostic* parser
 //!   (`NinoTncTxTestFrame`).
 //! - [`airtest`] — the over-air TX-Test UI-frame recognizer (`NinoTncAirTestFrame`).
+//! - [`cqbeep`] — the CQBEEP arming / beep-request *builders* (`NinoTncCqBeep`) — the
+//!   outbound counterpart to [`airtest`]'s recognizer.
+//! - [`status`] — the periodic numeric diagnostic-register report parser
+//!   (`NinoTncStatusFrame`).
+//! - [`rssi`] — the GETRSSI RX-audio-level reply parser (`NinoTncRssiReading`).
 //! - [`firmware`] — the firmware version + dsPIC chip variant value types.
 //! - [`classify`] — the NinoTNC-aware classifier overlay (`NinoTncFrameClassifier`).
 //!
@@ -36,23 +41,30 @@
 //! - **Firmware OTA** (`Firmware/GitHub*Catalogue`, `*Flasher`): GitHub release
 //!   discovery + ICSP flashing — host tooling, no place on the node. Omitted; only
 //!   the firmware *version* + *chip variant* value types are ported ([`firmware`]).
-//! - **The async modem driver** (`NinoTncSerialPort`: the read pump, the ACKMODE
-//!   correlation `Channel`/`Task`, the event handlers): the *protocol* it speaks is
-//!   ported (KISS codec + [`crate::kiss::ackmode`] + [`sethw`] + [`classify`]); its
-//!   async I/O glue maps onto the firmware's embassy UART transport rather than C#
-//!   `System.IO.Ports` + `System.Threading.Channels`.
+//! - **The async modem driver** (`NinoTncSerialPort`: the read pump, the event
+//!   handlers): the *protocol* it speaks is ported (KISS codec +
+//!   [`crate::kiss::ackmode`] — including the portable ACKMODE TX-completion
+//!   correlator [`crate::kiss::ackmode::AckCorrelator`] — plus [`sethw`], [`status`],
+//!   [`rssi`], [`cqbeep`], and [`classify`]); only its async I/O glue maps onto the
+//!   firmware's embassy UART transport rather than C# `System.IO.Ports` +
+//!   `System.Threading.Channels`.
 
 pub mod airtest;
 pub mod catalog;
 pub mod classify;
+pub mod cqbeep;
 pub mod firmware;
+pub mod rssi;
 pub mod sethw;
+pub mod status;
 pub mod txtest;
 
 pub use airtest::NinoTncAirTestFrame;
 pub use catalog::NinoTncMode;
 pub use classify::{classify, NinoTncInboundEvent};
 pub use firmware::{ChipVariant, FirmwareVersion};
+pub use rssi::NinoTncRssiReading;
+pub use status::NinoTncStatusFrame;
 pub use txtest::NinoTncTxTestFrame;
 
 /// The NinoTNC's documented KISS baud rate (8N1). Matches the C#
