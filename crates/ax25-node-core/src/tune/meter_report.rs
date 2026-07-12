@@ -152,10 +152,11 @@ impl MeterReport {
                 clip = parse_long_opt(text);
             } else if let Some(text) = try_field(part, "rssi:", "r") {
                 rssi = parse_db_tenths_opt(text);
-            } else if let Some(text) = try_field(part, "lvl:", "l") {
-                level = parse_db_tenths_opt(text);
             } else {
-                return None; // unknown field — not an MS args string
+                match try_field(part, "lvl:", "l") {
+                    Some(text) => level = parse_db_tenths_opt(text),
+                    None => return None, // unknown field — not an MS args string
+                }
             }
         }
 
