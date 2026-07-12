@@ -28,6 +28,7 @@
 //! noted embedded follow-up — the parsing math is identical.
 
 use super::address::{Address, ADDRESS_LEN};
+use super::parse_options::Ax25ParseOptions;
 use alloc::vec::Vec;
 
 /// Control byte for a UI frame, P bit clear.
@@ -55,6 +56,18 @@ pub enum ParseError {
     MissingControl,
     /// An address slot's bytes were not a valid encoded callsign.
     BadAddress,
+    /// An address slot had an empty callsign base and
+    /// [`Ax25ParseOptions::allow_empty_callsign_base`] was not set (strict §3.12).
+    EmptyCallsignBase,
+    /// Trailing bytes appeared on a frame §3.5 doesn't permit an info field on
+    /// (an S frame, or a non-FRMR/XID/TEST U frame) and
+    /// [`Ax25ParseOptions::allow_info_on_supervisory_frames`] was not set.
+    InfoNotPermitted,
+    /// A command-only unnumbered frame (SABM / SABME / DISC) carried address C-bits
+    /// that don't mark it a command, and
+    /// [`Ax25ParseOptions::allow_command_frame_as_response`] was not set
+    /// (strict §4.3.3.1 / §6.1.2).
+    CommandFrameAsResponse,
 }
 
 /// A decoded AX.25 frame (modulo-8 view of the control field).
@@ -151,29 +164,57 @@ impl Frame {
     }
 
     /// Decode a KISS-delivered AX.25 frame (no flags, no FCS), assuming modulo-8
-    /// (a 1-octet control field). Use [`Frame::decode_with_modulo`] to decode a
-    /// frame on a link operating at a known (possibly extended) modulo.
+    /// (a 1-octet control field) and the lenient (accept-everything) parser options.
+    /// Use [`Frame::decode_with_modulo`] for a link at a known (possibly extended)
+    /// modulo, or [`Frame::decode_with_options`] to apply strict-vs-lenient choices.
     pub fn decode(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::decode_inner(bytes, false).map(|(frame, _)| frame)
+        Self::decode_inner(bytes, false, &Ax25ParseOptions::LENIENT).map(|(frame, _)| frame)
     }
 
-    /// Decode a KISS-delivered frame for a link at a known modulo. When `extended`,
-    /// an I or S frame carries a 2-octet control field (Fig 4.1b); the second octet
-    /// is consumed and returned alongside the frame. U frames are 1 octet in both
-    /// modes, so the second octet is `None` for them and for every modulo-8 frame.
-    /// The width is *not* derivable from the octets alone — the receive path, which
-    /// knows the session's negotiated modulo, supplies `extended`. Mirrors
-    /// `Ax25Frame.TryParse(..., bool extended, ...)` (Ax25Frame.cs:358-438).
+    /// Decode a modulo-8 frame applying the supplied [`Ax25ParseOptions`] for
+    /// strict-vs-lenient parser choices. Mirrors
+    /// `Ax25Frame.TryParse(bytes, options, out)` (Ax25Frame.cs:346).
+    pub fn decode_with_options(
+        bytes: &[u8],
+        options: &Ax25ParseOptions,
+    ) -> Result<Self, ParseError> {
+        Self::decode_inner(bytes, false, options).map(|(frame, _)| frame)
+    }
+
+    /// Decode a KISS-delivered frame for a link at a known modulo, lenient options.
+    /// When `extended`, an I or S frame carries a 2-octet control field (Fig 4.1b);
+    /// the second octet is consumed and returned alongside the frame. U frames are 1
+    /// octet in both modes, so the second octet is `None` for them and for every
+    /// modulo-8 frame. The width is *not* derivable from the octets alone — the
+    /// receive path, which knows the session's negotiated modulo, supplies
+    /// `extended`. Mirrors `Ax25Frame.TryParse(..., bool extended, ...)`
+    /// (Ax25Frame.cs:358-438).
     pub fn decode_with_modulo(
         bytes: &[u8],
         extended: bool,
     ) -> Result<(Self, Option<u8>), ParseError> {
-        Self::decode_inner(bytes, extended)
+        Self::decode_inner(bytes, extended, &Ax25ParseOptions::LENIENT)
+    }
+
+    /// Decode a frame at a known modulo, applying the supplied [`Ax25ParseOptions`].
+    /// The full-control equivalent of `Ax25Frame.TryParse(bytes, options, extended,
+    /// out)` (Ax25Frame.cs:358).
+    pub fn decode_with_modulo_options(
+        bytes: &[u8],
+        extended: bool,
+        options: &Ax25ParseOptions,
+    ) -> Result<(Self, Option<u8>), ParseError> {
+        Self::decode_inner(bytes, extended, options)
     }
 
     /// Shared decode body. Returns the decoded frame plus the extended control
-    /// octet (`Some` only for an extended I/S frame).
-    fn decode_inner(bytes: &[u8], extended: bool) -> Result<(Self, Option<u8>), ParseError> {
+    /// octet (`Some` only for an extended I/S frame). `options` gates the pragmatic
+    /// accommodations (empty callsign base, info on S/U frames, command-as-response).
+    fn decode_inner(
+        bytes: &[u8],
+        extended: bool,
+        options: &Ax25ParseOptions,
+    ) -> Result<(Self, Option<u8>), ParseError> {
         // Two mandatory address slots.
         if bytes.len() < ADDRESS_LEN * 2 {
             return Err(ParseError::TooShort);
@@ -181,6 +222,15 @@ impl Frame {
         let destination = Address::decode(&bytes[0..ADDRESS_LEN]).ok_or(ParseError::BadAddress)?;
         let source =
             Address::decode(&bytes[ADDRESS_LEN..ADDRESS_LEN * 2]).ok_or(ParseError::BadAddress)?;
+
+        // Empty callsign base (all-space slot) is a pragmatic accommodation — under
+        // strict §3.12 a callsign has ≥ 1 alphanumeric. Mirrors the C# `AllowEmptyCallsignBase`
+        // gate in `Ax25Address.Read`, applied to every slot.
+        if !options.allow_empty_callsign_base
+            && (destination.callsign.base().is_empty() || source.callsign.base().is_empty())
+        {
+            return Err(ParseError::EmptyCallsignBase);
+        }
 
         // The destination must NOT be the last address (its extension bit must be
         // clear — a source always follows). Matches the C# decode's guard.
@@ -204,6 +254,9 @@ impl Frame {
             }
             let digi = Address::decode(&bytes[offset..offset + ADDRESS_LEN])
                 .ok_or(ParseError::BadAddress)?;
+            if !options.allow_empty_callsign_base && digi.callsign.base().is_empty() {
+                return Err(ParseError::EmptyCallsignBase);
+            }
             last_ext = digi.extension;
             digipeaters.push(digi);
             offset += ADDRESS_LEN;
@@ -233,13 +286,43 @@ impl Frame {
         // PID present on I and UI frames. I = bit0 clear; UI = (ctrl & 0xEF)==0x03.
         let is_i = (control & 0x01) == 0;
         let is_ui = (control & 0xEF) == CONTROL_UI;
-        let (pid, info_start) = if (is_i || is_ui) && bytes.len() > offset {
-            (Some(bytes[offset]), offset + 1)
+        let (pid, info) = if is_i || is_ui {
+            if bytes.len() > offset {
+                (Some(bytes[offset]), bytes[offset + 1..].to_vec())
+            } else {
+                // Lenient: an I/UI frame with no room for a PID octet keeps the
+                // crate's historical acceptance (pid absent, empty info). This is
+                // looser than C# strict (which requires a PID here), but it is not
+                // one of the named flags, so it stays unchanged.
+                (None, Vec::new())
+            }
+        } else if offset < bytes.len() {
+            // A non-I/non-UI frame with trailing bytes. §3.5 permits an info field
+            // only on FRMR/XID/TEST among these; S frames and SABM/SABME/DISC/UA/DM
+            // don't carry one. Gated by `AllowInfoOnSupervisoryFrames`. Mirrors
+            // Ax25Frame.cs:455-471.
+            let u_base = control & 0xEF;
+            let info_bearing = matches!(u_base, 0x87 | 0xAF | 0xE3); // FRMR / XID / TEST
+            if !info_bearing && !options.allow_info_on_supervisory_frames {
+                return Err(ParseError::InfoNotPermitted);
+            }
+            (None, bytes[offset..].to_vec())
         } else {
-            (None, offset)
+            (None, Vec::new())
         };
 
-        let info = bytes[info_start..].to_vec();
+        // §4.3.3.1 / §6.1.2: SABM, SABME and DISC are ALWAYS commands. Under strict,
+        // a frame carrying one of those control octets whose address C-bits don't
+        // mark it a command is malformed — so a bogus-direction SABM can't open a
+        // session. Gated by `AllowCommandFrameAsResponse`. Mirrors Ax25Frame.cs:478-487.
+        if !options.allow_command_frame_as_response && is_u_frame {
+            let cmd_base = control & 0xEF;
+            let is_command_only = matches!(cmd_base, 0x2F | 0x6F | 0x43); // SABM / SABME / DISC
+            let is_command_frame = destination.crh && !source.crh;
+            if is_command_only && !is_command_frame {
+                return Err(ParseError::CommandFrameAsResponse);
+            }
+        }
 
         // Normalise the per-slot HDLC extension bit out of the logical frame: it
         // is a wire-positional artifact (1 only on the last address octet) fully
@@ -634,5 +717,89 @@ mod tests {
         let (g, ext) = Frame::decode_with_modulo(&wire, true).unwrap();
         assert!(ext.is_none(), "U frame carries no extended control octet");
         assert_eq!(g, f);
+    }
+
+    // ─── Ax25ParseOptions: strict-rejects / lenient-accepts pairs ───────────
+
+    #[test]
+    fn strict_rejects_info_on_supervisory_frame_lenient_accepts() {
+        // An RR (S) frame with trailing bytes — §3.5 forbids an info field here.
+        let f = Frame {
+            destination: addr("M0LTE", false),
+            source: addr("G7XYZ", true),
+            digipeaters: Vec::new(),
+            control: 0x01, // RR, N(R)=0
+            pid: None,
+            info: b"trailing".to_vec(),
+        };
+        let wire = f.encode();
+
+        assert_eq!(
+            Frame::decode_with_options(&wire, &Ax25ParseOptions::STRICT),
+            Err(ParseError::InfoNotPermitted)
+        );
+        let g = Frame::decode_with_options(&wire, &Ax25ParseOptions::LENIENT)
+            .expect("lenient accepts trailing bytes on an S frame");
+        assert_eq!(g.info, b"trailing");
+        // The parameterless default entry point is lenient (historical behaviour).
+        assert!(Frame::decode(&wire).is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_command_frame_as_response_lenient_accepts() {
+        // A SABM (always a command) sent with response C-bits (dest C=0, src C=1).
+        let f = Frame {
+            destination: addr("M0LTE", false),
+            source: addr("G7XYZ", true),
+            digipeaters: Vec::new(),
+            control: 0x2F, // SABM, P clear
+            pid: None,
+            info: Vec::new(),
+        };
+        let wire = f.encode();
+
+        assert_eq!(
+            Frame::decode_with_options(&wire, &Ax25ParseOptions::STRICT),
+            Err(ParseError::CommandFrameAsResponse)
+        );
+        assert!(Frame::decode_with_options(&wire, &Ax25ParseOptions::LENIENT).is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_empty_callsign_base_lenient_accepts() {
+        // A UI frame whose destination slot has an all-space (empty) callsign base.
+        let empty = Callsign::new(b"", 0).unwrap();
+        let f = Frame {
+            destination: Address {
+                callsign: empty,
+                crh: true,
+                extension: false,
+            },
+            source: addr("G7XYZ", false),
+            digipeaters: Vec::new(),
+            control: CONTROL_UI,
+            pid: Some(PID_NO_LAYER3),
+            info: b"x".to_vec(),
+        };
+        let wire = f.encode();
+
+        assert_eq!(
+            Frame::decode_with_options(&wire, &Ax25ParseOptions::STRICT),
+            Err(ParseError::EmptyCallsignBase)
+        );
+        let g = Frame::decode_with_options(&wire, &Ax25ParseOptions::LENIENT)
+            .expect("lenient accepts an empty callsign base");
+        assert!(g.destination.callsign.base().is_empty());
+    }
+
+    #[test]
+    fn parse_option_presets_and_default_match_csharp() {
+        // Default is lenient; presets mirror C# (Bpq=Lenient, Xrouter=Strict,
+        // Direwolf=Lenient).
+        assert_eq!(Ax25ParseOptions::default(), Ax25ParseOptions::LENIENT);
+        assert_eq!(Ax25ParseOptions::BPQ, Ax25ParseOptions::LENIENT);
+        assert_eq!(Ax25ParseOptions::XROUTER, Ax25ParseOptions::STRICT);
+        assert_eq!(Ax25ParseOptions::DIREWOLF, Ax25ParseOptions::LENIENT);
+        assert!(Ax25ParseOptions::STRICT != Ax25ParseOptions::LENIENT);
     }
 }
