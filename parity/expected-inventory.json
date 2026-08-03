@@ -29,6 +29,7 @@
 
     { "section": "quirkFlags", "name": "SegmentFirstCarriesL3Pid", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode segmentation/reassembly PID placement." },
     { "section": "quirkFlags", "name": "Ax25Spec38SrejSelectiveRetransmit", "coverage": { "set": "srej", "capability": "srej" }, "note": "SREJ selective retransmit." },
+    { "section": "quirkFlags", "name": "SrejCommandIgnored", "coverage": { "set": "srej", "capability": "srej" }, "note": "Ignore the retransmit request in an SREJ sent as a COMMAND (§4.3.2.4 makes SREJ response-only; direwolf and linbpq both refuse), while still processing its N(R) ack. Became a named flag when the corrected figc4.5 (ax25sdl 0.10.1) made the command paths actionable — packet-net/packet.net#674." },
     { "section": "quirkFlags", "name": "Ax25Spec40DiscardOutOfWindowIFrames", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode I-frame window handling." },
     { "section": "quirkFlags", "name": "Ax25Spec41KarnSrtSampling", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "T1/RTT (Karn) timer sampling in connected mode." },
     { "section": "quirkFlags", "name": "Ax25Spec42SrejTargetsGap", "coverage": { "set": "srej", "capability": "srej" }, "note": "SREJ gap-targeting behaviour." },
