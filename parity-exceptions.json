@@ -5,7 +5,8 @@
       "MaxCachedPeers": "Listener resource-management knob (LRU peer-session cache bound); no on-air wire or FSM behaviour to vector. Firmware sizes its own fixed-capacity pool.",
       "ConfigureSession": "C# host-API extension hook (Action<Ax25Session> delegate). A callback surface, not an on-air behaviour; pico-node firmware has no equivalent delegate seam to vector.",
       "CarrierSense": "TX medium-access / CSMA gating (ICarrierSense). A transmit-timing/transport concern, not a codec or FSM behaviour; not represented by any parity vector set.",
-      "RestartT1OnTxComplete": "Re-arms a running T1 from a TNC ACKMODE TX-completion echo — a TNC/node-host transport capability (packet.net kiss.t1FromTxComplete). Same reason ax25-ts excepts it: no vectored on-air behaviour."
+      "RestartT1OnTxComplete": "Re-arms a running T1 from a TNC ACKMODE TX-completion echo — a TNC/node-host transport capability (packet.net kiss.t1FromTxComplete). Same reason ax25-ts excepts it: no vectored on-air behaviour.",
+      "PortName": "Human-readable label for the modem/port a listener is attached to, carried in packet.net's structured debug log lines so an operator running several ports can tell which modem a message came from. A diagnostics/logging label with no on-air wire or FSM behaviour to vector — same reason as the FrameTraced listenerSurface exception, and mirrors the ax25-ts exception. Firmware labels its own defmt output."
     },
     "listenerSurface": {
       "StartAsync": "Host listener lifecycle (start the RX/TX loop). pico-node firmware brings its own I/O loop up; not a vectored on-air behaviour.",
