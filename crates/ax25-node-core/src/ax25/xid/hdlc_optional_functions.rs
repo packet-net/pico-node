@@ -151,7 +151,7 @@ impl HdlcOptionalFunctions {
         let mod128 = (field & (1 << BIT_MODULO128)) != 0;
         let mod8 = (field & (1 << BIT_MODULO8)) != 0;
         // Default modulo 128 if neither; mod-8 only if it alone is asserted.
-        let is_mod128 = !(mod8 && !mod128);
+        let is_mod128 = !mod8 || mod128;
 
         Self {
             reject,
