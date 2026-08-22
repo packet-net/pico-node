@@ -63,7 +63,7 @@ impl ClassesOfProcedures {
         let half = (field & (1 << BIT_HALF_DUPLEX)) != 0;
         // Half-duplex unless only full-duplex is asserted.
         Self {
-            half_duplex: !(full && !half),
+            half_duplex: !full || half,
         }
     }
 }
