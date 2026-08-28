@@ -49,6 +49,14 @@ impl LineAssembler {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
         let mut lines = Vec::new();
         for &b in chunk {
+            // Telnet sends NUL both as NOP and as the second byte of "CR alone"
+            // (CR-NUL, RFC 854); it is never line content, so drop it. Without
+            // this, a CR-NUL "Enter" leaves the NUL behind to prepend to the
+            // next line. Mirrors the C# LineAssembler's leading NUL guard.
+            if b == 0 {
+                continue;
+            }
+
             // Coalesce CR-LF: an LF right after a CR is swallowed.
             if b == b'\n' && self.last_was_cr {
                 self.last_was_cr = false;
@@ -135,6 +143,21 @@ mod tests {
         let lines = a.push(b"\n");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].is_empty());
+    }
+
+    #[test]
+    fn nul_bytes_are_dropped_not_buffered() {
+        // Telnet "CR alone" arrives as CR-NUL (RFC 854): the NUL must not
+        // prepend to the following line, and a NOP NUL mid-line is not content.
+        let mut a = LineAssembler::default();
+        let lines = a.push(b"C M0LTE\r\0/quit\r");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(s(&lines[0]), "C M0LTE");
+        assert_eq!(s(&lines[1]), "/quit");
+
+        let lines = a.push(b"AB\0C\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(s(&lines[0]), "ABC");
     }
 
     #[test]

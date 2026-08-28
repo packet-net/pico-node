@@ -8,27 +8,77 @@
 //! prefix) are dropped, malformed escape sequences drop the offending byte
 //! leniently, and a frame must carry at least the command byte.
 //!
-//! `alloc`-gated because the in-progress frame is a growable `Vec`. A heapless
-//! follow-up (fixed `MAX_FRAME` cap, dropping over-long frames) is noted in the
-//! module roadmap — the decode *logic* is unchanged, only the buffer type.
+//! The in-progress buffer is bounded by [`DEFAULT_MAX_FRAME_LEN`] (configurable
+//! via [`Decoder::with_max_frame_len`]). KISS has no length field; a frame ends
+//! at the next FEND, so a peer (or a noise burst, or a mis-set baud rate) that
+//! never sends one would otherwise grow the buffer without limit, and `clear`
+//! keeps the grown capacity, so the memory stayed retained afterwards
+//! (packet-net/packet.net#696). Over the bound the partial frame is dropped, the
+//! buffer capacity released, and bytes are discarded until the next FEND
+//! resynchronises the stream. Mirrors the C# `KissDecoder` bound.
+//!
+//! `alloc`-gated because the in-progress frame is a growable `Vec`.
 
 use super::frame::{Command, Frame, FEND, FESC, TFEND, TFESC};
 use alloc::vec::Vec;
 
+/// Default bound on a single KISS frame's decoded length, in octets. Comfortably
+/// above anything AX.25 produces - a maximum-size frame is 8 digipeaters (56) +
+/// addresses/control/PID (18) + the §6.7.2 maximum N1 of 256, so ~330 - while
+/// still small enough that a frameless stream cannot exhaust memory. Mirrors
+/// `KissDecoder.DefaultMaxFrameLength`.
+pub const DEFAULT_MAX_FRAME_LEN: usize = 4096;
+
+/// Initial (and post-release) capacity of the in-progress frame buffer. Mirrors
+/// `KissDecoder.InitialCapacity`.
+const INITIAL_CAPACITY: usize = 256;
+
 /// A streaming KISS decoder. Construct with [`Decoder::new`], feed [`Decoder::push`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Decoder {
     current: Vec<u8>,
     in_escape: bool,
+    max_frame_len: usize,
+    /// True while discarding a stream we have lost sync with (an oversize frame):
+    /// every byte is dropped until the next FEND starts a fresh frame.
+    resynchronising: bool,
+    oversize_frames_dropped: u64,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Decoder {
-    /// Create an empty decoder.
+    /// Create an empty decoder bounded by [`DEFAULT_MAX_FRAME_LEN`].
     pub fn new() -> Self {
+        Self::with_max_frame_len(DEFAULT_MAX_FRAME_LEN)
+    }
+
+    /// Create an empty decoder with an explicit maximum frame length, in octets
+    /// (0 falls back to the default). Mirrors `KissDecoder(int maxFrameLength)`.
+    pub fn with_max_frame_len(max_frame_len: usize) -> Self {
         Self {
-            current: Vec::with_capacity(256),
+            current: Vec::with_capacity(INITIAL_CAPACITY),
             in_escape: false,
+            max_frame_len: if max_frame_len > 0 {
+                max_frame_len
+            } else {
+                DEFAULT_MAX_FRAME_LEN
+            },
+            resynchronising: false,
+            oversize_frames_dropped: 0,
         }
+    }
+
+    /// How many partial frames have been discarded for exceeding the maximum
+    /// frame length. A non-zero, growing count means the stream is not KISS
+    /// (wrong baud rate, a raw-serial peer, line noise) - worth logging by a
+    /// driver that wants to surface it. Mirrors `KissDecoder.OversizeFramesDropped`.
+    pub fn oversize_frames_dropped(&self) -> u64 {
+        self.oversize_frames_dropped
     }
 
     /// Push a chunk of received bytes. Returns every frame the chunk completed
@@ -36,6 +86,15 @@ impl Decoder {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Frame> {
         let mut frames = Vec::new();
         for &b in bytes {
+            if self.resynchronising {
+                // Nothing between the overrun and the next FEND can be a frame.
+                if b == FEND {
+                    self.resynchronising = false;
+                    self.in_escape = false;
+                }
+                continue;
+            }
+
             if self.in_escape {
                 self.in_escape = false;
                 match b {
@@ -44,6 +103,7 @@ impl Decoder {
                     // Lenient: drop a malformed escape byte and carry on.
                     _ => {}
                 }
+                self.drop_if_oversize();
                 continue;
             }
 
@@ -58,16 +118,43 @@ impl Decoder {
                     // else: empty inter-frame FEND, ignore.
                 }
                 FESC => self.in_escape = true,
-                _ => self.current.push(b),
+                _ => {
+                    self.current.push(b);
+                    self.drop_if_oversize();
+                }
             }
         }
         frames
     }
 
-    /// Discard any partially-decoded frame state.
+    /// Discard any partially-decoded frame state (releasing grown capacity).
     pub fn reset(&mut self) {
         self.current.clear();
+        self.release_buffer();
         self.in_escape = false;
+        self.resynchronising = false;
+    }
+
+    // Over the bound the partial frame is unusable: drop it, hand the memory back,
+    // count it, and skip everything up to the next FEND.
+    fn drop_if_oversize(&mut self) {
+        if self.current.len() <= self.max_frame_len {
+            return;
+        }
+
+        self.oversize_frames_dropped += 1;
+        self.current.clear();
+        self.release_buffer();
+        self.in_escape = false;
+        self.resynchronising = true;
+    }
+
+    // `clear` keeps the grown capacity, so a single oversize burst would retain
+    // its memory for the life of the decoder. Give it back.
+    fn release_buffer(&mut self) {
+        if self.current.capacity() > INITIAL_CAPACITY {
+            self.current.shrink_to(INITIAL_CAPACITY);
+        }
     }
 
     fn finish(&self) -> Option<Frame> {
@@ -150,6 +237,73 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].payload, vec![0x01]);
         assert_eq!(frames[1].payload, vec![0x02]);
+    }
+
+    #[test]
+    fn oversize_partial_is_dropped_and_stream_resyncs_at_the_next_fend() {
+        let mut d = Decoder::with_max_frame_len(4);
+        // Command byte + 4 payload bytes = 5 buffered > 4: dropped mid-stream.
+        // Everything up to the next FEND is discarded (including the 0x99 tail),
+        // then the following frame decodes normally.
+        let frames = d.push(&[
+            FEND, 0x00, 0x01, 0x02, 0x03, 0x04, 0x99, 0x99, FEND, 0x00, 0x42, FEND,
+        ]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x42]);
+        assert_eq!(d.oversize_frames_dropped(), 1);
+    }
+
+    #[test]
+    fn frame_exactly_at_the_bound_is_kept() {
+        let mut d = Decoder::with_max_frame_len(4);
+        // Command byte + 3 payload bytes = 4 buffered = the bound: accepted.
+        let frames = d.push(&[FEND, 0x00, 0x01, 0x02, 0x03, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x01, 0x02, 0x03]);
+        assert_eq!(d.oversize_frames_dropped(), 0);
+    }
+
+    #[test]
+    fn oversize_drop_counts_an_escaped_byte_too() {
+        // The bound applies to the decoded length, so an escaped byte that lands
+        // the buffer over the cap triggers the same drop + resync.
+        let mut d = Decoder::with_max_frame_len(2);
+        let frames = d.push(&[FEND, 0x00, 0x01, FESC, TFEND, 0x77, FEND, 0x00, 0x55, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x55]);
+        assert_eq!(d.oversize_frames_dropped(), 1);
+    }
+
+    #[test]
+    fn frameless_byte_stream_is_bounded_and_capacity_released() {
+        // A stream with no FEND at all (the packet.net#696 shape): the default
+        // decoder must drop oversize partials rather than grow without limit,
+        // and hand the grown capacity back.
+        let mut d = Decoder::new();
+        let noise = vec![0x55u8; DEFAULT_MAX_FRAME_LEN * 2 + 10];
+        assert!(d.push(&noise).is_empty());
+        assert!(d.oversize_frames_dropped() >= 1);
+        assert!(
+            d.current.capacity() < DEFAULT_MAX_FRAME_LEN,
+            "grown buffer capacity must be released after an oversize drop"
+        );
+        // Resync + a clean frame still decodes.
+        let frames = d.push(&[FEND, 0x00, 0x42, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x42]);
+    }
+
+    #[test]
+    fn reset_clears_resync_state_and_releases_capacity() {
+        let mut d = Decoder::with_max_frame_len(4);
+        assert!(d.push(&[FEND, 0x00, 1, 2, 3, 4, 5]).is_empty()); // now resynchronising
+        d.reset();
+        // After reset the decoder accepts a frame without needing the resync FEND
+        // first (the leading FEND here is the normal frame opener).
+        let frames = d.push(&[FEND, 0x00, 0x42, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x42]);
+        assert!(d.current.capacity() <= INITIAL_CAPACITY);
     }
 
     #[test]
