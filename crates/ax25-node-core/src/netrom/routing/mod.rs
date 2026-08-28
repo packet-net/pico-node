@@ -216,6 +216,42 @@ mod tests {
     }
 
     #[test]
+    fn an_advertisement_of_us_via_a_third_node_is_not_learned_or_re_advertised() {
+        let mut t = Table::with_defaults();
+        let nbr_a = call("GB7RDG");
+        let nbr_b = call("GB7XYZ");
+        let me = call("M0LTE");
+        let sot = call("GB7SOT");
+        // RDG advertises US (M0LTE) as a destination reachable via XYZ, a third
+        // node, so the best-neighbour loop guard (which only catches "via us") does
+        // not fire. We must still never learn a route to ourselves, or our own
+        // callsign ends up in our own NODES broadcast (LinBPQ L3Code.c:456 skips
+        // destination == MYCALL).
+        t.ingest(
+            nbr_a,
+            me,
+            port(),
+            &broadcast(
+                "RDGBPQ",
+                &[(me, "MYNODE", nbr_b, 200), (sot, "SOT", nbr_b, 200)],
+            ),
+            0,
+        );
+
+        assert!(
+            find_dest(&t, &me).is_none(),
+            "a route to ourselves is never learned"
+        );
+        let adv = t.build_advertisement(Some(0));
+        assert!(
+            adv.iter().all(|e| e.destination != me),
+            "and so never re-advertised"
+        );
+        // The rest of the broadcast is unaffected.
+        assert!(adv.iter().any(|e| e.destination == sot));
+    }
+
+    #[test]
     fn keeps_only_the_three_best_routes_per_destination() {
         let mut t = Table::with_defaults();
         let me = call("M0LTE");
@@ -427,13 +463,23 @@ mod tests {
         let sot = call("GB7SOT");
         // RDG advertises SOT via itself; the assumed-direct route to RDG is via RDG
         // too. Both routes forward through RDG.
-        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]), 0);
+        t.ingest(
+            nbr_a,
+            me,
+            port(),
+            &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]),
+            0,
+        );
         assert!(find_dest(&t, &sot).is_some());
 
         let dropped = t.mark_neighbour_down(&nbr_a);
 
         assert!(dropped > 0, "the routes via the down neighbour are removed");
-        assert_eq!(dests(&t).len(), 0, "every route forwarded through the down neighbour");
+        assert_eq!(
+            dests(&t).len(),
+            0,
+            "every route forwarded through the down neighbour"
+        );
         assert!(
             !neighbours(&t).iter().any(|n| n.neighbour == nbr_a),
             "the down neighbour is removed too"
@@ -448,9 +494,24 @@ mod tests {
         let nbr_b = call("GB7XYZ");
         let sot = call("GB7SOT");
         // SOT reachable via two neighbours; nbr_a is higher quality (best).
-        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 250)]), 0);
-        t.ingest(nbr_b, me, port(), &broadcast("XYZ", &[(sot, "SOT", nbr_b, 150)]), 0);
-        assert_eq!(find_dest(&t, &sot).unwrap().best_route.unwrap().neighbour, nbr_a);
+        t.ingest(
+            nbr_a,
+            me,
+            port(),
+            &broadcast("RDG", &[(sot, "SOT", nbr_a, 250)]),
+            0,
+        );
+        t.ingest(
+            nbr_b,
+            me,
+            port(),
+            &broadcast("XYZ", &[(sot, "SOT", nbr_b, 150)]),
+            0,
+        );
+        assert_eq!(
+            find_dest(&t, &sot).unwrap().best_route.unwrap().neighbour,
+            nbr_a
+        );
 
         t.mark_neighbour_down(&nbr_a);
 
@@ -459,7 +520,11 @@ mod tests {
             !routes_of(&t, &sot).iter().any(|r| r.neighbour == nbr_a),
             "the down neighbour's route is gone"
         );
-        assert_eq!(after.best_route.unwrap().neighbour, nbr_b, "failed over to the surviving route");
+        assert_eq!(
+            after.best_route.unwrap().neighbour,
+            nbr_b,
+            "failed over to the surviving route"
+        );
     }
 
     #[test]
@@ -469,10 +534,19 @@ mod tests {
         let nbr_a = call("GB7RDG");
         let nbr_b = call("GB7XYZ");
         let sot = call("GB7SOT");
-        t.ingest(nbr_a, me, port(), &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]), 0);
+        t.ingest(
+            nbr_a,
+            me,
+            port(),
+            &broadcast("RDG", &[(sot, "SOT", nbr_a, 200)]),
+            0,
+        );
 
         assert_eq!(t.mark_neighbour_down(&nbr_b), 0);
-        assert!(find_dest(&t, &sot).is_some(), "an unrelated neighbour's routes are untouched");
+        assert!(
+            find_dest(&t, &sot).is_some(),
+            "an unrelated neighbour's routes are untouched"
+        );
     }
 
     // ─── Quality floor (MINQUAL) ───

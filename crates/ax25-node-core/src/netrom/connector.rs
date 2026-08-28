@@ -245,7 +245,12 @@ impl NetRomConnector {
         // Ensure the interlink to the best neighbour before originating.
         self.ensure_interlink(best.neighbour);
 
-        let key = self.manager.open_circuit(destination.destination);
+        // The circuit table is bounded (CircuitManager::MAX_LIVE_CIRCUITS); at the
+        // cap, surface the same no-route signal so the host falls back to a direct
+        // AX.25 dial rather than panicking or silently doing nothing.
+        let Some(key) = self.manager.open_circuit(destination.destination) else {
+            return Err(NetRomNoRoute::new(target));
+        };
         self.manager
             .circuit_mut(key)
             .expect("just opened")
@@ -299,6 +304,12 @@ impl NetRomConnector {
         info: &[u8],
         now_ms: u64,
     ) {
+        // Disabled means no NET/ROM service at all (the C# host never constructs
+        // its circuit manager then): an inbound datagram must neither terminate a
+        // circuit here nor be forwarded, exactly as connect() refuses above.
+        if !self.enabled {
+            return;
+        }
         self.ensure_interlink(from);
         if let Some(packet) = NetRomPacket::decode(info) {
             // L3 dispatch (mirrors the C# `NetRomService.OnInterlinkData`): a datagram
@@ -823,6 +834,46 @@ mod tests {
         let result = connector.connect(&table, "ENDND", a_node(), NOW);
         assert!(matches!(result, Err(ref e) if e.target() == "ENDND"));
         assert_eq!(connector.interlink_neighbours().len(), 0);
+    }
+
+    #[test]
+    fn a_disabled_connector_ignores_inbound_interlink_data() {
+        // Disabled means no NET/ROM service at all (the C# host never constructs
+        // its circuit manager then). Without the gate a disabled node still
+        // minted, auto-accepted, acked, and could tear down circuits over the
+        // interlink; it must stay inert. A (enabled) dials toward B (disabled).
+        let table_a = seeded_table_a();
+        let table_b: Table = NetRomRoutingTable::new(NetRomRoutingOptions::default());
+        let mut a = NetRomConnector::new(
+            a_node(),
+            NetRomConnectorOptions {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let mut b = NetRomConnector::new(
+            b_node(),
+            NetRomConnectorOptions {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let _conn = a
+            .connect(&table_a, "ENDND", a_node(), NOW)
+            .expect("route to END");
+        for send in a.take_interlink_sends() {
+            b.on_interlink_data(&table_b, a_node(), &send.datagram, NOW);
+        }
+
+        assert_eq!(b.circuit_count(), 0, "no inbound circuit minted");
+        assert!(b.take_incoming_connections().is_empty());
+        assert!(b.take_interlink_sends().is_empty(), "no reply of any kind");
+        assert_eq!(
+            b.interlink_neighbours().len(),
+            0,
+            "the session is not recorded as an interlink"
+        );
     }
 
     #[test]
