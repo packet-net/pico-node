@@ -152,7 +152,10 @@ pub fn save(
         return Ok(SaveOutcome::Unchanged); // no erase/write — the wear win
     }
 
-    let mut record = [0xFFu8; HEADER_LEN + MAX_BODY + 2];
+    // Sized up to the write granularity so a padded write can never index
+    // past the buffer, whatever MAX_BODY grows to.
+    const RECORD_CAPACITY: usize = (HEADER_LEN + MAX_BODY + 2 + 255) / 256 * 256;
+    let mut record = [0xFFu8; RECORD_CAPACITY];
     record[0..4].copy_from_slice(MAGIC);
     record[4] = VERSION;
     let generation = generation + 1;

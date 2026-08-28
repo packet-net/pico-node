@@ -51,7 +51,10 @@ const OTA_PORT: u16 = 80;
 
 /// DFU partition capacity (must match memory.x DFU LENGTH). Uploads larger than
 /// this are rejected up front.
-const DFU_CAPACITY: usize = 516 * 1024;
+// The largest image that can actually BOOT is the ACTIVE partition (512 KiB);
+// DFU is one scratch page larger, but an image in that extra page would pass an
+// upload guard yet fail the swap, so bound uploads at ACTIVE.
+const DFU_CAPACITY: usize = 512 * 1024;
 
 type SharedFlash = BlockingMutex<NoopRawMutex, RefCell<ConfigFlash>>;
 

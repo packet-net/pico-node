@@ -212,7 +212,10 @@ pub async fn dns_catch_all(stack: Stack<'static>) {
             i += buf[i] as usize + 1;
         }
         let qend = i + 5; // null label + qtype(2) + qclass(2)
-        if qend > n || qend > out.len() {
+        // The answer appended below is 16 bytes past qend; bound the WHOLE
+        // write, not just the echoed question, or a query whose question ends
+        // within 16 bytes of the buffer end indexes past `out` and panics.
+        if qend > n || qend + 16 > out.len() {
             continue;
         }
         out[..qend].copy_from_slice(&buf[..qend]);
