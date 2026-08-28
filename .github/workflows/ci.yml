@@ -44,12 +44,13 @@ jobs:
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          # Pinned to a reproducible ax25sdl commit — the latest SDL source. A
-          # release tag can't be used: the no_std Rust backend landed post-v0.10.0
-          # (ADR-0003), so the tags carry the old pre-no_std crate. To advance the
-          # SDL, bump this SHA (both jobs) + the parity-manifest.toml [sdl] block.
+          # Pinned to a reproducible ax25sdl commit, the latest SDL source: one
+          # tooling-only commit past v0.10.2/crate-v0.8.0 (spec/rust is identical),
+          # which carries the corrected figc4.5 tables that C# NuGet 0.10.2 runs.
+          # To advance the SDL, bump this SHA (both jobs) + the
+          # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 14ad468a80635a6a574962fc60eed469e6cc975c
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 4212c1e1b9bc27f5520e820c995c10204838cee8
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ clippy)
@@ -95,18 +96,20 @@ jobs:
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          # Pinned to a reproducible ax25sdl commit — the latest SDL source. A
-          # release tag can't be used: the no_std Rust backend landed post-v0.10.0
-          # (ADR-0003), so the tags carry the old pre-no_std crate. To advance the
-          # SDL, bump this SHA (both jobs) + the parity-manifest.toml [sdl] block.
+          # Pinned to a reproducible ax25sdl commit, the latest SDL source: one
+          # tooling-only commit past v0.10.2/crate-v0.8.0 (spec/rust is identical),
+          # which carries the corrected figc4.5 tables that C# NuGet 0.10.2 runs.
+          # To advance the SDL, bump this SHA (both jobs) + the
+          # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 14ad468a80635a6a574962fc60eed469e6cc975c
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 4212c1e1b9bc27f5520e820c995c10204838cee8
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
-      - name: Install Rust 1.93.1 (+ thumbv6m target)
+      - name: Install Rust 1.93.1 (+ thumbv6m target, clippy)
         uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: thumbv6m-none-eabi
+          components: clippy
 
       # flip-link is the linker the fw .cargo/config.toml names; install once
       # per runner (no-op when already present in the persistent ~/.cargo/bin).
@@ -116,6 +119,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/ax25-node-fw
+
+      # The fw crate is expected clippy-clean (commits have fixed fw clippy
+      # failures before), but only developer discipline enforced it; gate it.
+      - name: Clippy the firmware (release, locked, -D warnings)
+        working-directory: crates/ax25-node-fw
+        run: cargo clippy --release --locked -- -D warnings
 
       - name: Build the firmware binary (release, locked)
         working-directory: crates/ax25-node-fw
@@ -129,6 +138,10 @@ jobs:
       # thumbv6m crate (embassy-boot-rp). Build it here so the A/B layout +
       # linker glue can't bitrot. No ax25sdl sibling needed (it doesn't depend
       # on core). See docs/OTA.md.
+      - name: Clippy the OTA bootloader (release, locked, -D warnings)
+        working-directory: crates/ax25-node-bootloader
+        run: cargo clippy --release --locked -- -D warnings
+
       - name: Build the OTA bootloader (release, locked)
         working-directory: crates/ax25-node-bootloader
         run: cargo build --release --locked

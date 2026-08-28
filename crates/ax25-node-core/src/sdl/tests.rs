@@ -608,7 +608,8 @@ fn negotiated_srej_link_emits_srej_on_out_of_sequence_i_frame() {
     // A negotiated-SREJ link recovers with SREJ (not REJ), targeting the gap V(R)=0.
     let sup = r.supervisory();
     assert!(
-        sup.iter().any(|(k, nr)| *k == SupervisoryKind::Srej && *nr == 0),
+        sup.iter()
+            .any(|(k, nr)| *k == SupervisoryKind::Srej && *nr == 0),
         "negotiated SREJ link must emit an SREJ for the gap: {sup:?}"
     );
     assert!(
@@ -640,6 +641,82 @@ fn go_back_n_link_emits_rej_not_srej_on_out_of_sequence_i_frame() {
         !sup.iter().any(|(k, _)| *k == SupervisoryKind::Srej),
         "SREJ must stay dormant without XID negotiation: {sup:?}"
     );
+}
+
+// ─── Quirk: SREJ command ignored (packet.net#674) ────────────────────────────
+//
+// The corrected figc4.5/figc4.4 tables (ax25sdl v0.10.1+) give every SREJ path a
+// native single-frame selective retransmit - including the off-spec COMMAND form
+// (§4.3.2.4 makes SREJ response-only). The srej_command_ignored quirk (default
+// on, matching direwolf/linbpq) suppresses the retransmit tail for commands
+// while still applying the N(R) acknowledgement.
+
+/// A connected session with three I frames in flight (V(S)=3, nothing acked).
+fn session_with_three_unacked_i_frames(t: &mut MockTimerService) -> (Session, Recorder) {
+    let mut s = connected_session();
+    let mut r = Recorder::default();
+    for n in 0..3u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            t,
+            &mut r,
+        );
+    }
+    assert_eq!(r.i_frames().len(), 3);
+    assert_eq!(s.context.vs, 3);
+    (s, Recorder::default())
+}
+
+#[test]
+fn srej_response_selectively_retransmits_only_the_requested_frame() {
+    let mut t = MockTimerService::new();
+    let (mut s, mut r) = session_with_three_unacked_i_frames(&mut t);
+
+    // Peer asks for frame 1 again (SREJ response, F=0): single-frame retransmit,
+    // straight off the corrected tables - no go-back-N, no quirk involved.
+    s.post_event(Event::SrejReceived(rx_s(1, false, false)), &mut t, &mut r);
+
+    let is = r.i_frames();
+    assert_eq!(is.len(), 1, "exactly the requested frame: {is:?}");
+    assert_eq!(is[0].0, 1, "N(S) = the SREJ's N(R)");
+    assert_eq!(is[0].2, vec![1]);
+}
+
+#[test]
+fn srej_command_is_ignored_but_its_acknowledgement_still_applies() {
+    let mut t = MockTimerService::new();
+    let (mut s, mut r) = session_with_three_unacked_i_frames(&mut t);
+    assert!(s.context.quirks.srej_command_ignored, "default on");
+
+    // The same request arriving as a COMMAND (P=1): off-spec, so the retransmit
+    // tail is suppressed - but the F=1 path's N(R)=1 acknowledgement (frame 0
+    // delivered, VAAssignNR) still lands, and the poll still gets its response.
+    s.post_event(Event::SrejReceived(rx_s(1, true, true)), &mut t, &mut r);
+
+    assert!(
+        r.i_frames().is_empty(),
+        "no retransmission for a command SREJ"
+    );
+    assert_eq!(s.context.va, 1, "the ack it carried was still processed");
+}
+
+#[test]
+fn srej_command_retransmits_with_the_quirk_off() {
+    let mut t = MockTimerService::new();
+    let (mut s, mut r) = session_with_three_unacked_i_frames(&mut t);
+    s.context.quirks.srej_command_ignored = false;
+
+    // Quirk off: the corrected figure runs exactly as drawn - the command form is
+    // actionable and retransmits the requested frame.
+    s.post_event(Event::SrejReceived(rx_s(1, false, true)), &mut t, &mut r);
+
+    let is = r.i_frames();
+    assert_eq!(
+        is.len(),
+        1,
+        "figure as drawn: command SREJ retransmits: {is:?}"
+    );
+    assert_eq!(is[0].0, 1);
 }
 
 // ─── Unhandled events are dropped (SDL semantics) ───────────────────────────
