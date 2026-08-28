@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "ax25-node-fw"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ax25-node-core",
  "cortex-m",
