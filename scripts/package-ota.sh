@@ -16,7 +16,9 @@
 # only ever ships the single pico-node-app.bin.
 #
 # Usage: scripts/package-ota.sh [OUTDIR]   (default OUTDIR=dist)
-# Requires: rustup thumbv6m target, picotool, rust-objcopy, python3.
+# Requires: rustup thumbv6m target, rust-objcopy, python3. picotool is used for
+# the UF2 conversions when present; scripts/bin2uf2.py (verified byte-identical
+# in structure to picotool's output) covers a box without it.
 # Pass OTA_BUILD_TAG=<tag> to stamp /version (defaults to the crate version).
 set -euo pipefail
 
@@ -65,6 +67,15 @@ python3 "$ROOT/scripts/build-blobs.py" \
   "$FW_DIR/43439A0.bin" "$FW_DIR/43439A0_clm.bin" "$FW_DIR/nvram_rp2040.bin" \
   "$OUT/.blobs.bin"
 
+# UF2 conversion: picotool when present, else the in-repo converter.
+uf2() {
+  if command -v picotool >/dev/null 2>&1; then
+    picotool uf2 convert "$1" -t bin -o "$2" "$3"
+  else
+    python3 "$ROOT/scripts/bin2uf2.py" "$1" "$2" "$3"
+  fi
+}
+
 echo "==> firmware.uf2 = contiguous bootloader + 0xFF state-clear + app"
 python3 - "$OUT/.bl.bin" "$OUT/pico-node-app.bin" "$APP_OFFSET" "$OUT/.fw.bin" <<'PY'
 import sys
@@ -77,10 +88,10 @@ img[app_off:app_off + len(app)] = app
 open(sys.argv[4], "wb").write(img)
 print(f"  firmware image: {len(img)} bytes ({len(img)/1024:.0f} KiB)")
 PY
-picotool uf2 convert "$OUT/.fw.bin"    -t bin -o 0x10000000   "$OUT/pico-node-firmware.uf2"
+uf2 "$OUT/.fw.bin"    0x10000000   "$OUT/pico-node-firmware.uf2"
 
 echo "==> blobs.uf2 = contiguous cyw43 firmware"
-picotool uf2 convert "$OUT/.blobs.bin" -t bin -o "$BLOBS_ADDR" "$OUT/pico-node-blobs.uf2"
+uf2 "$OUT/.blobs.bin" "$BLOBS_ADDR" "$OUT/pico-node-blobs.uf2"
 
 rm -f "$OUT/.bl.bin" "$OUT/.fw.bin" "$OUT/.blobs.bin"
 
