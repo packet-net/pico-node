@@ -705,6 +705,22 @@ pub async fn task(
                     let expired = ps.timers.take_expired(now);
                     for id in expired {
                         defmt::debug!("axudp: timer expiry ({=u8})", id as u8);
+                        let Some(event) = session::expiry_event(id) else {
+                            // TM201 (the MDL XID retry timer): not a data-link
+                            // event - the manager drives the peer's MDL machine,
+                            // which retries the XID command or, on give-up, fires
+                            // a probe's deferred SABM.
+                            let (frames, ep) = {
+                                let Some(ps) = peers[i].as_mut() else {
+                                    break;
+                                };
+                                let peer = ps.peer;
+                                let ep = ps.endpoint;
+                                (sessions.tm201_expiry(peer, &mut ps.timers), ep)
+                            };
+                            send_all(&socket, ep, frames).await;
+                            continue;
+                        };
                         drive(
                             &mut sessions,
                             &mut peers,
@@ -719,7 +735,7 @@ pub async fn task(
                                 inp3: inp3.as_mut(),
                             },
                             i,
-                            session::expiry_event(id),
+                            event,
                             &console_id,
                             &prompt,
                         )
@@ -1371,34 +1387,32 @@ async fn ensure_interlinks(
         if heard_lookup(heard, &nbr).is_none() {
             continue; // no endpoint to reach it — wait until we hear it
         }
-        match start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
-            Ok(i) => {
-                let mut name = [0u8; 16];
-                defmt::info!(
-                    "axudp: bringing up interlink to {=str}",
-                    call_str(&nbr, &mut name)
-                );
-                drive(
-                    sessions,
-                    peers,
-                    socket,
-                    heard,
-                    beacon_ep,
-                    my_call,
-                    &mut L4 {
-                        connector,
-                        netrom,
-                        circuits,
-                        inp3: inp3.as_deref_mut(),
-                    },
-                    i,
-                    Event::DlConnectRequest,
-                    console_id,
-                    prompt,
-                )
-                .await;
-            }
-            Err(_) => {} // busy/no-slot — fine, try again next pass
+        // Err from start_outbound (busy/no-slot) is fine; try again next pass.
+        if let Ok(i) = start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
+            let mut name = [0u8; 16];
+            defmt::info!(
+                "axudp: bringing up interlink to {=str}",
+                call_str(&nbr, &mut name)
+            );
+            drive(
+                sessions,
+                peers,
+                socket,
+                heard,
+                beacon_ep,
+                my_call,
+                &mut L4 {
+                    connector,
+                    netrom,
+                    circuits,
+                    inp3: inp3.as_deref_mut(),
+                },
+                i,
+                Event::DlConnectRequest,
+                console_id,
+                prompt,
+            )
+            .await;
         }
     }
 }

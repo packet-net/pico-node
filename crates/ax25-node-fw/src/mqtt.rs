@@ -4,7 +4,7 @@
 //!
 //! A minimal **publish-only MQTT 3.1.1 over TCP** client (same hand-rolled
 //! philosophy as the DHCP/DNS/mDNS servers): CONNECT → CONNACK → PUBLISH (QoS 0)
-//! + periodic PINGREQ, reconnecting with backoff. No subscribe, no QoS 1/2 — a
+//! with periodic PINGREQ, reconnecting with backoff. No subscribe, no QoS 1/2 — a
 //! node shouting telemetry, nothing more. Configured via `MQTT_HOST`
 //! (`host:port`, port defaults to 1883) in flash config / the captive portal.
 //!

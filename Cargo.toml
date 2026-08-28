@@ -39,5 +39,5 @@ exclude = [
 # `edition.workspace = true` etc.
 [workspace.package]
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/m0lte/pico-node"
+license = "AGPL-3.0-or-later"   # matches the root LICENSE and the ax25sdl dependency
+repository = "https://github.com/packet-net/pico-node"

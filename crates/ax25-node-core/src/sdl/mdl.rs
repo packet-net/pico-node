@@ -1,22 +1,27 @@
-//! Management Data-Link (MDL) XID negotiation — ports the substantive logic of
+//! Management Data-Link (MDL) XID negotiation - ports
 //! `Packet.Ax25.Session.XidNegotiator` + `Ax25ManagementDataLink` +
 //! `Ax25Listener.HandleNoCachedSession`'s pre-session XID branch.
 //!
 //! The AX.25 v2.2 MDL (Appendix C5) is the XID parameter-negotiation FSM that
 //! turns SREJ / segmentation / modulo / window / T1 / N2 from forced establishment
-//! defaults into *negotiated* link parameters. pico ports the two pieces that
-//! matter on-air today:
+//! defaults into *negotiated* link parameters. Three pieces:
 //!
+//! - The **[`MdlMachine`]** - the runtime driver for the generated figc5.1/figc5.2
+//!   state pages ([`ax25sdl::MANAGEMENT_DATA_LINK_READY`] /
+//!   [`ax25sdl::MANAGEMENT_DATA_LINK_NEGOTIATING`]), consuming the
+//!   MDL-NEGOTIATE Request poke figc4.6 raises after a v2.2 UA and fronting the
+//!   initiator pre-connect probe. Mirrors `Ax25ManagementDataLink`.
 //! - The **§6.3.2 reverts-to merge** ([`apply_negotiated`]) that turns our offer
 //!   and the peer's XID into agreed link parameters, plus the §1436 version-2.0
 //!   default set ([`apply_version_20_defaults`]) and the offer derivation
-//!   ([`default_offer_for`]). These mirror `XidNegotiator`.
+//!   ([`default_offer_for`]). These mirror `XidNegotiator` (the collapsed
+//!   figc5.3-5.8 subroutine bodies).
 //! - The **pre-session XID *command* responder** ([`respond_pre_session_xid`]) —
-//!   the un-transcribed figc5.1 responder path that answers an inbound XID command
-//!   *before* a session exists (a PDN NET/ROM mod-8 interlink initiator opening
-//!   with XID before its SABM). Mirrors `RespondToXidCommand` +
-//!   `HandleNoCachedSession`. The manager wires this in on the no-cached-session
-//!   path; the negotiated params stage on the cached context so the subsequent
+//!   the un-transcribed figc5.1 responder column that answers an inbound XID
+//!   command *before* a session exists (a PDN NET/ROM mod-8 interlink initiator
+//!   opening with XID before its SABM). Mirrors `RespondToXidCommand` +
+//!   `HandleNoCachedSession`; hand-implemented in C# too, until upstream redraws
+//!   figc5.1. The negotiated params stage on the cached context so the subsequent
 //!   SABM's `Set Version 2.0` (which clears only `is_extended`) preserves the
 //!   staged `srej_enabled` into the established link.
 //!
@@ -88,8 +93,7 @@ pub fn apply_negotiated(
         && their_hdlc.reject == RejectMode::SelectiveReject;
     let agreed_modulo128 = our_hdlc.modulo128 && their_hdlc.modulo128;
     // Segmenter/reassembler is a mutual-capability AND (§6.3.2 ¶1419).
-    let agreed_segmenter =
-        our_hdlc.segmenter_reassembler && their_hdlc.segmenter_reassembler;
+    let agreed_segmenter = our_hdlc.segmenter_reassembler && their_hdlc.segmenter_reassembler;
 
     context.srej_enabled = agreed_selective_reject;
     context.implicit_reject = !agreed_selective_reject;
@@ -228,12 +232,313 @@ fn max_present(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
+// ─── The management_data_link machine (figc5.1 Ready / figc5.2 Negotiating) ───
+//
+// Ports `Packet.Ax25.Session.Ax25ManagementDataLink`: the runtime driver for the
+// generated MDL state pages [`ax25sdl::MANAGEMENT_DATA_LINK_READY`] /
+// [`ax25sdl::MANAGEMENT_DATA_LINK_NEGOTIATING`] - the XID parameter-negotiation
+// FSM of Appendix C5. It consumes the MDL-NEGOTIATE Request poke the data-link
+// side emits after the UA on a v2.2 connect (figc4.6), and it also fronts the
+// initiator pre-connect XID probe (the LinBPQ SREJ accommodation), which C#
+// likewise runs through this same machine - "the same XID exchange the post-UA
+// path runs, simply triggered before the SABM".
+//
+// Like the C#, the machine keeps its OWN retry bookkeeping (RC / NM201 / TM201)
+// so it never disturbs the live data-link session's RC and T1/T2/T3; the
+// negotiated parameters are applied to the REAL link [`SessionContext`] - that is
+// the whole point of the exercise. The figc5.3-5.8 per-parameter "reverts-to"
+// subroutines are collapsed in the SDL to a single `Apply Negotiated Parameters`
+// placeholder; its runtime body is [`apply_negotiated`] (mirroring
+// `XidNegotiator`), and the un-transcribed figc5.1 *responder* column stays the
+// hand-implemented [`respond_pre_session_xid`] until upstream redraws figc5.1.
+
+use ax25sdl::{
+    Ax25ActionVerb, Ax25Event, Ax25Guard, StatePage, TransitionSpec,
+    MANAGEMENT_DATA_LINK_NEGOTIATING, MANAGEMENT_DATA_LINK_READY,
+};
+
+use super::timer::{TimerId, TimerService};
+
+/// TM201 duration - the management analogue of T1. §C5.3 gives no numeric
+/// default; 3000 ms is the spec's T1 default, matching the C# dispatcher default
+/// (deliberately NOT seeded from the link T1V, which establishment resets).
+pub const TM201_MS: u32 = 3000;
+
+/// The two MDL states (figc5.1 / figc5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdlState {
+    /// figc5.1 - no XID command outstanding.
+    Ready,
+    /// figc5.2 - our XID command is on the wire, awaiting response / FRMR / TM201.
+    Negotiating,
+}
+
+/// The runtime events posted into the MDL machine. Mirrors the C# event routing:
+/// `Negotiate()` / `OnXidReceived` / `OnFrmrReceived` / the TM201 expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MdlEvent {
+    /// MDL-NEGOTIATE Request - open the XID exchange (from figc4.6's post-UA poke
+    /// or a pre-connect probe).
+    NegotiateRequest,
+    /// The peer's XID *response* frame: its F bit + raw info field.
+    XidResponseReceived {
+        /// The response's F bit (the figc5.2 `F_eq_1` diamond).
+        final_bit: bool,
+        /// The raw XID info field (parsed by `Apply Negotiated Parameters`).
+        info: Vec<u8>,
+    },
+    /// A FRMR answering our XID command - a pre-v2.2 peer; §6.3.2 ¶1 v2.0 fallback.
+    FrmrReceived,
+    /// TM201 expired with no response - retry the XID command or give up (error C).
+    Tm201Expiry,
+}
+
+impl MdlEvent {
+    /// The typed [`ax25sdl::Ax25Event`] this runtime event maps onto.
+    fn to_sdl(&self) -> Ax25Event {
+        match self {
+            MdlEvent::NegotiateRequest => Ax25Event::MDLNEGOTIATERequest,
+            MdlEvent::XidResponseReceived { .. } => Ax25Event::XIDResponseReceived,
+            MdlEvent::FrmrReceived => Ax25Event::FRMRReceived,
+            MdlEvent::Tm201Expiry => Ax25Event::TM201Expiry,
+        }
+    }
+}
+
+/// The Layer-3 signals the MDL machine raises (figc5.x, §5.1 / §C5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdlSignal {
+    /// MDL-NEGOTIATE Confirm - negotiation complete (parameters applied, or the
+    /// FRMR v2.0 fallback taken).
+    NegotiateConfirm,
+    /// MDL-ERROR Indicate - "B" unexpected XID response, "C" retry limit
+    /// exceeded, "D" XID response without F=1.
+    ErrorIndicate(&'static str),
+}
+
+/// What one [`MdlMachine::post_event`] drive produced: an XID command to put on
+/// the wire (its encoded info field; the caller frames it as a U XID with P=1  -
+/// error A, "XID command without P=1", implies P=1), and the Layer-3 signals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MdlOutcome {
+    /// `Some(encoded info field)` when the drive ran the `XID_command` verb.
+    pub xid_command: Option<Vec<u8>>,
+    /// The MDL→L3 signals raised, in order.
+    pub signals: Vec<MdlSignal>,
+}
+
+/// The table-driven MDL machine - see the section comment above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdlMachine {
+    /// Current state (`Ready` / `Negotiating`).
+    pub state: MdlState,
+    /// RC - the XID retry count (§C5.3 Variables; distinct from the link RC).
+    rc: u32,
+    /// NM201 - maximum XID command retries. Defaults from the link N2 at
+    /// construction, mirroring the C# `nm201 ?? linkContext.N2`.
+    nm201: u32,
+    /// The exact offer sent in our last XID command, kept so `Apply Negotiated
+    /// Parameters` merges against precisely what we advertised.
+    offered: Option<XidParameters>,
+}
+
+impl MdlMachine {
+    /// A fresh machine in `Ready` with the given retry limit (typically the link
+    /// context's `n2`).
+    pub fn new(nm201: u32) -> Self {
+        Self {
+            state: MdlState::Ready,
+            rc: 0,
+            nm201,
+            offered: None,
+        }
+    }
+
+    /// True while a negotiation is in progress (awaiting the peer's XID response /
+    /// FRMR / a TM201 retry). The manager uses this to decide whether an inbound
+    /// XID/FRMR belongs to the MDL or the data-link session.
+    pub fn is_negotiating(&self) -> bool {
+        self.state == MdlState::Negotiating
+    }
+
+    /// The generated state page for the current state.
+    fn page(&self) -> &'static StatePage {
+        match self.state {
+            MdlState::Ready => &MANAGEMENT_DATA_LINK_READY,
+            MdlState::Negotiating => &MANAGEMENT_DATA_LINK_NEGOTIATING,
+        }
+    }
+
+    /// Drive one event through the generated tables against the REAL data-link
+    /// `link` context (negotiated parameters land there) and the shared timer
+    /// service (TM201 is a distinct [`TimerId`], so it never collides with
+    /// T1/T2/T3). An event with no matching transition is dropped - SDL semantics,
+    /// same as the data-link driver (e.g. a FRMR arriving in `Ready`).
+    pub fn post_event(
+        &mut self,
+        event: MdlEvent,
+        link: &mut SessionContext,
+        timers: &mut dyn TimerService,
+    ) -> MdlOutcome {
+        let mut outcome = MdlOutcome::default();
+        let on = event.to_sdl();
+        let Some(spec) = self
+            .page()
+            .transitions
+            .iter()
+            .find(|t| t.on == on && self.guards_hold(t, &event))
+        else {
+            return outcome;
+        };
+        // The MDL pages carry no loop_while ranges today; this walker does not
+        // expand them, so fail loudly in tests if a regenerate ever adds one.
+        debug_assert!(
+            spec.loops.is_empty(),
+            "MDL transition {} gained loops; teach MdlMachine to expand them",
+            spec.id
+        );
+        for step in spec.actions {
+            self.execute_verb(step.verb, &event, link, timers, &mut outcome);
+        }
+        self.state = match spec.next {
+            "Ready" => MdlState::Ready,
+            "Negotiating" => MdlState::Negotiating,
+            other => unreachable!("unknown MDL next-state `{other}` in generated tables"),
+        };
+        outcome
+    }
+
+    /// Evaluate a transition's guard conjunction. The MDL pages use exactly two
+    /// atoms; any other atom appearing here is a codegen/wiring surprise worth a
+    /// loud stop (the same posture as the subroutine-name lookup).
+    fn guards_hold(&self, spec: &TransitionSpec, event: &MdlEvent) -> bool {
+        spec.guard.iter().all(|term| {
+            let holds = match term.atom {
+                // figc5.2's XID-response final-bit diamond.
+                Ax25Guard::FEq1 => matches!(
+                    event,
+                    MdlEvent::XidResponseReceived {
+                        final_bit: true,
+                        ..
+                    }
+                ),
+                // figc5.2's TM201-expiry retry-limit diamond.
+                Ax25Guard::RCEqNM201 => self.rc == self.nm201,
+                other => {
+                    panic!("guard atom {other:?} is not part of the management_data_link machine")
+                }
+            };
+            holds != term.negate
+        })
+    }
+
+    /// Execute one MDL action verb. Exhaustive over the verbs the figc5.x pages
+    /// carry; a data-link verb reaching here is a wiring bug (loud stop).
+    fn execute_verb(
+        &mut self,
+        verb: Ax25ActionVerb,
+        event: &MdlEvent,
+        link: &mut SessionContext,
+        timers: &mut dyn TimerService,
+        outcome: &mut MdlOutcome,
+    ) {
+        match verb {
+            Ax25ActionVerb::RCAssign0 => self.rc = 0,
+            Ax25ActionVerb::RCAssignRCPlus1 => self.rc = self.rc.saturating_add(1),
+            // Build + emit our XID command: derive the offer from the CURRENT
+            // link context (so a context mutated since construction is
+            // reflected - the C# `Offered` property), remember it verbatim for
+            // the merge, and hand the encoded info field to the caller.
+            Ax25ActionVerb::XIDCommand => {
+                let offer = default_offer_for(link);
+                outcome.xid_command = Some(info_field::encode(&offer));
+                self.offered = Some(offer);
+            }
+            Ax25ActionVerb::StartTM201 => timers.arm(TimerId::Tm201, TM201_MS),
+            Ax25ActionVerb::StopTM201 => timers.cancel(TimerId::Tm201),
+            // The figc5.3-5.8 "reverts-to" placeholder: parse the peer's XID
+            // response off the triggering event (malformed/empty ⇒ "no
+            // parameters offered" → per-field spec defaults, §4.3.3.7 ¶1024)
+            // and run the §6.3.2 merge into the REAL link context.
+            Ax25ActionVerb::ApplyNegotiatedParameters => {
+                let response = match event {
+                    MdlEvent::XidResponseReceived { info, .. } => {
+                        info_field::parse(info).unwrap_or_default()
+                    }
+                    _ => XidParameters::default(),
+                };
+                let offered = self.offered.unwrap_or_else(|| default_offer_for(link));
+                apply_negotiated(link, &offered, &response);
+            }
+            // The figc5.2 FRMR path draws a single "Set Version 2.0" box meaning
+            // the COMPLETE §1436 v2.0 default set on the real link context (not
+            // merely is_extended = false).
+            Ax25ActionVerb::SetVersion20 => apply_version_20_defaults(link),
+            Ax25ActionVerb::MDLNEGOTIATEConfirm => {
+                outcome.signals.push(MdlSignal::NegotiateConfirm)
+            }
+            Ax25ActionVerb::MDLERRORIndicateB => {
+                outcome.signals.push(MdlSignal::ErrorIndicate("B"))
+            }
+            Ax25ActionVerb::MDLERRORIndicateC => {
+                outcome.signals.push(MdlSignal::ErrorIndicate("C"))
+            }
+            Ax25ActionVerb::MDLERRORIndicateD => {
+                outcome.signals.push(MdlSignal::ErrorIndicate("D"))
+            }
+            other => panic!("verb {other:?} is not part of the management_data_link machine"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sdl::timer::MockTimerService;
 
     fn ctx() -> SessionContext {
         SessionContext::new()
+    }
+
+    /// figc5.1 t02: an XID *response* arriving in `Ready` (no command of ours
+    /// outstanding) is error B - reported upward, state unchanged, link context
+    /// untouched. (The manager's router only feeds responses to a Negotiating
+    /// machine, so this is the machine-level contract test.)
+    #[test]
+    fn unexpected_xid_response_in_ready_is_error_b() {
+        let mut m = MdlMachine::new(10);
+        let mut c = ctx();
+        let mut t = MockTimerService::new();
+
+        let outcome = m.post_event(
+            MdlEvent::XidResponseReceived {
+                final_bit: true,
+                info: Vec::new(),
+            },
+            &mut c,
+            &mut t,
+        );
+
+        assert_eq!(outcome.signals, alloc::vec![MdlSignal::ErrorIndicate("B")]);
+        assert!(outcome.xid_command.is_none());
+        assert_eq!(m.state, MdlState::Ready);
+        // An unexpected response never touches the link parameters.
+        assert!(!c.srej_enabled);
+        assert!(!c.is_extended);
+        assert_eq!(c.n2, 10);
+    }
+
+    /// SDL semantics: an event with no transition in the current state is
+    /// dropped - a FRMR in `Ready` (no XID command outstanding) does nothing.
+    #[test]
+    fn frmr_in_ready_is_dropped() {
+        let mut m = MdlMachine::new(10);
+        let mut c = ctx();
+        let mut t = MockTimerService::new();
+
+        let outcome = m.post_event(MdlEvent::FrmrReceived, &mut c, &mut t);
+        assert_eq!(outcome, MdlOutcome::default());
+        assert_eq!(m.state, MdlState::Ready);
     }
 
     fn hdlc(srej: bool, mod128: bool) -> HdlcOptionalFunctions {
@@ -470,8 +775,12 @@ mod tests {
     fn pre_session_xid_command_with_empty_info_falls_to_defaults() {
         let mut c = ctx();
         let response_info = respond_pre_session_xid(&mut c, &[]);
-        assert!(c.srej_enabled, "seeded SREJ meets the SREJ default ⇒ SREJ negotiated");
-        let p = info_field::parse(&response_info).expect("response is a well-formed XID info field");
+        assert!(
+            c.srej_enabled,
+            "seeded SREJ meets the SREJ default ⇒ SREJ negotiated"
+        );
+        let p =
+            info_field::parse(&response_info).expect("response is a well-formed XID info field");
         assert_eq!(
             p.hdlc_optional_functions.unwrap().reject,
             RejectMode::SelectiveReject
@@ -491,7 +800,9 @@ mod tests {
         assert!(c.srej_enabled);
         assert!(!c.implicit_reject);
         // The offer advertises SREJ, mod-8, and SREJ-multiframe (BPQ's OPSREJMult).
-        let hdlc = offer.hdlc_optional_functions.expect("offer carries HDLC opts");
+        let hdlc = offer
+            .hdlc_optional_functions
+            .expect("offer carries HDLC opts");
         assert_eq!(hdlc.reject, RejectMode::SelectiveReject);
         assert!(!hdlc.modulo128, "a mod-8 probe stays mod-8");
         assert!(hdlc.srej_multiframe, "OPSREJMult set — BPQ requires it");

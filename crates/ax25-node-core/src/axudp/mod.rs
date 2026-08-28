@@ -45,11 +45,16 @@ pub struct ReceivedDatagram {
     pub fcs_valid: bool,
 }
 
+/// The smallest datagram worth checking: a minimum AX.25 frame (2 address
+/// slots plus control = 15 octets) plus the 2-octet FCS. Mirrors the C#
+/// `TryStripFcs` length gate, so a tiny datagram can never report a "valid" FCS.
+pub const MIN_DATAGRAM_LEN: usize = (2 * 7) + 1 + 2;
+
 /// Decode a received AXUDP datagram payload: split off the trailing 2-byte FCS,
 /// verify it over the body, and parse the body as AX.25. Total — arbitrary
 /// bytes yield `frame: None`, never a panic.
 pub fn decode_datagram(payload: &[u8]) -> ReceivedDatagram {
-    if payload.len() < 2 {
+    if payload.len() < MIN_DATAGRAM_LEN {
         return ReceivedDatagram {
             frame: None,
             fcs_valid: false,
@@ -158,5 +163,21 @@ mod tests {
             assert_eq!(r.frame, None);
             assert!(!r.fcs_valid);
         }
+    }
+
+    #[test]
+    fn sub_minimum_datagram_with_a_matching_crc_is_rejected() {
+        // 14 body bytes + a correct FCS = 16 bytes: below the C# TryStripFcs
+        // 17-byte gate (min AX.25 frame + FCS), so it must be rejected outright,
+        // not reported as fcs_valid with no frame.
+        let body = [0xAAu8; 14];
+        let mut dgram = body.to_vec();
+        let fcs = crate::crc::compute(&body);
+        dgram.push((fcs & 0xFF) as u8);
+        dgram.push((fcs >> 8) as u8);
+        assert_eq!(dgram.len(), MIN_DATAGRAM_LEN - 1);
+        let r = decode_datagram(&dgram);
+        assert_eq!(r.frame, None);
+        assert!(!r.fcs_valid);
     }
 }

@@ -250,8 +250,8 @@ mod firmware {
                 "AP mode up: SSID {=str}, gateway 192.168.4.1 (connect to configure)",
                 ap_ssid
             );
-            // Keep the control handle alive for the AP's lifetime.
-            core::mem::forget(control);
+            // The control handle is not Drop, so letting it fall out of scope
+            // leaves the AP running; nothing to keep alive explicitly.
         }
 
         // --- OLED status display (NinoBLE Rev5, I2C0 GP4/GP5; optional —

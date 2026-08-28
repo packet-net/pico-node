@@ -13,8 +13,8 @@
 name = "ax25-node-bootloader"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/m0lte/pico-node"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/packet-net/pico-node"
 description = "OTA A/B bootloader for the pico-node RP2040 firmware (embassy-boot-rp)."
 publish = false
 

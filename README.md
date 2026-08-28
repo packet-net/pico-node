@@ -15,8 +15,8 @@ Four capabilities, mirroring the C# node:
 
 ## Layout
 
-- `crates/ax25-node-core` — portable, `no_std`-able, **zero-dependency** logic (KISS, AXUDP, AX.25 codec, CRC, console, SDL glue). Host-tested with `cargo test` today.
-- `crates/ax25-node-fw` — the thin RP2040 / Embassy firmware binary (standalone, workspace-excluded; built once the embedded toolchain is in place).
+- `crates/ax25-node-core` - portable, `no_std`-able logic (KISS, AXUDP, AX.25 codec, CRC, console, NET/ROM, the SDL runtime). Exactly one external dependency: the generated `ax25sdl` tables, as a local sibling path dependency. Host-tested with `cargo test` today.
+- `crates/ax25-node-fw` - the thin RP2040 / Embassy firmware binary (standalone, workspace-excluded; builds for thumbv6m and is proven on hardware - see `docs/PLAN.md`'s amendment log and `docs/OTA.md`).
 
 ## Build + test the portable core (works now, offline, no hardware)
 

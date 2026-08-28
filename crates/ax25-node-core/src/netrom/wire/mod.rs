@@ -18,10 +18,10 @@
 
 pub mod broadcast;
 pub mod callsign;
-/// The LinBPQ extended Connect Acknowledge info field (window / TTL + the
-/// compression-agreed bit). Gated behind `netrom-compress`. Mirrors C#
+/// The Connect Acknowledge info field: the base NET/ROM accepted-window octet
+/// (always present on an accept, so NOT feature-gated) plus the LinBPQ TTL /
+/// compression-agreed extension octet. Mirrors C#
 /// `Packet.NetRom.Wire.ConnectAckInfo`.
-#[cfg(feature = "netrom-compress")]
 pub mod connect_ack_info;
 pub mod connect_request_info;
 pub mod entry;
@@ -38,8 +38,10 @@ pub use broadcast::NodesBroadcast;
 pub use callsign::{
     read_alias, try_read_shifted, write_alias, write_shifted, Alias, ALIAS_LENGTH, SHIFTED_LENGTH,
 };
-#[cfg(feature = "netrom-compress")]
-pub use connect_ack_info::{ConnectAckInfo, CONNECT_ACK_INFO_EXTENDED_LEN};
+pub use connect_ack_info::{
+    ConnectAckInfo, CONNECT_ACK_INFO_EXTENDED_LEN, CONNECT_ACK_INFO_VANILLA_LEN,
+    CONNECT_ACK_MAX_WINDOW,
+};
 #[cfg(feature = "netrom-compress")]
 pub use connect_request_info::CONNECT_REQUEST_INFO_EXTENDED_LEN;
 pub use connect_request_info::{ConnectRequestInfo, CONNECT_REQUEST_INFO_LEN};

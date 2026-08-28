@@ -292,7 +292,10 @@ impl ConfigService {
         let len = self.pending.encode(&mut payload);
         let generation = self.generation + 1;
 
-        let mut record = [0xFFu8; HEADER_LEN + MAX_PAYLOAD + 2];
+        // Sized up to the write granularity so `record[..padded]` below can
+        // never index past the buffer, whatever MAX_PAYLOAD grows to.
+        const RECORD_CAPACITY: usize = (HEADER_LEN + MAX_PAYLOAD + 2).div_ceil(256) * 256;
+        let mut record = [0xFFu8; RECORD_CAPACITY];
         record[0..4].copy_from_slice(MAGIC);
         record[4] = VERSION;
         record[5..9].copy_from_slice(&generation.to_le_bytes());
@@ -306,7 +309,7 @@ impl ConfigService {
 
         // Alternate sectors by generation parity; the previous record survives
         // until this write completes.
-        let offset = if generation % 2 == 0 {
+        let offset = if generation.is_multiple_of(2) {
             SECTOR_A
         } else {
             SECTOR_B

@@ -432,10 +432,15 @@ fn build_progress_messages(enable: bool) -> CcdiFrame {
 }
 
 /// Build the GO_TO_CHANNEL frame — `g` + channel (or zone-qualified) digits
-/// (§1.9.4). `None` for a channel above 9999. Mirrors `GoToChannelAsync`'s
+/// (§1.9.4). `None` for a channel above 9999 or a zone above 99: the qualified
+/// wire format is exactly 2 zone digits, and a wider zone would silently render
+/// only its low 2 digits. Mirrors `GoToChannelAsync`'s
 /// `zone is {} z ? $"{z:00}{channel:0000}" : channel.ToString()`.
 fn build_go_to_channel(channel: u16, zone: Option<u8>) -> Option<CcdiFrame> {
     if channel > 9999 {
+        return None;
+    }
+    if matches!(zone, Some(z) if z > 99) {
         return None;
     }
     let mut params = [0u8; 6];
@@ -545,7 +550,10 @@ mod tests {
         assert_eq!(build_query_cctm(b"064").encode_to_bytes(), b"q0450645C\r");
         assert_eq!(build_transmitter(true).encode_to_bytes(), b"f0291CE\r");
         assert_eq!(build_transmitter(false).encode_to_bytes(), b"f0290CF\r");
-        assert_eq!(build_progress_messages(true).encode_to_bytes(), b"f03041A2\r");
+        assert_eq!(
+            build_progress_messages(true).encode_to_bytes(),
+            b"f03041A2\r"
+        );
         assert_eq!(
             build_go_to_channel(5, None).unwrap().encode(),
             CcdiFrame::new(b'g', b"5").unwrap().encode()
@@ -559,6 +567,13 @@ mod tests {
             CcdiFrame::new(b'g', b"100").unwrap().encode()
         );
         assert!(build_go_to_channel(10000, None).is_none());
+        // Zone is exactly 2 wire digits: 99 fits, 100 must be rejected rather
+        // than silently rendering as "00".
+        assert_eq!(
+            build_go_to_channel(5, Some(99)).unwrap().encode(),
+            CcdiFrame::new(b'g', b"990005").unwrap().encode()
+        );
+        assert!(build_go_to_channel(5, Some(100)).is_none());
     }
 
     #[test]
@@ -599,7 +614,10 @@ mod tests {
         block_on(radio.go_to_channel(7, None)).unwrap();
         assert_eq!(
             radio.stream_mut().take_written(),
-            CcdiFrame::new(b'g', b"7").unwrap().encode_to_bytes().as_slice()
+            CcdiFrame::new(b'g', b"7")
+                .unwrap()
+                .encode_to_bytes()
+                .as_slice()
         );
     }
 
@@ -627,7 +645,10 @@ mod tests {
         let rssi = block_on(radio.read_rssi_tenths()).unwrap();
         assert_eq!(rssi, -456);
         assert_eq!(radio.channel_busy(), Some(true));
-        assert_eq!(radio.drain_events(), alloc::vec![RadioEvent::CarrierSense(true)]);
+        assert_eq!(
+            radio.drain_events(),
+            alloc::vec![RadioEvent::CarrierSense(true)]
+        );
     }
 
     #[test]
@@ -713,7 +734,9 @@ mod tests {
 
     #[test]
     fn read_buffered_sdm_returns_data_then_empty() {
-        let sframe = CcdiFrame::new(b's', b"V1|5|HI|x").unwrap().encode_to_bytes();
+        let sframe = CcdiFrame::new(b's', b"V1|5|HI|x")
+            .unwrap()
+            .encode_to_bytes();
         let mut radio = radio_primed(&sframe);
         let mut buf = [0u8; 64];
         let n = block_on(radio.read_buffered_sdm_into(&mut buf))
@@ -723,6 +746,9 @@ mod tests {
         // An empty GET_SDM means nothing is buffered → None.
         let empty = CcdiFrame::new(b's', b"").unwrap().encode_to_bytes();
         radio.stream_mut().feed(&empty);
-        assert_eq!(block_on(radio.read_buffered_sdm_into(&mut buf)).unwrap(), None);
+        assert_eq!(
+            block_on(radio.read_buffered_sdm_into(&mut buf)).unwrap(),
+            None
+        );
     }
 }

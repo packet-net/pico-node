@@ -14,8 +14,10 @@
 //! cancelled (the packet.net#225 timer-rollback). [`TimerService`] therefore
 //! exposes [`capture`](TimerService::capture) / [`restore`](TimerService::restore).
 
-/// The three data-link timers. (TM201 — the MDL retry timer — is out of scope for
-/// the data-link runtime; the management machine owns it.)
+/// The link timers. The data-link runtime arms T1/T2/T3; TM201 is the MDL
+/// (figc5.x) XID retry timer, armed only by [`super::mdl::MdlMachine`] - a
+/// distinct name on the shared service so it never collides with T1/T2/T3
+/// (mirrors the C# listener sharing one `ITimerScheduler`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimerId {
     /// T1 — acknowledgement timer (§6.7.1.3).
@@ -24,10 +26,12 @@ pub enum TimerId {
     T2,
     /// T3 — inactive-link timer (§6.7.1.5).
     T3,
+    /// TM201 - the management data-link XID retry timer (§C5.3).
+    Tm201,
 }
 
 /// An opaque snapshot of which timers are running + their remaining ms, used to
-/// roll back a thrown transition's timer side-effects. Three slots — one per
+/// roll back a thrown transition's timer side-effects. One slot per
 /// [`TimerId`] — each `Some(remaining_ms)` if running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TimerSnapshot {
@@ -37,6 +41,8 @@ pub struct TimerSnapshot {
     pub t2: Option<u32>,
     /// T3 remaining ms, or `None` if not running.
     pub t3: Option<u32>,
+    /// TM201 remaining ms, or `None` if not running.
+    pub tm201: Option<u32>,
 }
 
 /// The abstract timer service the runtime drives. The firmware implements this
@@ -90,6 +96,7 @@ pub struct MockTimerService {
     t1: Option<u32>,
     t2: Option<u32>,
     t3: Option<u32>,
+    tm201: Option<u32>,
 }
 
 impl MockTimerService {
@@ -103,6 +110,7 @@ impl MockTimerService {
             TimerId::T1 => self.t1,
             TimerId::T2 => self.t2,
             TimerId::T3 => self.t3,
+            TimerId::Tm201 => self.tm201,
         }
     }
 
@@ -111,6 +119,7 @@ impl MockTimerService {
             TimerId::T1 => &mut self.t1,
             TimerId::T2 => &mut self.t2,
             TimerId::T3 => &mut self.t3,
+            TimerId::Tm201 => &mut self.tm201,
         }
     }
 
@@ -141,11 +150,13 @@ impl TimerService for MockTimerService {
             t1: self.t1,
             t2: self.t2,
             t3: self.t3,
+            tm201: self.tm201,
         }
     }
     fn restore(&mut self, snap: TimerSnapshot) {
         self.t1 = snap.t1;
         self.t2 = snap.t2;
         self.t3 = snap.t3;
+        self.tm201 = snap.tm201;
     }
 }

@@ -139,16 +139,26 @@ impl CircuitManager {
             .map(|m| m.circuit.peer_choked())
     }
 
+    /// The maximum live circuits (inbound + outbound) this manager holds - the
+    /// embedded bound. Every minted circuit carries heap-backed queues, so an
+    /// unbounded table is remote heap exhaustion on the Pico (a flood of Connect
+    /// Requests, each with a novel peer key, would abort the allocator). A few
+    /// links with a small window is the design load; 16 is comfortably above it.
+    /// At the cap, a further Connect Request is refused (choke-bit Connect
+    /// Acknowledge) and [`open_circuit`](Self::open_circuit) returns `None`.
+    pub const MAX_LIVE_CIRCUITS: usize = 16;
+
     /// Mint a local circuit to `remote_node`, register it, and return its key. The
-    /// owner then drives it via [`circuit_mut`](Self::circuit_mut).
-    pub fn open_circuit(&mut self, remote_node: Callsign) -> CircuitKey {
-        let (index, id) = self.allocate_key();
+    /// owner then drives it via [`circuit_mut`](Self::circuit_mut). Returns `None`
+    /// when the circuit table is full ([`MAX_LIVE_CIRCUITS`](Self::MAX_LIVE_CIRCUITS)).
+    pub fn open_circuit(&mut self, remote_node: Callsign) -> Option<CircuitKey> {
+        let (index, id) = self.allocate_key()?;
         let circuit = NetRomCircuit::new(index, id, self.local_node, remote_node, self.options);
         self.circuits.push(Managed {
             circuit,
             peer_key: None,
         });
-        (index, id)
+        Some((index, id))
     }
 
     /// Feed an inbound datagram. Routes it to the addressed circuit, or, for a
@@ -156,49 +166,61 @@ impl CircuitManager {
     /// via [`take_incoming`](Self::take_incoming)). Tolerant of stray datagrams.
     pub fn on_packet(&mut self, packet: &NetRomPacket, now_ms: u64) {
         let t = packet.transport;
-        let key = (t.circuit_index, t.circuit_id);
 
+        // OPCODE FIRST. A Connect Request's index/id name the PEER's circuit, not
+        // ours (we have none yet), so it must never be demuxed through the local-key
+        // table: keys are per-node and both ends allocate from (0,0), so a fresh
+        // peer's first connect collides with our own first circuit and would be
+        // swallowed by it (ignored while Connecting, or re-acked to the WRONG node
+        // once Connected; the circuit never checks network.origin). Route it by the
+        // peer's identity instead: (origin node, its index, its id).
+        if NetRomOpcode::from_nibble(t.opcode) == Some(NetRomOpcode::ConnectRequest) {
+            // Dedup a retransmitted Connect Request: if we already minted a circuit
+            // for this peer-circuit identity, hand the retransmit to it (it re-acks)
+            // rather than minting a duplicate.
+            let peer_key = (packet.network.origin, t.circuit_index, t.circuit_id);
+            if let Some(m) = self
+                .circuits
+                .iter_mut()
+                .find(|m| m.peer_key == Some(peer_key))
+            {
+                m.circuit.on_packet(packet, now_ms);
+                return;
+            }
+            self.mint_inbound(packet);
+            return;
+        }
+
+        // Every other opcode is addressed to a circuit of OURS: demux on the
+        // (index,id) we handed the peer at connect time.
+        let key = (t.circuit_index, t.circuit_id);
         if let Some(m) = self.circuits.iter_mut().find(|m| key_of(&m.circuit) == key) {
             m.circuit.on_packet(packet, now_ms);
             return;
         }
 
-        match NetRomOpcode::from_nibble(t.opcode) {
-            Some(NetRomOpcode::ConnectRequest) => {
-                // Dedup a retransmitted Connect Request by the peer's identity.
-                let peer_key = (packet.network.origin, t.circuit_index, t.circuit_id);
-                if let Some(m) = self
-                    .circuits
-                    .iter_mut()
-                    .find(|m| m.peer_key == Some(peer_key))
-                {
-                    m.circuit.on_packet(packet, now_ms);
-                    return;
-                }
-                self.mint_inbound(packet);
-            }
-            Some(NetRomOpcode::DisconnectRequest) => {
-                // Courteously disconnect-ack so a half-open peer settles.
-                let network = NetRomNetworkHeader {
-                    origin: self.local_node,
-                    destination: packet.network.origin,
-                    time_to_live: self.options.time_to_live,
-                };
-                let transport = NetRomTransportHeader {
-                    circuit_index: t.circuit_index,
-                    circuit_id: t.circuit_id,
-                    tx_sequence: 0,
-                    rx_sequence: 0,
-                    opcode: NetRomOpcode::DisconnectAcknowledge.as_u8(),
-                    flags: 0,
-                };
-                self.outbox.push(OutboundPacket {
-                    network,
-                    transport,
-                    payload: Vec::new(),
-                });
-            }
-            _ => {} // stray datagram for an unknown circuit — drop.
+        // Nothing matched: the datagram is for a circuit we don't have (a late or
+        // duplicate one) - drop it, except a Disconnect Request, which we
+        // courteously disconnect-ack so a half-open peer settles.
+        if NetRomOpcode::from_nibble(t.opcode) == Some(NetRomOpcode::DisconnectRequest) {
+            let network = NetRomNetworkHeader {
+                origin: self.local_node,
+                destination: packet.network.origin,
+                time_to_live: self.options.time_to_live,
+            };
+            let transport = NetRomTransportHeader {
+                circuit_index: t.circuit_index,
+                circuit_id: t.circuit_id,
+                tx_sequence: 0,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::DisconnectAcknowledge.as_u8(),
+                flags: 0,
+            };
+            self.outbox.push(OutboundPacket {
+                network,
+                transport,
+                payload: Vec::new(),
+            });
         }
     }
 
@@ -267,6 +289,14 @@ impl CircuitManager {
         let t = request.transport;
         let remote_node = request.network.origin;
 
+        // Table full (or, defensively, no free key): refuse rather than mint. The
+        // refusal rides the existing choke-bit path so the originator closes as
+        // Refused instead of retransmitting into the void.
+        let Some((index, id)) = self.allocate_key() else {
+            self.refuse_connect_request(request);
+            return;
+        };
+
         let mut originating_user = remote_node;
         let mut proposed_window = 0u8;
         if let Some(info) = ConnectRequestInfo::decode(request.payload) {
@@ -279,7 +309,6 @@ impl CircuitManager {
         let offered_compression = ConnectRequestInfo::offers_compression(request.payload);
 
         let peer_key = (remote_node, t.circuit_index, t.circuit_id);
-        let (index, id) = self.allocate_key();
         let circuit = NetRomCircuit::new(index, id, self.local_node, remote_node, self.options);
         self.circuits.push(Managed {
             circuit,
@@ -297,7 +326,14 @@ impl CircuitManager {
         });
     }
 
-    fn allocate_key(&mut self) -> (u8, u8) {
+    /// Allocate a free `(index, id)` circuit key, or `None` when the table is at
+    /// [`MAX_LIVE_CIRCUITS`](Self::MAX_LIVE_CIRCUITS) - the caller refuses the
+    /// circuit. Never returns an in-use key: handing out a duplicate would corrupt
+    /// the demux table (two circuits answering to one key).
+    fn allocate_key(&mut self) -> Option<(u8, u8)> {
+        if self.circuits.len() >= Self::MAX_LIVE_CIRCUITS {
+            return None; // circuit table full - the embedded bound
+        }
         for _ in 0..65536u32 {
             let index = self.next_index;
             let id = self.next_id;
@@ -310,11 +346,39 @@ impl CircuitManager {
                 .iter()
                 .any(|m| key_of(&m.circuit) == (index, id))
             {
-                return (index, id);
+                return Some((index, id));
             }
         }
-        // 65536 live circuits — practically unreachable; reuse the probe head.
-        (self.next_index, self.next_id)
+        // Unreachable: below the cap there are far fewer live circuits than the
+        // 65536-key space, so the probe always finds a free key. Refuse anyway
+        // rather than ever duplicating one.
+        None
+    }
+
+    /// Refuse a Connect Request without minting a circuit: a Connect Acknowledge
+    /// with the choke (refusal) bit, addressed to the peer's circuit, with zeros
+    /// where our index/id would ride (we allocated none) and no info field (a
+    /// refusal accepts nothing - Linux nr_transmit_refusal is the same bare frame).
+    fn refuse_connect_request(&mut self, request: &NetRomPacket) {
+        let t = request.transport;
+        let network = NetRomNetworkHeader {
+            origin: self.local_node,
+            destination: request.network.origin,
+            time_to_live: self.options.time_to_live,
+        };
+        let transport = NetRomTransportHeader {
+            circuit_index: t.circuit_index,
+            circuit_id: t.circuit_id,
+            tx_sequence: 0,
+            rx_sequence: 0,
+            opcode: NetRomOpcode::ConnectAcknowledge.as_u8(),
+            flags: crate::netrom::wire::FLAG_CHOKE,
+        };
+        self.outbox.push(OutboundPacket {
+            network,
+            transport,
+            payload: Vec::new(),
+        });
     }
 
     /// Sweep every circuit: aggregate its outbox + events into the manager's queues
@@ -456,7 +520,9 @@ mod tests {
         /// A originates a circuit toward B; returns its key. Drive it with
         /// [`connect_a`](Self::connect_a) / [`send_a`](Self::send_a) etc.
         fn open_from_a(&mut self) -> CircuitKey {
-            self.a.open_circuit(self.b_node)
+            self.a
+                .open_circuit(self.b_node)
+                .expect("below the circuit cap")
         }
 
         fn connect_a(&mut self, key: CircuitKey, originating_user: Callsign) {
@@ -652,6 +718,14 @@ mod tests {
 
         assert_eq!(h.accepted_b.len(), 1);
         assert_eq!(h.b.circuit_window(h.accepted(0)), Some(2));
+        // The other half of the negotiation: B's Connect Acknowledge reports the
+        // window it ACCEPTED in info[0] and the originator comes down to it (LinBPQ
+        // L4Code.c:2287 reads it back unconditionally).
+        assert_eq!(
+            h.a.circuit_window(a),
+            Some(2),
+            "the acknowledgement's window octet caps A's proposed 8"
+        );
     }
 
     #[test]
@@ -924,19 +998,31 @@ mod tests {
 
     #[test]
     fn a_retransmitted_connect_request_does_not_mint_a_duplicate_inbound_circuit() {
+        // The retransmit's header names A's circuit (not B's), so it can't match
+        // B's local-key table; B must dedup it by the peer identity and re-ack, NOT
+        // mint a second inbound circuit.
+        //
+        // B holds a DECOY outbound circuit to a third node, opened first so it owns
+        // the (0,0) key A's circuit also has: without it the dedup would be
+        // indistinguishable from B accidentally demuxing the retransmit onto its
+        // own inbound circuit, whose local key happens to collide with A's.
         let mut h = Harness::with_both(NetRomCircuitOptions {
             retransmit_timeout_ms: 5000,
             max_retries: 3,
             ..Default::default()
         });
         h.auto_accept_on_b();
+        let decoy = h.b.open_circuit(call("GB7CCC")).expect("below the cap");
+        assert_eq!(decoy, (0, 0), "the first key allocated is (0,0)");
         let a = h.open_from_a();
+        assert_eq!(a, (0, 0), "A's first circuit collides with B's decoy");
+
         h.drop_next_b_to_a(1); // lose B's first Connect Acknowledge
         h.connect_a(a, user());
         h.pump();
         assert!(!h.cap_a(a).connected, "the connect-ack was dropped");
         assert_eq!(
-            h.b.circuit_count(),
+            h.accepted_b.len(),
             1,
             "B minted exactly one inbound circuit"
         );
@@ -947,11 +1033,158 @@ mod tests {
             "the re-ack from the deduped circuit completes the connect"
         );
         assert_eq!(
-            h.b.circuit_count(),
+            h.accepted_b.len(),
             1,
-            "the retransmit re-acked the existing circuit"
+            "the retransmit re-acked the existing circuit, no duplicate"
         );
-        assert_eq!(h.accepted_b.len(), 1, "IncomingCircuit fired exactly once");
+        assert_eq!(
+            h.b.circuit_state(decoy),
+            Some(State::Disconnected),
+            "the decoy never saw A's connect"
+        );
+    }
+
+    /// A Connect Request datagram from `origin` naming the peer's circuit
+    /// `(index, id)`, with a canonical 15-octet info field.
+    fn connect_request_from(origin: Callsign, dest: Callsign, index: u8, id: u8) -> OutboundPacket {
+        let cri = ConnectRequestInfo {
+            proposed_window: 4,
+            originating_user: user(),
+            originating_node: origin,
+        };
+        let mut info = [0u8; crate::netrom::wire::CONNECT_REQUEST_INFO_LEN];
+        cri.encode(&mut info).expect("15-byte buffer");
+        OutboundPacket {
+            network: NetRomNetworkHeader {
+                origin,
+                destination: dest,
+                time_to_live: 25,
+            },
+            transport: NetRomTransportHeader {
+                circuit_index: index,
+                circuit_id: id,
+                tx_sequence: 0,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::ConnectRequest.as_u8(),
+                flags: 0,
+            },
+            payload: info.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_connect_request_whose_key_collides_with_a_live_local_circuit_is_still_routed_to_the_peer()
+    {
+        // Circuit keys are per-node and every node allocates from (0,0), so a
+        // third node's FIRST connect carries the same (index,id) as our own first
+        // circuit. A connect names the PEER's circuit, so it must be routed by
+        // (origin,index,id), never demuxed onto ours, which would swallow it (no
+        // incoming circuit raised) or, once our circuit is up, ack the wrong node.
+        let local = call("GB7XXX");
+        let peer = call("GB7YYY");
+        let third = call("GB7ZZZ");
+        let mut manager = CircuitManager::new(local, NetRomCircuitOptions::default());
+
+        // Our own outbound circuit to GB7YYY takes the first key, (0,0), and is live.
+        let ours = manager.open_circuit(peer).expect("below the circuit cap");
+        assert_eq!(ours, (0, 0));
+        manager.circuit_mut(ours).unwrap().connect(user(), SEED_MS);
+        let _ = manager.take_outbox(); // drain our own Connect Request
+
+        // A THIRD node's fresh circuit is (0,0) too; its Connect Request names it.
+        let creq = connect_request_from(third, local, 0, 0);
+        manager.on_packet(&as_packet(&creq), SEED_MS);
+
+        let incoming = manager.take_incoming();
+        assert_eq!(
+            incoming.len(),
+            1,
+            "the colliding connect must mint an inbound circuit"
+        );
+        assert_eq!(incoming[0].remote_node, third);
+        manager.accept(&incoming[0]);
+
+        let sent = manager.take_outbox();
+        assert_eq!(sent.len(), 1);
+        let ack = &sent[0];
+        assert_eq!(
+            NetRomOpcode::from_nibble(ack.transport.opcode),
+            Some(NetRomOpcode::ConnectAcknowledge)
+        );
+        assert_eq!(
+            ack.network.destination, third,
+            "the acknowledgement goes to the node that connected"
+        );
+        assert_eq!(
+            ack.transport.circuit_index, 0,
+            "addressed to the peer's own circuit"
+        );
+        assert_eq!(
+            manager.circuit_state(ours),
+            Some(State::Connecting),
+            "our colliding circuit is untouched"
+        );
+    }
+
+    #[test]
+    fn a_connect_flood_is_capped_and_refused_with_the_choke_bit() {
+        // Every novel (origin,index,id) mints a heap-backed circuit, so an
+        // uncapped table is remote heap exhaustion on the Pico. Past
+        // MAX_LIVE_CIRCUITS a Connect Request is refused, not minted.
+        let local = call("GB7XXX");
+        let mut manager = CircuitManager::new(local, NetRomCircuitOptions::default());
+
+        for i in 0..CircuitManager::MAX_LIVE_CIRCUITS {
+            let origin = Callsign::new(b"GB7FLD", i as u8).unwrap();
+            let creq = connect_request_from(origin, local, 0, 0);
+            manager.on_packet(&as_packet(&creq), SEED_MS);
+        }
+        assert_eq!(manager.circuit_count(), CircuitManager::MAX_LIVE_CIRCUITS);
+        assert_eq!(
+            manager.take_incoming().len(),
+            CircuitManager::MAX_LIVE_CIRCUITS
+        );
+
+        let over_origin = call("GB7OVR");
+        let over = connect_request_from(over_origin, local, 0, 0);
+        manager.on_packet(&as_packet(&over), SEED_MS);
+
+        assert_eq!(
+            manager.circuit_count(),
+            CircuitManager::MAX_LIVE_CIRCUITS,
+            "no circuit minted past the cap"
+        );
+        assert!(manager.take_incoming().is_empty());
+        let sent = manager.take_outbox();
+        let refusal = sent
+            .iter()
+            .find(|p| p.network.destination == over_origin)
+            .expect("the over-cap connect is answered");
+        assert_eq!(
+            NetRomOpcode::from_nibble(refusal.transport.opcode),
+            Some(NetRomOpcode::ConnectAcknowledge)
+        );
+        assert_ne!(
+            refusal.transport.flags & crate::netrom::wire::FLAG_CHOKE,
+            0,
+            "refused via the choke bit, so the originator closes as Refused"
+        );
+        assert!(
+            refusal.payload.is_empty(),
+            "a refusal accepts nothing - no info field"
+        );
+    }
+
+    #[test]
+    fn open_circuit_refuses_past_the_live_circuit_cap() {
+        // Key allocation refuses at the bound instead of ever handing out a
+        // duplicate live key (which would corrupt the demux table).
+        let mut manager = CircuitManager::new(call("GB7XXX"), NetRomCircuitOptions::default());
+        for _ in 0..CircuitManager::MAX_LIVE_CIRCUITS {
+            assert!(manager.open_circuit(call("GB7YYY")).is_some());
+        }
+        assert_eq!(manager.open_circuit(call("GB7YYY")), None);
+        assert_eq!(manager.circuit_count(), CircuitManager::MAX_LIVE_CIRCUITS);
     }
 
     #[test]
@@ -1033,7 +1266,9 @@ mod tests {
     fn compressible_payload() -> Vec<u8> {
         let mut data = Vec::new();
         for _ in 0..60 {
-            data.extend_from_slice(b"GB7RDG NET/ROM node broadcast quality 192 via GB7RDG-7 more follows\n");
+            data.extend_from_slice(
+                b"GB7RDG NET/ROM node broadcast quality 192 via GB7RDG-7 more follows\n",
+            );
         }
         data
     }

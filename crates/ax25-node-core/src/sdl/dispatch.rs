@@ -8,9 +8,9 @@
 //! that lands without an arm is a build error, killing the verb-vs-dispatch bug
 //! class (UI-reception, DL-DATA-while-connecting) at compile time.
 //!
-//! Three trigger-scoped verb rewrites (the SREJ/gap/drain spec-defect quirks #38,
-//! #42, #47) are applied before dispatch, exactly as the C# does at the top of
-//! `Execute(verb, tx)`.
+//! Two trigger-scoped verb rewrites (the gap/drain spec-defect quirks #42, #47)
+//! plus the `srej_command_ignored` retransmit-tail suppression are applied before
+//! dispatch, exactly as the C# does at the top of `Execute(verb, tx)`.
 
 extern crate alloc;
 
@@ -85,16 +85,37 @@ pub fn execute_steps(actions: &[ActionStep], tx: &mut Tx<'_>) {
 
 /// Execute a single action verb against `tx`. The exhaustive typed `match`.
 pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
-    let verb = apply_verb_quirks(verb, tx);
-    // The #38 quirk can suppress a verb entirely (skip Invoke_Retransmission on an
-    // SREJ trigger); `apply_verb_quirks` signals that with `None` would complicate
-    // the return type, so we re-check the one suppression case here.
-    if tx.session.quirks.srej_selective_retransmit
-        && matches!(tx.trigger, Event::SrejReceived(_))
-        && verb == Ax25ActionVerb::InvokeRetransmission
+    // Quirk srej_command_ignored (default on): an SREJ received as a COMMAND is
+    // off-spec (§4.3.2.4 makes SREJ response-only) and no deployed stack acts on
+    // one; every surveyed stack still applies the N(R) acknowledgement, and so do
+    // we. Suppress the RETRANSMIT TAIL only - the run of verbs the corrected
+    // figc4.5 (ax25sdl v0.10.1+) gives the command paths after the
+    // acknowledgement bookkeeping:
+    //     ... CheckIFrameAcknowledged | PushOldIFrameNROnQueue | LMDataRequest
+    //                                 | StopT3 | StartT1 | ClearAcknowledgePending
+    // The push onward exists solely to send the requested frame, and StopT3/
+    // StartT1/ClearAcknowledgePending are "we just transmitted" bookkeeping that
+    // must not fire when we transmit nothing. Mirrors the C# ActionDispatcher
+    // (packet.net#674; replaces the retired #38 rewrite, packet.net#682).
+    if tx.session.quirks.srej_command_ignored
+        && matches!(&tx.trigger, Event::SrejReceived(fi) if fi.is_command)
+        && matches!(
+            verb,
+            Ax25ActionVerb::PushOldIFrameNROnQueue
+                | Ax25ActionVerb::PushOnIFrameQueue
+                | Ax25ActionVerb::PushOnIFrameQueueNoteWordOrder
+                | Ax25ActionVerb::PushFrameOnQueue
+                | Ax25ActionVerb::PushIFrameOnIQueue
+                | Ax25ActionVerb::LMDataRequest
+                | Ax25ActionVerb::StopT3
+                | Ax25ActionVerb::StartT1
+                | Ax25ActionVerb::ClearAcknowledgePending
+                | Ax25ActionVerb::InvokeRetransmission
+        )
     {
         return;
     }
+    let verb = apply_verb_quirks(verb, tx);
 
     match verb {
         // ─── Flag mutations ─────────────────────────────────────────────
@@ -213,11 +234,11 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
         //
         // These are emitted ONLY by the management_data_link machine
         // (Negotiating/Ready), which this data-link runtime does not drive (the
-        // C# `Ax25Session` likewise drives only the data-link tables; the MDL has
-        // its own driver). The data-link state pages never carry these verbs, so
-        // they are unreachable in practice — but the typed `match` must stay
-        // exhaustive (the SP-010 guarantee), so they are explicit inert arms. If
-        // the MDL machine is ported later, these gain real bodies + sink methods.
+        // C# `Ax25Session` likewise drives only the data-link tables). Their real
+        // bodies live in [`super::mdl::MdlMachine`]'s executor, which drives the
+        // generated MDL pages. The data-link state pages never carry these verbs,
+        // so they are unreachable in practice - but the typed `match` must stay
+        // exhaustive (the SP-010 guarantee), so they are explicit inert arms.
         Ax25ActionVerb::XIDCommand
         | Ax25ActionVerb::StartTM201
         | Ax25ActionVerb::StopTM201
@@ -373,23 +394,12 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
     }
 }
 
-/// Apply the three trigger-scoped verb rewrites (the SREJ #38, gap #42, drain #47
-/// quirks) before dispatch. Mirrors the top of the C# `Execute(verb, tx)`.
+/// Apply the two trigger-scoped verb rewrites (the gap #42 and drain #47 quirks)
+/// before dispatch. Mirrors the top of the C# `Execute(verb, tx)`. (The old #38
+/// SREJ selective-retransmit rewrite is retired: the corrected figc4.5 tables do
+/// single-frame retransmit natively, so there is nothing left to rewrite.)
 fn apply_verb_quirks(mut verb: Ax25ActionVerb, tx: &Tx<'_>) -> Ax25ActionVerb {
     let q = &tx.session.quirks;
-
-    // #38 — SREJ selective retransmit: on an SREJ trigger, redirect a fresh-push
-    // verb to the single-frame "Push Old I Frame N(r)" behaviour. (The
-    // Invoke_Retransmission suppression is handled in execute_verb.)
-    if q.srej_selective_retransmit && matches!(tx.trigger, Event::SrejReceived(_)) {
-        verb = match verb {
-            Ax25ActionVerb::PushOnIFrameQueue
-            | Ax25ActionVerb::PushOnIFrameQueueNoteWordOrder
-            | Ax25ActionVerb::PushFrameOnQueue
-            | Ax25ActionVerb::PushIFrameOnIQueue => Ax25ActionVerb::PushOldIFrameNROnQueue,
-            other => other,
-        };
-    }
 
     // #42 — SREJ targets gap: on an I_received trigger, retarget `N(r) := N(s)`
     // (request the just-arrived frame) to `N(r) := V(r)` (the next missing gap).

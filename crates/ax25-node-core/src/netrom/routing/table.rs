@@ -40,13 +40,13 @@
 
 use crate::ax25::Callsign;
 
+use super::inp3_sntt::SNTT_UNSET_RAW;
 use super::model::{Inp3RouteMetric, NetRomDestination, NetRomNeighbour, NetRomRoute};
 use super::options::NetRomRoutingOptions;
 use super::quality;
 use crate::netrom::wire::inp3_rif::{Inp3Rif, Inp3Rip};
 use crate::netrom::wire::{Alias, NodesAdvertisementEntry, NodesBroadcast};
 use crate::netrom::PortId;
-use super::inp3_sntt::SNTT_UNSET_RAW;
 use alloc::vec::Vec;
 
 /// One kept route inside a destination's route set.
@@ -255,6 +255,16 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
         // Heuristic 5/6/7/8: each advertised destination becomes a route via this
         // neighbour at the combined quality, loop-guarded against us.
         for entry in broadcast.entries() {
+            if entry.destination == my_call {
+                // Trivial-loop guard: never learn (and so never re-advertise) a
+                // route to OURSELVES. The best-neighbour guard below only catches
+                // the direct case (a neighbour advertising us back with our own
+                // call as its next hop); an advertisement of us via a THIRD node
+                // slips past it and puts our own callsign into our own NODES
+                // broadcast. LinBPQ skips destination == MYCALL outright
+                // (L3Code.c:456), and ingest_rif has the same guard.
+                continue;
+            }
             let q = if entry.best_neighbour == my_call {
                 quality::MIN // trivial-loop guard
             } else {
@@ -443,8 +453,9 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
             // local target time = peer target + this link's measured cost + per-hop
             // floor; computed in u64 so the horizon comparison is overflow-free even if
             // the peer advertised right up against the horizon (SNTT ≤ 600_000).
-            let local_target_time: u64 =
-                rip.target_time_ms as u64 + neighbour_sntt_ms as u64 + Self::PER_HOP_INCREMENT_MS as u64;
+            let local_target_time: u64 = rip.target_time_ms as u64
+                + neighbour_sntt_ms as u64
+                + Self::PER_HOP_INCREMENT_MS as u64;
 
             // Horizon = withdrawal (clears the INP3 metric only), independent of the
             // SNTT measurement — a peer advertising the horizon withdraws regardless.
@@ -579,7 +590,8 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
 
         // Own-node RIP first (the source seed: 0/0, no TLVs, never poisoned), then the
         // ordered destination RIPs.
-        let mut rips: Vec<Inp3Rip> = Vec::with_capacity(dest_rips.len() + recently_withdrawn.len() + 1);
+        let mut rips: Vec<Inp3Rip> =
+            Vec::with_capacity(dest_rips.len() + recently_withdrawn.len() + 1);
         rips.push(Inp3Rip {
             destination: my_call,
             hop_count: 0,
@@ -849,11 +861,7 @@ impl<const MAX_DESTS: usize, const MAX_ROUTES: usize, const MAX_NBRS: usize>
     /// Delegates to the shared [`crate::netrom::forwarding::select_inp3_next_hop`] over the
     /// destination's kept routes (gathered via [`Self::for_each_route`]), so forward +
     /// connect agree on the active INP3 next hop. `None` when no usable INP3 route exists.
-    pub fn inp3_next_hop_excluding(
-        &self,
-        dest: &Callsign,
-        exclude: &Callsign,
-    ) -> Option<Callsign> {
+    pub fn inp3_next_hop_excluding(&self, dest: &Callsign, exclude: &Callsign) -> Option<Callsign> {
         let mut routes: alloc::vec::Vec<NetRomRoute> = alloc::vec::Vec::new();
         self.for_each_route(dest, |route| routes.push(route));
         crate::netrom::forwarding::select_inp3_next_hop(&routes, exclude)
@@ -1379,7 +1387,12 @@ mod inp3_tests {
         }
     }
 
-    fn rip_alias_of(destination: Callsign, hop_count: u8, target_time_ms: u32, alias: &str) -> Inp3Rip {
+    fn rip_alias_of(
+        destination: Callsign,
+        hop_count: u8,
+        target_time_ms: u32,
+        alias: &str,
+    ) -> Inp3Rip {
         Inp3Rip {
             destination,
             hop_count,
@@ -1394,10 +1407,7 @@ mod inp3_tests {
 
     // A NODES quality route: build a frame and parse it back so we exercise the real
     // codec, mirroring the C# `Nodes(...)` test helper.
-    fn nodes(
-        sender_alias: &str,
-        entries: &[(Callsign, &str, Callsign, u8)],
-    ) -> NodesBroadcast {
+    fn nodes(sender_alias: &str, entries: &[(Callsign, &str, Callsign, u8)]) -> NodesBroadcast {
         let adv: Vec<NodesAdvertisementEntry> = entries
             .iter()
             .map(|(dest, alias, via, q)| NodesAdvertisementEntry {
@@ -1462,58 +1472,125 @@ mod inp3_tests {
     #[test]
     fn a_pure_inp3_route_has_quality_zero_so_it_is_invisible_to_the_quality_path() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let route = route_via(&table, dest_sot(), nbr_a()).unwrap();
-        assert_eq!(route.quality, 0, "a route known only via INP3 carries no NODES quality");
+        assert_eq!(
+            route.quality, 0,
+            "a route known only via INP3 carries no NODES quality"
+        );
         assert!(route.inp3.is_some());
     }
 
     #[test]
     fn re_ingesting_the_same_dest_via_the_same_neighbour_refreshes_the_metric_in_place() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 300)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 300)]),
+            HOP_LIMIT,
+        );
 
         let routes = routes_of(&table, dest_sot());
-        assert_eq!(routes.len(), 1, "the same (dest, via) is one route, refreshed not duplicated");
+        assert_eq!(
+            routes.len(),
+            1,
+            "the same (dest, via) is one route, refreshed not duplicated"
+        );
         assert_eq!(routes[0].inp3.unwrap().target_time_ms, 300 + 50 + 10);
     }
 
     #[test]
     fn local_target_time_is_peer_time_plus_link_sntt_plus_ten_ms_per_hop() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 75, &rif(vec![rip(dest_sot(), 2, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            75,
+            &rif(vec![rip(dest_sot(), 2, 100)]),
+            HOP_LIMIT,
+        );
 
         let route = route_via(&table, dest_sot(), nbr_a()).unwrap();
         assert_eq!(route.inp3.unwrap().target_time_ms, 100 + 75 + 10);
-        assert_eq!(route.inp3.unwrap().hop_count, 3, "one more hop — through us");
+        assert_eq!(
+            route.inp3.unwrap().hop_count,
+            3,
+            "one more hop - through us"
+        );
     }
 
     #[test]
     fn per_hop_increment_keeps_target_time_strictly_increasing_across_a_zero_ms_link() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 0, &rif(vec![rip(dest_sot(), 0, 0)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            0,
+            &rif(vec![rip(dest_sot(), 0, 0)]),
+            HOP_LIMIT,
+        );
 
         let route = route_via(&table, dest_sot(), nbr_a()).unwrap();
-        assert_eq!(route.inp3.unwrap().target_time_ms, 10, "the +10 per-hop floor keeps it > 0");
+        assert_eq!(
+            route.inp3.unwrap().target_time_ms,
+            10,
+            "the +10 per-hop floor keeps it > 0"
+        );
         assert_eq!(route.inp3.unwrap().hop_count, 1);
     }
 
     #[test]
     fn full_millisecond_precision_is_kept_not_requantised_to_the_ten_ms_granule() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 73, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            73,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let route = route_via(&table, dest_sot(), nbr_a()).unwrap();
-        assert_eq!(route.inp3.unwrap().target_time_ms, 183, "100 + 73 + 10, full ms");
+        assert_eq!(
+            route.inp3.unwrap().target_time_ms,
+            183,
+            "100 + 73 + 10, full ms"
+        );
     }
 
     #[test]
     fn best_inp3_route_per_destination_is_the_lowest_target_time() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 200, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 310
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 130
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            200,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 310
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 130
 
         let best = routes_of(&table, dest_sot())
             .into_iter()
@@ -1536,8 +1613,17 @@ mod inp3_tests {
     #[test]
     fn a_rip_at_or_over_the_horizon_is_a_withdrawal_clearing_the_inp3_metric() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        assert!(route_via(&table, dest_sot(), nbr_a()).unwrap().inp3.is_some());
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        assert!(route_via(&table, dest_sot(), nbr_a())
+            .unwrap()
+            .inp3
+            .is_some());
 
         table.ingest_rif(
             nbr_a(),
@@ -1547,14 +1633,26 @@ mod inp3_tests {
             HOP_LIMIT,
         );
 
-        assert!(route_via(&table, dest_sot(), nbr_a()).is_none(), "withdrawing the only metric removes the route");
-        assert!(!has_dest(&table, dest_sot()), "the destination left with no route is removed");
+        assert!(
+            route_via(&table, dest_sot(), nbr_a()).is_none(),
+            "withdrawing the only metric removes the route"
+        );
+        assert!(
+            !has_dest(&table, dest_sot()),
+            "the destination left with no route is removed"
+        );
     }
 
     #[test]
     fn a_computed_target_time_reaching_the_horizon_also_withdraws() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         // peer just under horizon, link SNTT pushes the computed value over it.
         table.ingest_rif(
@@ -1565,14 +1663,29 @@ mod inp3_tests {
             HOP_LIMIT,
         );
 
-        assert!(route_via(&table, dest_sot(), nbr_a()).is_none(), "100 + 599_990 + 10 ≥ 600_000 → withdrawn");
+        assert!(
+            route_via(&table, dest_sot(), nbr_a()).is_none(),
+            "100 + 599_990 + 10 ≥ 600_000 → withdrawn"
+        );
     }
 
     #[test]
     fn withdrawal_clears_only_the_inp3_metric_and_leaves_a_coexisting_quality_route() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         let both = route_via(&table, dest_sot(), nbr_a()).unwrap();
         assert!(both.quality > 0);
         assert!(both.inp3.is_some());
@@ -1587,26 +1700,55 @@ mod inp3_tests {
 
         let after = route_via(&table, dest_sot(), nbr_a()).expect("the quality route survives");
         assert!(after.inp3.is_none(), "only the INP3 metric was withdrawn");
-        assert_eq!(after.quality, quality::combine(200, 192), "the quality metric is untouched");
+        assert_eq!(
+            after.quality,
+            quality::combine(200, 192),
+            "the quality metric is untouched"
+        );
     }
 
     #[test]
     fn an_unset_sntt_never_withdraws_a_route_it_never_learned() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
 
-        table.ingest_rif(nbr_a(), me(), SNTT_UNSET_RAW, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            SNTT_UNSET_RAW,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
-        let route = route_via(&table, dest_sot(), nbr_a()).expect("the quality route is undisturbed");
-        assert!(route.inp3.is_none(), "no time-route learned (link cost unknown)");
+        let route =
+            route_via(&table, dest_sot(), nbr_a()).expect("the quality route is undisturbed");
+        assert!(
+            route.inp3.is_none(),
+            "no time-route learned (link cost unknown)"
+        );
         assert!(route.quality > 0, "the quality route is intact");
     }
 
     #[test]
     fn a_horizon_rip_withdraws_even_when_the_link_is_unmeasured() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        assert!(route_via(&table, dest_sot(), nbr_a()).unwrap().inp3.is_some());
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        assert!(route_via(&table, dest_sot(), nbr_a())
+            .unwrap()
+            .inp3
+            .is_some());
 
         table.ingest_rif(
             nbr_a(),
@@ -1616,7 +1758,10 @@ mod inp3_tests {
             HOP_LIMIT,
         );
 
-        assert!(route_via(&table, dest_sot(), nbr_a()).is_none(), "explicit horizon RIP withdraws regardless of SNTT");
+        assert!(
+            route_via(&table, dest_sot(), nbr_a()).is_none(),
+            "explicit horizon RIP withdraws regardless of SNTT"
+        );
     }
 
     // ─── Hop limit ───
@@ -1625,7 +1770,10 @@ mod inp3_tests {
     fn a_rip_whose_local_hop_count_exceeds_the_hop_limit_is_not_learned() {
         let mut table = Table::with_defaults();
         table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 5, 100)]), 5);
-        assert!(route_via(&table, dest_sot(), nbr_a()).is_none(), "local hop 6 > hopLimit 5");
+        assert!(
+            route_via(&table, dest_sot(), nbr_a()).is_none(),
+            "local hop 6 > hopLimit 5"
+        );
     }
 
     #[test]
@@ -1640,11 +1788,29 @@ mod inp3_tests {
     fn the_default_hop_limit_is_thirty() {
         assert_eq!(Table::DEFAULT_HOP_LIMIT, 30);
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 29, 100)]), HOP_LIMIT);
-        table.ingest_rif(nbr_b(), me(), 50, &rif(vec![rip(dest_mnc(), 30, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 29, 100)]),
+            HOP_LIMIT,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            50,
+            &rif(vec![rip(dest_mnc(), 30, 100)]),
+            HOP_LIMIT,
+        );
 
-        assert!(route_via(&table, dest_sot(), nbr_a()).is_some(), "30 hops within the default limit");
-        assert!(route_via(&table, dest_mnc(), nbr_b()).is_none(), "31 hops exceeds the default limit");
+        assert!(
+            route_via(&table, dest_sot(), nbr_a()).is_some(),
+            "30 hops within the default limit"
+        );
+        assert!(
+            route_via(&table, dest_mnc(), nbr_b()).is_none(),
+            "31 hops exceeds the default limit"
+        );
     }
 
     // ─── Trivial-loop guard ───
@@ -1653,7 +1819,10 @@ mod inp3_tests {
     fn a_rip_whose_destination_is_us_is_skipped() {
         let mut table = Table::with_defaults();
         table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(me(), 1, 100)]), HOP_LIMIT);
-        assert!(!has_dest(&table, me()), "a route to ourselves is never learned");
+        assert!(
+            !has_dest(&table, me()),
+            "a route to ourselves is never learned"
+        );
     }
 
     // ─── Route cap ───
@@ -1679,13 +1848,29 @@ mod inp3_tests {
     fn an_inp3_only_route_is_evicted_in_favour_of_a_quality_route_when_capped() {
         // Per-destination cap of 1.
         let mut table: NetRomRoutingTable<16, 1, 16> = NetRomRoutingTable::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
-        table.ingest_rif(nbr_b(), me(), 10, &rif(vec![rip(dest_sot(), 1, 1)]), HOP_LIMIT);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            10,
+            &rif(vec![rip(dest_sot(), 1, 1)]),
+            HOP_LIMIT,
+        );
 
         let mut routes = Vec::new();
         table.for_each_route(&dest_sot(), |r| routes.push(r));
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].neighbour, nbr_a(), "the quality route is kept; the INP3-only (q0) route is evicted");
+        assert_eq!(
+            routes[0].neighbour,
+            nbr_a(),
+            "the quality route is kept; the INP3-only (q0) route is evicted"
+        );
     }
 
     // ─── Coexistence with quality routes ───
@@ -1693,17 +1878,32 @@ mod inp3_tests {
     #[test]
     fn inp3_ingestion_attaches_a_time_metric_to_an_existing_quality_route_without_disturbing_it() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
         let quality_only = route_via(&table, dest_sot(), nbr_a()).unwrap();
         assert!(quality_only.inp3.is_none());
         let q = quality_only.quality;
         let obs = quality_only.obsolescence;
 
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let both = route_via(&table, dest_sot(), nbr_a()).unwrap();
         assert_eq!(both.quality, q, "the quality metric is untouched");
-        assert_eq!(both.obsolescence, obs, "the obsolescence of the quality route is untouched");
+        assert_eq!(
+            both.obsolescence, obs,
+            "the obsolescence of the quality route is untouched"
+        );
         assert!(both.inp3.is_some());
         assert_eq!(both.inp3.unwrap().target_time_ms, 160);
     }
@@ -1711,26 +1911,70 @@ mod inp3_tests {
     #[test]
     fn a_nodes_refresh_does_not_wipe_a_coexisting_inp3_metric() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        assert!(route_via(&table, dest_sot(), nbr_a()).unwrap().inp3.is_some());
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        assert!(route_via(&table, dest_sot(), nbr_a())
+            .unwrap()
+            .inp3
+            .is_some());
 
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 100)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 100)]),
+            0,
+        );
 
         let route = route_via(&table, dest_sot(), nbr_a()).unwrap();
-        assert!(route.inp3.is_some(), "a NODES quality refresh must not wipe the time-route");
+        assert!(
+            route.inp3.is_some(),
+            "a NODES quality refresh must not wipe the time-route"
+        );
         assert_eq!(route.inp3.unwrap().target_time_ms, 160);
-        assert_eq!(route.quality, quality::combine(100, 192), "the quality is the refreshed value");
+        assert_eq!(
+            route.quality,
+            quality::combine(100, 192),
+            "the quality is the refreshed value"
+        );
     }
 
     #[test]
     fn a_quality_route_and_a_distinct_time_route_coexist_under_one_destination() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let routes = routes_of(&table, dest_sot());
-        assert_eq!(routes.len(), 2, "one route per next-hop neighbour, two distinct metric carriers");
+        assert_eq!(
+            routes.len(),
+            2,
+            "one route per next-hop neighbour, two distinct metric carriers"
+        );
         let a = routes.iter().find(|r| r.neighbour == nbr_a()).unwrap();
         let b = routes.iter().find(|r| r.neighbour == nbr_b()).unwrap();
         assert!(a.inp3.is_none(), "the NbrA route is quality-only");
@@ -1742,7 +1986,11 @@ mod inp3_tests {
     // ─────────────────────────── Inp3BuildRifTests ──────────────────────────
 
     fn rip_for(rif: &Inp3Rif, dest: Callsign) -> Inp3Rip {
-        rif.rips.iter().find(|r| r.destination == dest).cloned().expect("RIP present for dest")
+        rif.rips
+            .iter()
+            .find(|r| r.destination == dest)
+            .cloned()
+            .expect("RIP present for dest")
     }
 
     #[test]
@@ -1750,7 +1998,11 @@ mod inp3_tests {
         let table = Table::with_defaults();
         let rif = table.build_rif(me(), nbr_a(), &[]);
 
-        assert_eq!(rif.rips.len(), 1, "an empty table advertises only our own-node source RIP");
+        assert_eq!(
+            rif.rips.len(),
+            1,
+            "an empty table advertises only our own-node source RIP"
+        );
         let own = &rif.rips[0];
         assert_eq!(own.destination, me());
         assert_eq!(own.target_time_ms, 0);
@@ -1762,26 +2014,55 @@ mod inp3_tests {
     #[test]
     fn own_node_rip_is_always_first_and_is_zero_zero_regardless_of_table_state() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_mnc(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_mnc(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         for toward in [nbr_a(), nbr_b()] {
             let rif = table.build_rif(me(), toward, &[]);
-            assert_eq!(rif.rips[0].destination, me(), "the own-node RIP is always first");
+            assert_eq!(
+                rif.rips[0].destination,
+                me(),
+                "the own-node RIP is always first"
+            );
             assert_eq!(rif.rips[0].target_time_ms, 0);
             assert_eq!(rif.rips[0].hop_count, 0);
-            assert_eq!(rif.rips.iter().filter(|r| r.destination == me()).count(), 1, "exactly one own-node RIP");
+            assert_eq!(
+                rif.rips.iter().filter(|r| r.destination == me()).count(),
+                1,
+                "exactly one own-node RIP"
+            );
         }
     }
 
     #[test]
     fn a_rif_built_toward_us_never_poisons_our_own_node() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let rif = table.build_rif(me(), me(), &[]);
         let own = rif.rips.iter().find(|r| r.destination == me()).unwrap();
-        assert_eq!(own.target_time_ms, 0, "our own node is exempt from poison-reverse — always 0/0");
+        assert_eq!(
+            own.target_time_ms, 0,
+            "our own node is exempt from poison-reverse - always 0/0"
+        );
         assert!(!own.is_horizon());
     }
 
@@ -1789,13 +2070,25 @@ mod inp3_tests {
     fn each_selected_inp3_route_becomes_one_destination_rip_at_its_quantised_target_time() {
         let mut table = Table::with_defaults();
         // 100 + 73 + 10 = 183 stored; emitted floored to the 10 ms granule → 180.
-        table.ingest_rif(nbr_a(), me(), 73, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            73,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let rif = table.build_rif(me(), nbr_b(), &[]); // toward a DIFFERENT neighbour → no poison
 
         let r = rip_for(&rif, dest_sot());
-        assert_eq!(r.target_time_ms, 180, "183 stored, quantised to the 10 ms granule");
-        assert_eq!(r.hop_count, 2, "the selected route's local hop count (peer 1 + 1 through us)");
+        assert_eq!(
+            r.target_time_ms, 180,
+            "183 stored, quantised to the 10 ms granule"
+        );
+        assert_eq!(
+            r.hop_count, 2,
+            "the selected route's local hop count (peer 1 + 1 through us)"
+        );
         assert!(r.tlvs.is_empty(), "no alias TLV (gated off)");
         assert!(!r.is_horizon());
     }
@@ -1803,61 +2096,140 @@ mod inp3_tests {
     #[test]
     fn a_quality_only_destination_is_not_in_the_rif() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
 
         let rif = table.build_rif(me(), nbr_b(), &[]);
-        assert_eq!(rif.rips.len(), 1, "only the own-node RIP — the quality-only dest is carried by NODES");
+        assert_eq!(
+            rif.rips.len(),
+            1,
+            "only the own-node RIP - the quality-only dest is carried by NODES"
+        );
         assert_eq!(rif.rips[0].destination, me());
     }
 
     #[test]
-    fn destination_rips_are_ordered_by_ascending_target_time_then_callsign_after_the_own_node_rip() {
+    fn destination_rips_are_ordered_by_ascending_target_time_then_callsign_after_the_own_node_rip()
+    {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 200, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 310
-        table.ingest_rif(nbr_a(), me(), 20, &rif(vec![rip(dest_mnc(), 1, 100)]), HOP_LIMIT); // 130
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            200,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 310
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            20,
+            &rif(vec![rip(dest_mnc(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 130
 
         let rif = table.build_rif(me(), nbr_b(), &[]);
         assert_eq!(rif.rips[0].destination, me(), "own-node RIP first");
-        assert_eq!(rif.rips[1].destination, dest_mnc(), "then the lowest target time (130)");
-        assert_eq!(rif.rips[2].destination, dest_sot(), "then the slower one (310)");
+        assert_eq!(
+            rif.rips[1].destination,
+            dest_mnc(),
+            "then the lowest target time (130)"
+        );
+        assert_eq!(
+            rif.rips[2].destination,
+            dest_sot(),
+            "then the slower one (310)"
+        );
     }
 
     #[test]
     fn a_dest_via_n_is_poisoned_at_the_horizon_in_the_rif_toward_n() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let toward_a = table.build_rif(me(), nbr_a(), &[]);
         let r = rip_for(&toward_a, dest_sot());
-        assert_eq!(r.target_time_ms, Inp3Rip::HORIZON_MS, "SOT is via NbrA — poison it back at the horizon");
+        assert_eq!(
+            r.target_time_ms,
+            Inp3Rip::HORIZON_MS,
+            "SOT is via NbrA - poison it back at the horizon"
+        );
         assert!(r.is_horizon());
     }
 
     #[test]
     fn the_same_dest_is_finite_in_the_rif_toward_a_different_neighbour() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         let toward_a = table.build_rif(me(), nbr_a(), &[]);
         let toward_b = table.build_rif(me(), nbr_b(), &[]);
 
-        assert_eq!(rip_for(&toward_a, dest_sot()).target_time_ms, Inp3Rip::HORIZON_MS, "poisoned toward its own next hop");
-        assert_eq!(rip_for(&toward_b, dest_sot()).target_time_ms, 160, "advertised at its real time (100+50+10)");
+        assert_eq!(
+            rip_for(&toward_a, dest_sot()).target_time_ms,
+            Inp3Rip::HORIZON_MS,
+            "poisoned toward its own next hop"
+        );
+        assert_eq!(
+            rip_for(&toward_b, dest_sot()).target_time_ms,
+            160,
+            "advertised at its real time (100+50+10)"
+        );
         assert!(!rip_for(&toward_b, dest_sot()).is_horizon());
     }
 
     #[test]
     fn poison_reverse_covers_every_kept_next_hop_not_just_the_best() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 200, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 310 via NbrA
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 130 via NbrB
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            200,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 310 via NbrA
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 130 via NbrB
 
-        assert!(rip_for(&table.build_rif(me(), nbr_a(), &[]), dest_sot()).is_horizon(), "poison toward NbrA");
-        assert!(rip_for(&table.build_rif(me(), nbr_b(), &[]), dest_sot()).is_horizon(), "poison toward NbrB too");
+        assert!(
+            rip_for(&table.build_rif(me(), nbr_a(), &[]), dest_sot()).is_horizon(),
+            "poison toward NbrA"
+        );
+        assert!(
+            rip_for(&table.build_rif(me(), nbr_b(), &[]), dest_sot()).is_horizon(),
+            "poison toward NbrB too"
+        );
 
         let r = rip_for(&table.build_rif(me(), cs("GB7ZZZ"), &[]), dest_sot());
-        assert!(!r.is_horizon(), "toward a non-next-hop neighbour, SOT is advertised finite");
-        assert_eq!(r.target_time_ms, 130, "at the best (lowest) INP3 target time we hold");
+        assert!(
+            !r.is_horizon(),
+            "toward a non-next-hop neighbour, SOT is advertised finite"
+        );
+        assert_eq!(
+            r.target_time_ms, 130,
+            "at the best (lowest) INP3 target time we hold"
+        );
     }
 
     #[test]
@@ -1880,9 +2252,15 @@ mod inp3_tests {
                     assert!(!r.is_horizon(), "the own-node RIP is never poisoned");
                     continue;
                 }
-                let via_toward = routes_of(&table, r.destination).iter().any(|x| x.neighbour == toward);
+                let via_toward = routes_of(&table, r.destination)
+                    .iter()
+                    .any(|x| x.neighbour == toward);
                 if via_toward {
-                    assert_eq!(r.target_time_ms, Inp3Rip::HORIZON_MS, "via the target — must be poisoned");
+                    assert_eq!(
+                        r.target_time_ms,
+                        Inp3Rip::HORIZON_MS,
+                        "via the target - must be poisoned"
+                    );
                 } else {
                     assert!(!r.is_horizon(), "not via the target — must be finite");
                 }
@@ -1893,13 +2271,22 @@ mod inp3_tests {
     #[test]
     fn a_held_inp3_route_is_advertised_regardless_of_the_forwarding_preference() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT); // 160 via NbrA
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        ); // 160 via NbrA
 
         let rif = table.build_rif(me(), nbr_b(), &[]); // toward a different neighbour → finite
         let r = rip_for(&rif, dest_sot());
         assert_eq!(r.destination, dest_sot());
         assert!(!r.is_horizon());
-        assert_eq!(r.target_time_ms, 160, "the held INP3 route is advertised at its target time");
+        assert_eq!(
+            r.target_time_ms, 160,
+            "the held INP3 route is advertised at its target time"
+        );
     }
 
     // ─────────────────────── Inp3RecentlyWithdrawnTests ─────────────────────
@@ -1907,8 +2294,17 @@ mod inp3_tests {
     #[test]
     fn ingesting_a_horizon_rip_withdraws_the_last_inp3_route_and_records_it() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        assert!(table.recently_withdrawn().is_empty(), "learning a route is not a withdrawal");
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "learning a route is not a withdrawal"
+        );
 
         table.ingest_rif(
             nbr_a(),
@@ -1918,48 +2314,99 @@ mod inp3_tests {
             HOP_LIMIT,
         );
 
-        assert_eq!(table.recently_withdrawn(), vec![dest_sot()], "SOT lost its last INP3 route at the horizon");
+        assert_eq!(
+            table.recently_withdrawn(),
+            vec![dest_sot()],
+            "SOT lost its last INP3 route at the horizon"
+        );
     }
 
     #[test]
     fn mark_neighbour_down_records_a_destination_that_loses_its_last_inp3_route() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         table.mark_neighbour_down(&nbr_a());
 
-        assert_eq!(table.recently_withdrawn(), vec![dest_sot()], "dropping NbrA removed SOT's only INP3 route");
+        assert_eq!(
+            table.recently_withdrawn(),
+            vec![dest_sot()],
+            "dropping NbrA removed SOT's only INP3 route"
+        );
     }
 
     #[test]
     fn sweep_records_a_destination_whose_last_inp3_route_ages_out() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         // OBSINIT default is 6 → sweep it down to 0 to purge the route.
         for _ in 0..6 {
             table.sweep();
         }
 
-        assert_eq!(table.recently_withdrawn(), vec![dest_sot()], "SOT's only INP3 route aged out");
+        assert_eq!(
+            table.recently_withdrawn(),
+            vec![dest_sot()],
+            "SOT's only INP3 route aged out"
+        );
     }
 
     #[test]
     fn a_destination_that_keeps_another_inp3_route_is_not_withdrawn() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         table.mark_neighbour_down(&nbr_a());
 
-        assert!(table.recently_withdrawn().is_empty(), "SOT still has an INP3 route via NbrB");
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "SOT still has an INP3 route via NbrB"
+        );
     }
 
     #[test]
     fn withdrawing_one_route_when_another_inp3_route_survives_does_not_record() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         table.ingest_rif(
             nbr_a(),
@@ -1969,36 +2416,69 @@ mod inp3_tests {
             HOP_LIMIT,
         );
 
-        assert!(table.recently_withdrawn().is_empty(), "an INP3 route to SOT still exists via NbrB");
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "an INP3 route to SOT still exists via NbrB"
+        );
     }
 
     #[test]
     fn a_quality_only_mark_neighbour_down_never_populates_the_set() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
 
         table.mark_neighbour_down(&nbr_a());
 
-        assert!(table.recently_withdrawn().is_empty(), "a quality-only neighbour-down must never touch the set");
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "a quality-only neighbour-down must never touch the set"
+        );
     }
 
     #[test]
     fn a_quality_only_sweep_never_populates_the_set() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
 
         for _ in 0..10 {
             table.sweep();
         }
 
-        assert!(table.recently_withdrawn().is_empty(), "a quality-only sweep must never touch the set");
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "a quality-only sweep must never touch the set"
+        );
     }
 
     #[test]
     fn a_route_that_keeps_its_quality_after_inp3_withdrawal_is_still_recorded() {
         let mut table = Table::with_defaults();
-        table.ingest(nbr_a(), me(), port(), &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]), 0);
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest(
+            nbr_a(),
+            me(),
+            port(),
+            &nodes("RDG", &[(dest_sot(), "SOT", nbr_a(), 200)]),
+            0,
+        );
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         table.ingest_rif(
             nbr_a(),
@@ -2009,105 +2489,225 @@ mod inp3_tests {
         );
 
         assert_eq!(table.recently_withdrawn(), vec![dest_sot()]);
-        assert!(has_dest(&table, dest_sot()), "the quality route survives — SOT still reachable by NODES");
+        assert!(
+            has_dest(&table, dest_sot()),
+            "the quality route survives - SOT still reachable by NODES"
+        );
     }
 
     #[test]
     fn build_rif_emits_one_horizon_rip_for_each_withdrawn_destination_in_the_snapshot() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a()); // SOT withdrawn
 
         let snapshot = table.recently_withdrawn();
         let rif = table.build_rif(me(), nbr_b(), &snapshot);
 
-        let sot_rips: Vec<&Inp3Rip> = rif.rips.iter().filter(|r| r.destination == dest_sot()).collect();
+        let sot_rips: Vec<&Inp3Rip> = rif
+            .rips
+            .iter()
+            .filter(|r| r.destination == dest_sot())
+            .collect();
         assert_eq!(sot_rips.len(), 1);
-        assert_eq!(sot_rips[0].target_time_ms, Inp3Rip::HORIZON_MS, "an explicit one-shot horizon withdrawal");
+        assert_eq!(
+            sot_rips[0].target_time_ms,
+            Inp3Rip::HORIZON_MS,
+            "an explicit one-shot horizon withdrawal"
+        );
         assert!(sot_rips[0].is_horizon());
     }
 
     #[test]
     fn build_rif_with_no_snapshot_omits_withdrawals() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
 
         let rif = table.build_rif(me(), nbr_b(), &[]);
-        assert!(!rif.rips.iter().any(|r| r.destination == dest_sot()), "no snapshot ⇒ no horizon withdrawals");
-        assert_eq!(table.recently_withdrawn().len(), 1, "build_rif does not consume the set — only the drain does");
+        assert!(
+            !rif.rips.iter().any(|r| r.destination == dest_sot()),
+            "no snapshot ⇒ no horizon withdrawals"
+        );
+        assert_eq!(
+            table.recently_withdrawn().len(),
+            1,
+            "build_rif does not consume the set - only the drain does"
+        );
     }
 
     #[test]
     fn the_drained_snapshot_carries_the_withdrawal_to_every_neighbour() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
 
         let snapshot = table.drain_recently_withdrawn();
         let toward_b = table.build_rif(me(), nbr_b(), &snapshot);
         let toward_c = table.build_rif(me(), cs("GB7ZZZ"), &snapshot);
 
-        assert!(toward_b.rips.iter().find(|r| r.destination == dest_sot()).unwrap().is_horizon());
-        assert!(toward_c.rips.iter().find(|r| r.destination == dest_sot()).unwrap().is_horizon());
-        assert!(table.recently_withdrawn().is_empty(), "the drain cleared the live set atomically");
+        assert!(toward_b
+            .rips
+            .iter()
+            .find(|r| r.destination == dest_sot())
+            .unwrap()
+            .is_horizon());
+        assert!(toward_c
+            .rips
+            .iter()
+            .find(|r| r.destination == dest_sot())
+            .unwrap()
+            .is_horizon());
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "the drain cleared the live set atomically"
+        );
     }
 
     #[test]
     fn drain_recently_withdrawn_returns_then_empties_so_a_later_rif_omits_the_withdrawal() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
 
         let drained = table.drain_recently_withdrawn();
         assert_eq!(drained, vec![dest_sot()], "the drain returns the snapshot");
-        assert!(table.build_rif(me(), nbr_b(), &drained).rips.iter().any(|r| r.destination == dest_sot()), "the round carries it once");
+        assert!(
+            table
+                .build_rif(me(), nbr_b(), &drained)
+                .rips
+                .iter()
+                .any(|r| r.destination == dest_sot()),
+            "the round carries it once"
+        );
 
-        assert!(table.recently_withdrawn().is_empty(), "the drain cleared the set");
+        assert!(
+            table.recently_withdrawn().is_empty(),
+            "the drain cleared the set"
+        );
         let empty = table.drain_recently_withdrawn();
-        assert!(!table.build_rif(me(), nbr_b(), &empty).rips.iter().any(|r| r.destination == dest_sot()), "absent after the drain");
+        assert!(
+            !table
+                .build_rif(me(), nbr_b(), &empty)
+                .rips
+                .iter()
+                .any(|r| r.destination == dest_sot()),
+            "absent after the drain"
+        );
     }
 
     #[test]
     fn a_re_learned_destination_is_carried_finite_not_poisoned_in_the_same_round() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
         assert!(table.recently_withdrawn().contains(&dest_sot()));
 
         // Re-learned via NbrB in the SAME round (before the host drains).
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
 
         // Toward NbrA: SOT is NOT via NbrA anymore → finite, not poisoned.
         let snapshot = table.recently_withdrawn();
         let rif = table.build_rif(me(), nbr_a(), &snapshot);
-        let sot_rips: Vec<&Inp3Rip> = rif.rips.iter().filter(|r| r.destination == dest_sot()).collect();
-        assert_eq!(sot_rips.len(), 1, "exactly one RIP for SOT — finite, not both finite + horizon");
-        assert!(!sot_rips[0].is_horizon(), "re-learned finite — carried by its real metric");
+        let sot_rips: Vec<&Inp3Rip> = rif
+            .rips
+            .iter()
+            .filter(|r| r.destination == dest_sot())
+            .collect();
+        assert_eq!(
+            sot_rips.len(),
+            1,
+            "exactly one RIP for SOT - finite, not both finite + horizon"
+        );
+        assert!(
+            !sot_rips[0].is_horizon(),
+            "re-learned finite - carried by its real metric"
+        );
         assert_eq!(sot_rips[0].target_time_ms, 130, "100 + 20 + 10, quantised");
     }
 
     #[test]
     fn the_own_node_is_never_emitted_as_a_withdrawal() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
 
         let snapshot = table.recently_withdrawn();
         let rif = table.build_rif(me(), nbr_b(), &snapshot);
-        assert!(!rif.rips.iter().find(|r| r.destination == me()).unwrap().is_horizon(), "our own node is never withdrawn");
+        assert!(
+            !rif.rips
+                .iter()
+                .find(|r| r.destination == me())
+                .unwrap()
+                .is_horizon(),
+            "our own node is never withdrawn"
+        );
         assert_eq!(rif.rips[0].destination, me(), "own-node RIP first, at 0/0");
     }
 
     #[test]
     fn re_withdrawing_after_a_drain_re_populates_the_set() {
         let mut table = Table::with_defaults();
-        table.ingest_rif(nbr_a(), me(), 50, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_a(),
+            me(),
+            50,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_a());
         table.drain_recently_withdrawn();
         assert!(table.recently_withdrawn().is_empty());
 
-        table.ingest_rif(nbr_b(), me(), 20, &rif(vec![rip(dest_sot(), 1, 100)]), HOP_LIMIT);
+        table.ingest_rif(
+            nbr_b(),
+            me(),
+            20,
+            &rif(vec![rip(dest_sot(), 1, 100)]),
+            HOP_LIMIT,
+        );
         table.mark_neighbour_down(&nbr_b());
 
         assert_eq!(table.recently_withdrawn(), vec![dest_sot()]);

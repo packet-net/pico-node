@@ -10,6 +10,14 @@
 # Embassy targets stable Rust (no nightly needed for the RP2040 path).
 
 [toolchain]
-channel = "stable"
-components = ["rust-src", "llvm-tools"]
+# Pinned (was floating "stable") to the same 1.93.1 the rest of CI runs, per
+# the repo rule: pin the toolchain the suite was last green on, bump
+# deliberately. Floating stable meant each new clippy release could break the
+# fw lint gate with lints nobody had seen locally.
+channel = "1.93.1"
+# clippy is listed so rustup provisions it for THIS resolved toolchain: this
+# file overrides the CI job's dtolnay-installed toolchain inside the crate
+# directory, so a clippy installed only there is invisible here (the fw clippy
+# gate found that out the hard way).
+components = ["rust-src", "llvm-tools", "clippy"]
 targets = ["thumbv6m-none-eabi"]

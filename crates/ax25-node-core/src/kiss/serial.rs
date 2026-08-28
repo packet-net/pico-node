@@ -64,8 +64,10 @@ pub trait ByteStream {
 /// see PLAN §5 / research §6 — so a single frame stays small.)
 pub const MAX_AX25_BODY: usize = 512;
 
-/// Outbound scratch buffer sized for the worst-case KISS escaping of [`MAX_AX25_BODY`].
-const OUT_BUF_LEN: usize = max_encoded_len(MAX_AX25_BODY);
+/// Outbound scratch buffer sized for the worst-case KISS escaping of the largest
+/// payload any send path stages: an ACKMODE frame carries [`MAX_AX25_BODY`] plus
+/// its 2-byte sequence tag.
+const OUT_BUF_LEN: usize = max_encoded_len(MAX_AX25_BODY + 2);
 
 /// A KISS modem over an arbitrary [`ByteStream`]. The serial-KISS transport, with
 /// the byte source abstracted so the framing/codec is host-testable.
@@ -106,6 +108,12 @@ impl<S: ByteStream> SerialKissModem<S> {
     /// `KissSerialModem.SendFrameAsync`. Returns the modem's `Error::TooLarge` if
     /// the body exceeds [`MAX_AX25_BODY`].
     pub async fn send_frame(&mut self, ax25_bytes: &[u8]) -> Result<(), ModemError<S::Error>> {
+        // Explicit bound: the shared encode buffer is sized for the ACKMODE
+        // worst case (body + 2 tag bytes), so a bare Data frame slightly over
+        // MAX_AX25_BODY would otherwise slip through it.
+        if ax25_bytes.len() > MAX_AX25_BODY {
+            return Err(ModemError::TooLarge);
+        }
         self.send_kiss(Command::Data, ax25_bytes).await
     }
 
@@ -497,5 +505,28 @@ mod tests {
         let mut modem = SerialKissModem::new(MemStream::new());
         let huge = vec![0u8; MAX_AX25_BODY + 1];
         assert_eq!(block_on(modem.send_frame(&huge)), Err(ModemError::TooLarge));
+    }
+
+    #[test]
+    fn ackmode_accepts_a_full_size_body() {
+        // Boundary regression: an ACKMODE payload is body + 2 tag bytes, so the
+        // encode buffer must cover max_encoded_len(MAX_AX25_BODY + 2). A body of
+        // exactly MAX_AX25_BODY was wrongly rejected TooLarge when the buffer was
+        // sized for the bare body.
+        let mut modem = SerialKissModem::new(MemStream::new());
+        let body = vec![0x42u8; MAX_AX25_BODY];
+        block_on(modem.send_ackmode(0x1234, &body)).unwrap();
+        let wire = modem.stream.take_written();
+        let mut d = Decoder::new();
+        let frames = d.push(&wire);
+        let (tag, decoded) = super::super::ackmode::try_parse_data_frame(&frames[0]).unwrap();
+        assert_eq!(tag, 0x1234);
+        assert_eq!(decoded, &body[..]);
+        // One past the boundary is still rejected.
+        let over = vec![0x42u8; MAX_AX25_BODY + 1];
+        assert_eq!(
+            block_on(modem.send_ackmode(0x1234, &over)),
+            Err(ModemError::TooLarge)
+        );
     }
 }

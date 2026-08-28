@@ -27,12 +27,21 @@ use alloc::vec::Vec;
 use super::circuit_options::NetRomCircuitOptions;
 use super::circuit_state::{NetRomCircuitCloseReason, NetRomCircuitState};
 use crate::ax25::Callsign;
-#[cfg(feature = "netrom-compress")]
-use crate::netrom::wire::{ConnectAckInfo, CONNECT_REQUEST_INFO_EXTENDED_LEN, FLAG_COMPRESSED};
 use crate::netrom::wire::{
-    ConnectRequestInfo, NetRomNetworkHeader, NetRomOpcode, NetRomPacket, NetRomTransportHeader,
-    FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK,
+    ConnectAckInfo, ConnectRequestInfo, NetRomNetworkHeader, NetRomOpcode, NetRomPacket,
+    NetRomTransportHeader, FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK,
 };
+#[cfg(feature = "netrom-compress")]
+use crate::netrom::wire::{CONNECT_REQUEST_INFO_EXTENDED_LEN, FLAG_COMPRESSED};
+
+/// The reassembly-buffer ceiling for one logical (more-follows) frame, matching
+/// the 8 KiB decompress cap (`compression::MAX_DECOMPRESSED_FRAME`) so the two
+/// bounds agree. A peer streaming endless in-sequence more-follows Information
+/// frames would otherwise grow `reassembly` without limit; on the Pico that is
+/// remote heap exhaustion (the alloc error handler aborts). Duplicated here
+/// (rather than referenced) because the compression module is feature-gated and
+/// this bound must hold on the default build.
+const MAX_REASSEMBLY_BYTES: usize = 8192;
 
 /// An outbound datagram the circuit wants shipped over its interlink. The owner
 /// encodes it ([`OutboundPacket::encode`]) into a PID-0xCF I-frame, routing by
@@ -341,12 +350,9 @@ impl NetRomCircuit {
         let t = packet.transport;
         match NetRomOpcode::from_nibble(t.opcode) {
             Some(NetRomOpcode::ConnectRequest) => self.on_connect_request(),
-            Some(NetRomOpcode::ConnectAcknowledge) => self.on_connect_acknowledge(
-                &t,
-                #[cfg(feature = "netrom-compress")]
-                packet.payload,
-                now_ms,
-            ),
+            Some(NetRomOpcode::ConnectAcknowledge) => {
+                self.on_connect_acknowledge(&t, packet.payload, now_ms)
+            }
             Some(NetRomOpcode::DisconnectRequest) => self.on_disconnect_request(),
             Some(NetRomOpcode::DisconnectAcknowledge) => self.on_disconnect_acknowledge(),
             Some(NetRomOpcode::Information) => self.on_information(&t, packet.payload, now_ms),
@@ -445,7 +451,7 @@ impl NetRomCircuit {
                 }
                 for u in &mut frames {
                     u.sent_at = now_ms;
-                    u.retries += 1;
+                    u.retries = u.retries.saturating_add(1);
                 }
                 self.unacked = frames;
             }
@@ -465,12 +471,7 @@ impl NetRomCircuit {
 
     // ─── FSM handlers ───────────────────────────────────────────────────
 
-    fn on_connect_acknowledge(
-        &mut self,
-        t: &NetRomTransportHeader,
-        #[cfg(feature = "netrom-compress")] info: &[u8],
-        now_ms: u64,
-    ) {
+    fn on_connect_acknowledge(&mut self, t: &NetRomTransportHeader, info: &[u8], now_ms: u64) {
         if self.state != NetRomCircuitState::Connecting {
             return;
         }
@@ -482,6 +483,17 @@ impl NetRomCircuit {
         if t.choke() {
             self.close(NetRomCircuitCloseReason::Refused);
             return;
+        }
+
+        // Window negotiation: our Connect Request proposed options.window_size; the
+        // far end replies with the window it ACCEPTED in info[0] (base NET/ROM:
+        // LinBPQ L4Code.c:2287 assigns L4WINDOW = L4DATA[0] unconditionally, Linux
+        // reads skb->data[20]). Clamp our send ceiling down to it: sending more than
+        // the peer agreed to hold overruns its receive queue. A terse peer that
+        // sends no info field (or an out-of-range octet) leaves our proposal
+        // standing.
+        if let Some(accepted) = ConnectAckInfo::try_read_accepted_window(info) {
+            self.window = self.window.min(accepted);
         }
 
         // Compression negotiation: enable only if WE offered (options.compression_enabled)
@@ -531,6 +543,17 @@ impl NetRomCircuit {
         if t.tx_sequence == self.vr {
             self.vr = self.vr.wrapping_add(1);
             if !payload.is_empty() {
+                // Bound the logical frame: a peer streaming endless in-sequence
+                // more-follows fragments must not grow the buffer without limit
+                // (remote heap exhaustion on the Pico). Past MAX_REASSEMBLY_BYTES
+                // the frame is unrecoverable, so tear the circuit down cleanly
+                // (disconnect is reachable here: we are Connected) rather than
+                // silently dropping and desynchronising the stream.
+                if self.reassembly.len() + payload.len() > MAX_REASSEMBLY_BYTES {
+                    self.reassembly.clear();
+                    self.disconnect(now_ms);
+                    return;
+                }
                 // Track whether this logical frame is a compressed stream. BPQ sets
                 // the Compressed flag on every fragment, so the FIRST fragment is
                 // authoritative; read it at the start of accumulation and hold it
@@ -648,21 +671,29 @@ impl NetRomCircuit {
             flags: if refused { FLAG_CHOKE } else { 0 },
         };
 
-        // Mirror the compression agreement back to the originator (LinBPQ extended
-        // Connect Acknowledge) only when compression was actually agreed; otherwise
-        // the canonical empty-info Connect Acknowledge is sent, so a non-compressing
-        // circuit is byte-for-byte vanilla NET/ROM.
-        #[cfg(feature = "netrom-compress")]
-        if !refused && self.compression_enabled {
-            if let Some(info) =
-                ConnectAckInfo::encode(self.window, self.options.time_to_live, true)
-            {
-                self.emit(t, &info);
-                return;
-            }
+        // A REFUSAL accepts nothing, so it carries no info field, matching Linux's
+        // nr_transmit_refusal (bare 20-byte frame); the originator closes on the
+        // choke bit before any window is read either way.
+        if refused {
+            self.emit(t, &[]);
+            return;
         }
 
-        self.emit(t, &[]);
+        // The ACCEPTED WINDOW is base NET/ROM and rides every acknowledgement, not
+        // just a compressed one: LinBPQ writes L4DATA[0] = L4WINDOW and sends
+        // LENGTH = MSGHDDRLEN + 22, a 21-byte vanilla Connect Acknowledge
+        // (L4Code.c:1768,1824), and reads it back unconditionally (:2287); Linux
+        // af_netrom emits nr->window with NR_CONNACK_LEN 1. A peer that never sees
+        // the octet reads buffer residue for our window (BPQ then chokes forever at
+        // 0, or overruns us on a large one), so we always tell it. The second (TTL)
+        // octet stays the BPQ extension, emitted only when compression was agreed.
+        #[cfg(feature = "netrom-compress")]
+        let agree_compression = self.compression_enabled;
+        #[cfg(not(feature = "netrom-compress"))]
+        let agree_compression = false;
+        let (info, len) =
+            ConnectAckInfo::encode(self.window, self.options.time_to_live, agree_compression);
+        self.emit(t, &info[..len]);
     }
 
     fn send_disconnect_request(&mut self) {
@@ -795,6 +826,18 @@ impl NetRomCircuit {
     }
 
     fn retransmit_from(&mut self, seq: u8, now_ms: u64) {
+        // Enforce the retry budget on this path too: every NAK-driven retransmit
+        // refreshes sent_at, so the tick-based timeout alone would never exhaust
+        // under a NAK storm; the storm would bump retries forever. Once any frame
+        // in the requested range is out of retries, fail the circuit with the same
+        // Timeout close the tick path uses.
+        if self.unacked.iter().any(|u| {
+            (u.sequence == seq || mod256_after(u.sequence, seq))
+                && u.retries >= self.options.max_retries
+        }) {
+            self.close(NetRomCircuitCloseReason::Timeout);
+            return;
+        }
         // Take the in-flight list out so each matching frame can be borrowed while
         // calling `&mut self.send_information`, then put it back with bumped timers
         // (behaviour-identical to the prior clone-into-tuple).
@@ -813,7 +856,7 @@ impl NetRomCircuit {
         for u in &mut frames {
             if u.sequence == seq || mod256_after(u.sequence, seq) {
                 u.sent_at = now_ms;
-                u.retries += 1;
+                u.retries = u.retries.saturating_add(1);
             }
         }
         self.unacked = frames;
@@ -981,6 +1024,219 @@ mod tests {
             .take_events()
             .contains(&CircuitEvent::Closed(NetRomCircuitCloseReason::Normal)));
     }
+
+    #[test]
+    fn a_vanilla_connect_acknowledge_is_21_bytes_carrying_the_accepted_window() {
+        // The accepted-window octet is base NET/ROM, not a compression extension:
+        // LinBPQ's SendConACK writes L4DATA[0] = L4WINDOW and sends
+        // LENGTH = MSGHDDRLEN + 22, a 21-byte vanilla ack (L4Code.c:1768,1824), and
+        // Linux emits nr->window with NR_CONNACK_LEN 1. Without it the peer reads
+        // buffer residue for our window.
+        let opts = NetRomCircuitOptions {
+            window_size: 4,
+            ..Default::default()
+        };
+        let mut b = NetRomCircuit::new(2, 9, cs(b"GB7BBB"), cs(b"GB7AAA"), opts);
+        b.accept_inbound(
+            7,
+            3,
+            7, // the originator proposed 7; our ceiling is 4
+            #[cfg(feature = "netrom-compress")]
+            false,
+        );
+
+        let out = b.take_outbox();
+        assert_eq!(out.len(), 1);
+        let ack = &out[0];
+        assert_eq!(
+            NetRomOpcode::from_nibble(ack.transport.opcode),
+            Some(NetRomOpcode::ConnectAcknowledge)
+        );
+        assert_eq!(
+            ack.payload.len(),
+            crate::netrom::wire::CONNECT_ACK_INFO_VANILLA_LEN,
+            "the vanilla ack carries the window octet and nothing else"
+        );
+        assert_eq!(
+            ack.payload[0], 4,
+            "the accepted window: our ceiling, below the proposed 7"
+        );
+        let mut buf = [0u8; 64];
+        let n = ack.encode(&mut buf).unwrap();
+        assert_eq!(n, 21, "20-byte NET/ROM header + the accepted-window octet");
+    }
+
+    /// Bring up an A->B pair through the real handshake (A index 1/id 7, B 2/9).
+    fn connected_pair(
+        opts_a: NetRomCircuitOptions,
+        opts_b: NetRomCircuitOptions,
+    ) -> (NetRomCircuit, NetRomCircuit) {
+        let (na, nb) = (cs(b"GB7AAA"), cs(b"GB7BBB"));
+        let now = 1000u64;
+        let mut a = NetRomCircuit::new(1, 7, na, nb, opts_a);
+        let mut b = NetRomCircuit::new(2, 9, nb, na, opts_b);
+        a.connect(cs(b"M0LTE"), now);
+        let creq = a.take_outbox().remove(0);
+        let cri = ConnectRequestInfo::decode(&creq.payload).unwrap();
+        b.accept_inbound(
+            creq.transport.circuit_index,
+            creq.transport.circuit_id,
+            cri.proposed_window,
+            #[cfg(feature = "netrom-compress")]
+            false,
+        );
+        deliver(&mut b, &mut a, now);
+        assert_eq!(a.state(), NetRomCircuitState::Connected);
+        (a, b)
+    }
+
+    #[test]
+    fn the_originator_clamps_its_send_window_to_the_accepted_window() {
+        // The other half of the negotiation: B's Connect Acknowledge reports the
+        // window it ACCEPTED (info[0]) and the originator must come down to it;
+        // sending more frames than the far end agreed to hold overruns its receive
+        // queue. LinBPQ does exactly this on receipt: L4->L4WINDOW =
+        // L3MSG->L4DATA[0] (L4Code.c:2287).
+        let (a, b) = connected_pair(
+            NetRomCircuitOptions {
+                window_size: 8,
+                ..Default::default()
+            },
+            NetRomCircuitOptions {
+                window_size: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(b.window(), 2, "B accepts at most its own ceiling");
+        assert_eq!(
+            a.window(),
+            2,
+            "the acknowledgement's window octet caps A's proposed 8"
+        );
+    }
+
+    /// An Information frame addressed to B's circuit (local key 2/9).
+    fn info_to_b(seq: u8, payload: &[u8], more_follows: bool) -> OutboundPacket {
+        OutboundPacket {
+            network: NetRomNetworkHeader {
+                origin: cs(b"GB7AAA"),
+                destination: cs(b"GB7BBB"),
+                time_to_live: 10,
+            },
+            transport: NetRomTransportHeader {
+                circuit_index: 2,
+                circuit_id: 9,
+                tx_sequence: seq,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::Information.as_u8(),
+                flags: if more_follows { FLAG_MORE_FOLLOWS } else { 0 },
+            },
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_endless_more_follows_stream_is_bounded_and_disconnects_the_circuit() {
+        // A peer that never clears more-follows would grow the reassembly buffer
+        // without limit; on the Pico that is remote heap exhaustion. Past the 8 KiB
+        // cap (matching the decompress cap) the circuit tears down cleanly.
+        let now = 1000u64;
+        let (_a, mut b) = connected_pair(
+            NetRomCircuitOptions::default(),
+            NetRomCircuitOptions::default(),
+        );
+
+        let chunk = [0x55u8; 236];
+        let mut seq = 0u8;
+        // 36 * 236 = 8496 > 8192, so the cap trips before the loop ends.
+        for _ in 0..36 {
+            let p = info_to_b(seq, &chunk, true);
+            let pkt = NetRomPacket {
+                network: p.network,
+                transport: p.transport,
+                payload: &p.payload,
+            };
+            b.on_packet(&pkt, now);
+            if b.state() != NetRomCircuitState::Connected {
+                break;
+            }
+            seq = seq.wrapping_add(1);
+        }
+
+        assert_eq!(
+            b.state(),
+            NetRomCircuitState::Disconnecting,
+            "the over-cap frame disconnects the circuit"
+        );
+        assert!(
+            b.reassembly.is_empty(),
+            "the oversized partial frame was released"
+        );
+        assert!(
+            b.take_outbox().iter().any(|p| {
+                NetRomOpcode::from_nibble(p.transport.opcode)
+                    == Some(NetRomOpcode::DisconnectRequest)
+            }),
+            "the peer is told, not silently dropped"
+        );
+        assert!(
+            !b.take_events()
+                .iter()
+                .any(|e| matches!(e, CircuitEvent::DataReceived(_))),
+            "nothing was delivered upward"
+        );
+    }
+
+    #[test]
+    fn a_nak_storm_exhausts_retries_and_fails_the_circuit_without_overflow() {
+        // Every NAK-driven retransmit refreshes sent_at, so the tick-based timeout
+        // never fires under a storm, and the u8 retries counter would eventually
+        // wrap (panic in debug). The NAK path must enforce the same retry budget as
+        // the tick path and close with Timeout.
+        let now = 1000u64;
+        let (mut a, _b) = connected_pair(
+            NetRomCircuitOptions {
+                max_retries: 3,
+                ..Default::default()
+            },
+            NetRomCircuitOptions::default(),
+        );
+        a.send(b"storm target", now);
+        let _ = a.take_outbox();
+
+        // A NAK for sequence 0, addressed to A's circuit (local key 1/7).
+        let nak = OutboundPacket {
+            network: NetRomNetworkHeader {
+                origin: cs(b"GB7BBB"),
+                destination: cs(b"GB7AAA"),
+                time_to_live: 10,
+            },
+            transport: NetRomTransportHeader {
+                circuit_index: 1,
+                circuit_id: 7,
+                tx_sequence: 0,
+                rx_sequence: 0,
+                opcode: NetRomOpcode::InformationAcknowledge.as_u8(),
+                flags: FLAG_NAK,
+            },
+            payload: Vec::new(),
+        };
+        for _ in 0..5 {
+            let pkt = NetRomPacket {
+                network: nak.network,
+                transport: nak.transport,
+                payload: &nak.payload,
+            };
+            a.on_packet(&pkt, now);
+        }
+
+        assert_eq!(a.state(), NetRomCircuitState::Disconnected);
+        assert!(
+            a.take_events()
+                .contains(&CircuitEvent::Closed(NetRomCircuitCloseReason::Timeout)),
+            "retry exhaustion on the NAK path fails the circuit as a timeout"
+        );
+    }
 }
 
 // ─── L4 compression (BPQ L4Compress) — negotiation + send/recv, feature-gated ───
@@ -1076,8 +1332,14 @@ mod compression_tests {
         let (a, b) = connected_pair(on(), on());
         assert_eq!(a.state(), NetRomCircuitState::Connected);
         assert_eq!(b.state(), NetRomCircuitState::Connected);
-        assert!(a.compression_negotiated(), "originator settled compression on");
-        assert!(b.compression_negotiated(), "acceptor settled compression on");
+        assert!(
+            a.compression_negotiated(),
+            "originator settled compression on"
+        );
+        assert!(
+            b.compression_negotiated(),
+            "acceptor settled compression on"
+        );
     }
 
     #[test]
@@ -1098,9 +1360,11 @@ mod compression_tests {
         );
         let cack = b.take_outbox();
         assert_eq!(cack.len(), 1);
-        assert!(
-            cack[0].payload.is_empty(),
-            "a declining Connect Acknowledge is the vanilla empty-info form"
+        assert_eq!(
+            cack[0].payload.len(),
+            crate::netrom::wire::CONNECT_ACK_INFO_VANILLA_LEN,
+            "a declining Connect Acknowledge is the vanilla one-octet form: the base \
+             NET/ROM accepted-window octet and no BPQ TTL/compress extension"
         );
         assert!(!ConnectAckInfo::agrees_compression(&cack[0].payload));
         feed(&cack, &mut a);
@@ -1165,9 +1429,16 @@ mod compression_tests {
                 NetRomOpcode::from_nibble(f.transport.opcode),
                 Some(NetRomOpcode::Information)
             );
-            assert!(f.transport.compressed(), "fragment {i} lacks the Compressed flag");
+            assert!(
+                f.transport.compressed(),
+                "fragment {i} lacks the Compressed flag"
+            );
             let last = i == frames.len() - 1;
-            assert_eq!(f.transport.more_follows(), !last, "more-follows on fragment {i}");
+            assert_eq!(
+                f.transport.more_follows(),
+                !last,
+                "more-follows on fragment {i}"
+            );
         }
 
         feed(&frames, &mut b);
@@ -1180,7 +1451,10 @@ mod compression_tests {
             })
             .collect();
         assert_eq!(received.len(), 1, "reassembled to a single logical frame");
-        assert_eq!(received[0], original, "inflated payload matches the original");
+        assert_eq!(
+            received[0], original,
+            "inflated payload matches the original"
+        );
     }
 
     #[test]
@@ -1277,12 +1551,18 @@ mod compression_tests {
             .take_events()
             .into_iter()
             .any(|e| matches!(e, CircuitEvent::DataReceived(_)));
-        assert!(!delivered, "a corrupt compressed frame must not be delivered");
+        assert!(
+            !delivered,
+            "a corrupt compressed frame must not be delivered"
+        );
         // …but an Information Acknowledge was still emitted.
         let acked = b.take_outbox().into_iter().any(|p| {
             NetRomOpcode::from_nibble(p.transport.opcode)
                 == Some(NetRomOpcode::InformationAcknowledge)
         });
-        assert!(acked, "the dropped frame is still acked so the sender advances");
+        assert!(
+            acked,
+            "the dropped frame is still acked so the sender advances"
+        );
     }
 }

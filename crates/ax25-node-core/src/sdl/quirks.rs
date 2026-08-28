@@ -16,10 +16,18 @@
 /// behaviour); `strictly_faithful()` = every fix off (figures verbatim).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quirks {
-    /// figc4.5 draws the SREJ-received retransmit as the generic go-back-N push +
-    /// `Invoke_Retransmission`, contradicting §4.3.2.4/figc4.4. On an SREJ trigger
-    /// do single-frame selective retransmit instead (ax25spec#38, packet.net#234).
-    pub srej_selective_retransmit: bool,
+    /// Ignore the retransmission request carried by an SREJ received as a
+    /// COMMAND, while still honouring the acknowledgement it carries. §4.3.2.4
+    /// makes SREJ response-only, so a peer sending one as a command is already
+    /// off-spec, and no deployed stack acts on receiving one: direwolf omits the
+    /// path outright; linbpq gates the resend on RESP. Both still process the
+    /// N(R) acknowledgement, and so do we. The corrected figc4.5 (ax25sdl
+    /// v0.10.1+, from ax25spec#65) gives the command paths a native single-frame
+    /// selective retransmit, making the command form actionable for the first
+    /// time; this flag keeps the surveyed de-facto behaviour instead
+    /// (packet.net#674). It replaces the retired `srej_selective_retransmit`
+    /// (#38) rewrite, which the corrected figure absorbed (packet.net#682).
+    pub srej_command_ignored: bool,
     /// figc4.4's out-of-sequence I_received path has no receive-window guard, so a
     /// duplicate behind V(R) provokes an endless out-of-window re-send (the SREJ
     /// livelock). OR the out-of-window condition into `reject_exception`'s
@@ -90,7 +98,7 @@ impl Default for Quirks {
     /// Every fix on — spec-correct behaviour (mirrors `Ax25SessionQuirks.Default`).
     fn default() -> Self {
         Self {
-            srej_selective_retransmit: true,
+            srej_command_ignored: true,
             discard_out_of_window_i_frames: true,
             karn_srt_sampling: true,
             srej_targets_gap: true,
@@ -109,7 +117,7 @@ impl Quirks {
     /// Every fix OFF — run the SDL figures exactly as drawn (conformance testing).
     pub fn strictly_faithful() -> Self {
         Self {
-            srej_selective_retransmit: false,
+            srej_command_ignored: false,
             discard_out_of_window_i_frames: false,
             karn_srt_sampling: false,
             srej_targets_gap: false,

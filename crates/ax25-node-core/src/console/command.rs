@@ -91,7 +91,13 @@ pub fn parse_bytes(line: &[u8]) -> Command {
 /// Parse an already-decoded line into a typed command. Total.
 pub fn parse(line: &str) -> Command {
     let line = if line.len() > MAX_LINE_LEN {
-        &line[..MAX_LINE_LEN]
+        // Floor the cut to a char boundary: byte MAX_LINE_LEN can land inside a
+        // multi-byte char, and a mid-char slice would panic.
+        let mut end = MAX_LINE_LEN;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        &line[..end]
     } else {
         line
     };
@@ -106,8 +112,10 @@ pub fn parse(line: &str) -> Command {
         return Command::Help;
     }
 
-    let (verb, rest) = match trimmed.find(char::is_whitespace) {
-        Some(i) => (&trimmed[..i], trimmed[i + 1..].trim()),
+    // split_once steps over the separator by its full UTF-8 width; a byte-offset
+    // `[i + 1..]` slice would panic on a multi-byte whitespace char (e.g. NBSP).
+    let (verb, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((v, r)) => (v, r.trim()),
         None => (trimmed, ""),
     };
 
@@ -172,8 +180,10 @@ fn parse_connect(rest: &str) -> Command {
 
 fn parse_set(rest: &str) -> Command {
     let rest = rest.trim();
-    let (key, value) = match rest.find(char::is_whitespace) {
-        Some(i) => (&rest[..i], rest[i + 1..].trim()),
+    // As in `parse`: split_once, not a byte-offset slice, so a multi-byte
+    // whitespace separator can't panic.
+    let (key, value) = match rest.split_once(char::is_whitespace) {
+        Some((k, v)) => (k, v.trim()),
         None => (rest, ""),
     };
     if key.is_empty() || value.is_empty() {
@@ -228,11 +238,15 @@ mod tests {
     fn connect_bad_call_is_malformed_and_keeps_the_offending_token() {
         assert_eq!(
             parse("C not.a.call"),
-            Command::MalformedConnect { target: Some("not.a.call".to_string()) }
+            Command::MalformedConnect {
+                target: Some("not.a.call".to_string())
+            }
         );
         assert_eq!(
             parse("C TOOLONGG"),
-            Command::MalformedConnect { target: Some("TOOLONGG".to_string()) }
+            Command::MalformedConnect {
+                target: Some("TOOLONGG".to_string())
+            }
         );
     }
 
@@ -262,8 +276,14 @@ mod tests {
 
     #[test]
     fn unknown_verb_keeps_the_raw_line_for_echo() {
-        assert_eq!(parse("FROBNICATE"), Command::Unknown("FROBNICATE".to_string()));
-        assert_eq!(parse("xyzzy foo"), Command::Unknown("xyzzy foo".to_string()));
+        assert_eq!(
+            parse("FROBNICATE"),
+            Command::Unknown("FROBNICATE".to_string())
+        );
+        assert_eq!(
+            parse("xyzzy foo"),
+            Command::Unknown("xyzzy foo".to_string())
+        );
     }
 
     #[test]
@@ -277,13 +297,43 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_whitespace_separator_does_not_panic() {
+        // NBSP (U+00A0) is 2 bytes in UTF-8 and satisfies char::is_whitespace;
+        // the old byte-offset split sliced mid-char and panicked. Both the raw
+        // byte path and the str path must classify, not panic.
+        assert_eq!(
+            parse_bytes(b"C\xC2\xA0M0LTE"),
+            Command::Connect(Callsign::parse("M0LTE").unwrap())
+        );
+        assert_eq!(
+            parse("C\u{a0}M0LTE"),
+            Command::Connect(Callsign::parse("M0LTE").unwrap())
+        );
+    }
+
+    #[test]
+    fn truncation_at_a_multibyte_char_boundary_does_not_panic() {
+        // 511 ASCII bytes then a 2-byte char: byte 512 (MAX_LINE_LEN) falls
+        // mid-char, so the truncation must floor to the boundary at 511.
+        let mut line = String::new();
+        for _ in 0..(MAX_LINE_LEN - 1) {
+            line.push('A');
+        }
+        line.push('\u{e9}'); // 'e' acute, 2 bytes: 513 bytes total
+        assert!(matches!(parse(&line), Command::Unknown(_)));
+    }
+
+    #[test]
     fn parse_bytes_truncates_overlong() {
         let mut huge = alloc::vec![b'A'; MAX_LINE_LEN * 4];
         huge[0] = b'C';
         huge[1] = b' ';
         // Bytes 2.. are 'A's; the first token after "C " is a long run of 'A's,
         // which is not a valid callsign => malformed, not a panic or hang.
-        assert!(matches!(parse_bytes(&huge), Command::MalformedConnect { .. }));
+        assert!(matches!(
+            parse_bytes(&huge),
+            Command::MalformedConnect { .. }
+        ));
     }
 }
 
@@ -319,7 +369,30 @@ mod config_command_tests {
         assert_eq!(parse("SET"), Command::MalformedSet);
         assert_eq!(parse("SET ALIAS"), Command::MalformedSet);
         // "SE" is NOT a SET prefix (mutations don't prefix-match)…
-        assert_eq!(parse("SE ALIAS X"), Command::Unknown("SE ALIAS X".to_string()));
+        assert_eq!(
+            parse("SE ALIAS X"),
+            Command::Unknown("SE ALIAS X".to_string())
+        );
+    }
+
+    #[test]
+    fn set_with_multibyte_whitespace_separators_does_not_panic() {
+        // NBSP between verb and key, and between key and value: both splits must
+        // step over the 2-byte separator instead of slicing mid-char.
+        assert_eq!(
+            parse("SET\u{a0}KEY VALUE"),
+            Command::Set {
+                key: "KEY".to_string(),
+                value: "VALUE".to_string()
+            }
+        );
+        assert_eq!(
+            parse("SET KEY\u{a0}VALUE"),
+            Command::Set {
+                key: "KEY".to_string(),
+                value: "VALUE".to_string()
+            }
+        );
     }
 
     #[test]

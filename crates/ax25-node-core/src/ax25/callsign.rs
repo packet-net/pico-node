@@ -50,6 +50,8 @@ impl Callsign {
     /// `-SSID` must be 0–15. Returns `None` on any violation. Mirrors the C#
     /// `Callsign.TryParse` (which is the path used for `Connect <call>`).
     pub fn parse(text: &str) -> Option<Self> {
+        // Deliberate divergence from the C# TryParse (which does not trim): a
+        // convenience for user-typed input, with no wire impact.
         let text = text.trim();
         if text.is_empty() {
             return None;

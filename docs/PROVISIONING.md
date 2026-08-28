@@ -65,12 +65,19 @@ boot ── read config ── STA configured? ── yes ── join WiFi ─�
   via TNC, NET/ROM over those) fully operational. AXUDP/KISS-TCP/telnet bind
   on the AP subnet too — a laptop joined to the node's AP can use everything.
 - LAN mode = STA joined; portal served on the LAN (and config still editable
-  via authenticated telnet/console commands later).
+  via the telnet console. As built, the console is unauthenticated - the
+  trusted-LAN/AP posture below covers it; console auth remains an open
+  follow-up if a node is ever exposed beyond a trusted network).
 - Fallback: K consecutive STA join failures (AP gone, password rotated) drops
   back to AP mode so the node is never unreachable. The join loop in `net.rs`
   already has the retry/backoff scaffolding for this.
 
 ## Config schema (v1 sketch — versioned from day one)
+
+> **As built** (`config_store.rs`): the shipped store is a hand-rolled
+> versioned TLV record with CRC16/X.25, A/B alternating sectors, and a
+> read-back verify - not the `postcard` + CRC32 sketch below. The sketch is
+> kept for the field inventory it lists.
 
 `struct StoredConfig { version, crc }` over: callsign+ssid, alias, grid,
 node hostname; wifi: Option<{ssid, psk}>; mode hints; axudp {port, peers[]},
@@ -85,8 +92,10 @@ migrations.
   (hilltop boxes have physical security, not secrecy); the portal allows
   changing it. Amateur radio traffic is cleartext by law anyway — the AP
   passphrase guards *configuration*, not traffic.
-- The portal must rate-limit and only run plain HTTP on the AP/LAN — no
-  internet exposure story at all.
+- The portal runs plain HTTP on the AP/LAN only - no internet exposure story
+  at all. (Rate-limiting was sketched here but is not implemented; the
+  trusted-network posture is what actually holds. The same posture covers the
+  unauthenticated OTA push endpoint - see `docs/OTA.md`.)
 
 ## Staging (each lands as its own PR, in roughly this order)
 

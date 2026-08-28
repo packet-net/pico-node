@@ -50,9 +50,11 @@ pub struct NinoTncRssiReading {
 
 impl NinoTncRssiReading {
     /// The level in tenths of a dB (the `i16` "tenths-of-dBm" convention the node's
-    /// level plumbing uses elsewhere), truncated toward zero from the centi-dB value.
+    /// level plumbing uses elsewhere), truncated toward zero from the centi-dB value
+    /// and saturated to the `i16` range (a spoofed reply can carry a magnitude a
+    /// bare cast would silently wrap).
     pub fn tenths_db(self) -> i16 {
-        (self.centi_db / 10) as i16
+        (self.centi_db / 10).clamp(i16::MIN as i32, i16::MAX as i32) as i16
     }
 
     /// The whole-dB part of the level (truncated toward zero).
@@ -210,21 +212,44 @@ mod tests {
     #[test]
     fn missing_prefix_is_rejected() {
         assert!(NinoTncRssiReading::try_parse(b"LEVL:-62.54").is_none());
-        assert!(NinoTncRssiReading::try_parse(b"RSSI:").is_none(), "prefix only, no value");
+        assert!(
+            NinoTncRssiReading::try_parse(b"RSSI:").is_none(),
+            "prefix only, no value"
+        );
     }
 
     #[test]
     fn non_numeric_level_is_rejected() {
         assert!(NinoTncRssiReading::try_parse(b"RSSI:banana").is_none());
         assert!(NinoTncRssiReading::try_parse(b"RSSI:-").is_none());
-        assert!(NinoTncRssiReading::try_parse(b"RSSI:1e3").is_none(), "exponent not emitted by a NinoTNC");
+        assert!(
+            NinoTncRssiReading::try_parse(b"RSSI:1e3").is_none(),
+            "exponent not emitted by a NinoTNC"
+        );
         assert!(NinoTncRssiReading::try_parse(b"RSSI:.").is_none());
     }
 
     #[test]
     fn truncates_fractional_digits_past_the_second() {
         let r = NinoTncRssiReading::try_parse(b"RSSI:-62.549").unwrap();
-        assert_eq!(r.centi_db, -6254, "third fractional digit is dropped, not rounded");
+        assert_eq!(
+            r.centi_db, -6254,
+            "third fractional digit is dropped, not rounded"
+        );
+    }
+
+    #[test]
+    fn tenths_db_saturates_instead_of_wrapping() {
+        // |centi_db| >= 327,680 would wrap through a bare `as i16` cast. A real
+        // TNC never emits these, but a spoofed reply can.
+        let big = NinoTncRssiReading::try_parse(b"RSSI:400000").unwrap();
+        assert_eq!(big.centi_db, 40_000_000);
+        assert_eq!(big.tenths_db(), i16::MAX);
+        let small = NinoTncRssiReading::try_parse(b"RSSI:-400000").unwrap();
+        assert_eq!(small.tenths_db(), i16::MIN);
+        // In-range values are unchanged.
+        let normal = NinoTncRssiReading::try_parse(b"RSSI:-62.54").unwrap();
+        assert_eq!(normal.tenths_db(), -625);
     }
 
     #[test]

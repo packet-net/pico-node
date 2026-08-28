@@ -94,6 +94,7 @@ pub struct EmbassyTimers {
     t1: Option<Instant>,
     t2: Option<Instant>,
     t3: Option<Instant>,
+    tm201: Option<Instant>,
 }
 
 impl EmbassyTimers {
@@ -103,6 +104,7 @@ impl EmbassyTimers {
             t1: None,
             t2: None,
             t3: None,
+            tm201: None,
         }
     }
 
@@ -111,6 +113,7 @@ impl EmbassyTimers {
             TimerId::T1 => self.t1,
             TimerId::T2 => self.t2,
             TimerId::T3 => self.t3,
+            TimerId::Tm201 => self.tm201,
         }
     }
 
@@ -119,20 +122,24 @@ impl EmbassyTimers {
             TimerId::T1 => &mut self.t1,
             TimerId::T2 => &mut self.t2,
             TimerId::T3 => &mut self.t3,
+            TimerId::Tm201 => &mut self.tm201,
         }
     }
 
     /// The nearest armed deadline across all timers, if any — what [`timer_task`]
     /// sleeps until.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.t1, self.t2, self.t3].into_iter().flatten().min()
+        [self.t1, self.t2, self.t3, self.tm201]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Return the timer ids whose deadline is at/<= `now`, clearing them. The
     /// caller posts an expiry event for each.
-    pub fn take_expired(&mut self, now: Instant) -> heapless::Vec<TimerId, 3> {
+    pub fn take_expired(&mut self, now: Instant) -> heapless::Vec<TimerId, 4> {
         let mut out = heapless::Vec::new();
-        for id in [TimerId::T1, TimerId::T2, TimerId::T3] {
+        for id in [TimerId::T1, TimerId::T2, TimerId::T3, TimerId::Tm201] {
             if matches!(self.slot(id), Some(deadline) if deadline <= now) {
                 *self.slot_mut(id) = None;
                 let _ = out.push(id);
@@ -171,6 +178,7 @@ impl TimerService for EmbassyTimers {
             t1: self.t1.map(|_| self.time_remaining_ms(TimerId::T1)),
             t2: self.t2.map(|_| self.time_remaining_ms(TimerId::T2)),
             t3: self.t3.map(|_| self.time_remaining_ms(TimerId::T3)),
+            tm201: self.tm201.map(|_| self.time_remaining_ms(TimerId::Tm201)),
         }
     }
     fn restore(&mut self, snap: TimerSnapshot) {
@@ -179,15 +187,19 @@ impl TimerService for EmbassyTimers {
         self.t1 = to_deadline(snap.t1);
         self.t2 = to_deadline(snap.t2);
         self.t3 = to_deadline(snap.t3);
+        self.tm201 = to_deadline(snap.tm201);
     }
 }
 
 /// Map a timer id to the runtime expiry event the session manager expects.
-pub fn expiry_event(id: TimerId) -> Event {
+/// `None` for TM201 - the MDL XID retry timer is not a data-link event; route
+/// it through [`SessionManager::tm201_expiry`] instead.
+pub fn expiry_event(id: TimerId) -> Option<Event> {
     match id {
-        TimerId::T1 => Event::T1Expiry,
-        TimerId::T2 => Event::T2Expiry,
-        TimerId::T3 => Event::T3Expiry,
+        TimerId::T1 => Some(Event::T1Expiry),
+        TimerId::T2 => Some(Event::T2Expiry),
+        TimerId::T3 => Some(Event::T3Expiry),
+        TimerId::Tm201 => None,
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Ports `Packet.Node.Core.Console.TelnetConsoleListener` + `NodeCommandService`
 //! onto `embassy_net::tcp::TcpSocket`. Accept a TCP connection, write the banner
-//! + prompt, then run the prompt loop: feed reads through
+//! and prompt, then run the prompt loop: feed reads through
 //! [`ax25_node_core::console::LineAssembler`] (the CR/LF/CR-NUL line discipline,
 //! host-tested), parse each line, and act on it via
 //! [`ax25_node_core::console::service::dispatch`] — writing the rendered

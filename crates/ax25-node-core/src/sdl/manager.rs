@@ -18,46 +18,46 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::ax25::xid::{info_field, XidParameters};
+use crate::ax25::xid::info_field;
 use crate::ax25::Callsign;
 
 use super::bridge::WireSink;
 use super::capability::PeerDialPlan;
 use super::carrier::CarrierSense;
 use super::event::Event;
+use super::mdl::{MdlEvent, MdlMachine, MdlOutcome, MdlSignal};
 use super::session::Session;
 use super::timer::TimerService;
 
-/// An in-flight initiator pre-connect XID probe (the LinBPQ SREJ accommodation).
-/// Present on a slot between emitting our XID *command* and its resolution — the
-/// bounded-wait window of C# `Ax25Listener.NegotiateSrejBeforeConnectAsync`. The
-/// SABM is deferred until either the peer's XID *response* arrives (merge via
-/// [`super::mdl::apply_negotiated`] → connect) or [`SessionManager::xid_probe_timeout`]
-/// fires (revert → connect).
-#[derive(Debug, Clone, Copy)]
-pub struct XidProbe {
-    /// The parameter set we advertised in the XID command, merged against the peer's
-    /// response (§6.3.2) via [`super::mdl::apply_negotiated`]. Kept verbatim so the
-    /// merge runs against the exact offer we sent (matching the C# MDL's stored offer).
-    pub offered: XidParameters,
-    /// The local callsign this dial uses, so the deferred SABM re-dials as the same
-    /// station on the timeout path.
-    pub local: Callsign,
-}
-
-/// One occupied link slot: the peer it serves, its session, and its outbound wire
-/// sink (which also captures the DL signals raised upward for the app/console).
+/// One occupied link slot: the peer it serves, its session, its outbound wire
+/// sink (which also captures the DL signals raised upward for the app/console),
+/// and its management-data-link machine.
 #[derive(Debug, Clone)]
 pub struct Slot {
     /// The remote station this slot is connected to / establishing with.
     pub peer: Callsign,
+    /// The local callsign this link runs as. Part of the slot key - the C#
+    /// listener keys sessions on `SessionKey(Local, Remote)`, and the node
+    /// convention of dialling out on a complemented SSID means the same peer
+    /// can legitimately hold two links under two different locals.
+    pub local: Callsign,
     /// The link-layer session state machine.
     pub session: Session,
     /// The outbound wire sink (encoded frames + upward DL signals accumulate here).
     pub sink: WireSink,
-    /// An in-flight initiator pre-connect XID probe, if one is awaiting its response.
-    /// `None` on an ordinary link. See [`XidProbe`].
-    pub xid_probe: Option<XidProbe>,
+    /// The per-link MDL (figc5.x) machine driving the XID negotiation off the
+    /// generated `ax25sdl` MDL tables - both the post-UA v2.2 exchange and the
+    /// initiator pre-connect probe run through it, exactly as the C# listener's
+    /// per-session `Ax25ManagementDataLink` does.
+    pub mdl: MdlMachine,
+    /// The local callsign of a dial deferred behind a pre-connect XID probe
+    /// (the LinBPQ SREJ accommodation): the SABM is held back until the probe
+    /// resolves - the peer's XID response / FRMR (MDL confirm → connect) or the
+    /// bounded-wait [`SessionManager::xid_probe_timeout`] (revert → connect).
+    pub deferred_dial: Option<Callsign>,
+    /// MDL→L3 signals raised since the last [`SessionManager::take_mdl_signals`]
+    /// (the pico analogue of the C# `MdlSignalEmitted` event).
+    pub mdl_signals: Vec<MdlSignal>,
 }
 
 /// A fixed-capacity, peer-keyed collection of [`Session`]s. `N` is the maximum
@@ -152,16 +152,38 @@ impl<const N: usize> SessionManager<N> {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    /// Find the slot index for `peer`, if one exists.
+    /// Find the slot index for `peer`, if one exists. Peer-keyed convenience for
+    /// the read/drain accessors; when two slots share a peer under different
+    /// local callsigns (an out-dial on a complemented SSID plus an inbound
+    /// link), this returns the first match. The event entry points route by the
+    /// full `(local, peer)` pair via [`Self::index_of_pair`].
     fn index_of(&self, peer: &Callsign) -> Option<usize> {
         self.slots
             .iter()
             .position(|s| s.as_ref().is_some_and(|slot| slot.peer == *peer))
     }
 
-    /// Get the session for `peer`, if a slot exists (read-only).
+    /// Find the slot for the `(local, peer)` link - the C# `SessionKey(Local,
+    /// Remote)` pairing: the same remote under two different local callsigns is
+    /// two distinct links that must never share a slot.
+    fn index_of_pair(&self, local: &Callsign, peer: &Callsign) -> Option<usize> {
+        self.slots.iter().position(|s| {
+            s.as_ref()
+                .is_some_and(|slot| slot.peer == *peer && slot.local == *local)
+        })
+    }
+
+    /// Get the session for `peer`, if a slot exists (read-only). First match if
+    /// the peer holds links under two locals; see [`Self::session_for_pair`].
     pub fn session_for(&self, peer: &Callsign) -> Option<&Session> {
         self.index_of(peer)
+            .and_then(|i| self.slots[i].as_ref())
+            .map(|slot| &slot.session)
+    }
+
+    /// Get the session for the exact `(local, peer)` link, if a slot exists.
+    pub fn session_for_pair(&self, local: &Callsign, peer: &Callsign) -> Option<&Session> {
+        self.index_of_pair(local, peer)
             .and_then(|i| self.slots[i].as_ref())
             .map(|slot| &slot.session)
     }
@@ -175,22 +197,30 @@ impl<const N: usize> SessionManager<N> {
             .is_some_and(|slot| slot.sink.seize_pending)
     }
 
-    /// Ensure a slot exists for `peer`, returning its index. Returns `None` if the
-    /// manager is full and `peer` has no existing slot (the caller drops the frame /
-    /// replies DM — a node at capacity refuses new links). Creates the slot's
-    /// [`WireSink`] addressed for the `local ↔ peer` link.
-    fn ensure_slot(&mut self, peer: Callsign, local: Callsign) -> Option<usize> {
-        if let Some(i) = self.index_of(&peer) {
-            return Some(i);
+    /// Ensure a slot exists for the `(local, peer)` link, returning its index and
+    /// whether this call created it. Returns `None` if the manager is full and the
+    /// link has no existing slot (the caller drops the frame / replies DM - a node
+    /// at capacity refuses new links). Creates the slot's [`WireSink`] addressed
+    /// for the `local ↔ peer` link.
+    fn ensure_slot(&mut self, peer: Callsign, local: Callsign) -> Option<(usize, bool)> {
+        if let Some(i) = self.index_of_pair(&local, &peer) {
+            return Some((i, false));
         }
         let free = self.slots.iter().position(|s| s.is_none())?;
+        let session = Session::new();
+        // NM201 (the MDL XID retry limit) defaults from the link N2, mirroring
+        // the C# `nm201 ?? linkContext.N2`.
+        let mdl = MdlMachine::new(session.context.n2);
         self.slots[free] = Some(Slot {
             peer,
-            session: Session::new(),
+            local,
+            session,
             sink: WireSink::new(local, peer, Vec::new()),
-            xid_probe: None,
+            mdl,
+            deferred_dial: None,
+            mdl_signals: Vec::new(),
         });
-        Some(free)
+        Some((free, true))
     }
 
     /// Route `event` to `peer`'s session (creating a slot on first contact),
@@ -223,7 +253,7 @@ impl<const N: usize> SessionManager<N> {
         mut event: Event,
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
-        let Some(i) = self.ensure_slot(peer, local) else {
+        let Some((i, created)) = self.ensure_slot(peer, local) else {
             return Vec::new();
         };
         // Sample carrier-sense once for this drive (the synchronous runtime doesn't
@@ -235,56 +265,41 @@ impl<const N: usize> SessionManager<N> {
             .expect("slot just ensured to be present");
         slot.sink.sent.clear();
 
-        // Initiator pre-connect XID *response* handler (mirrors the inbound-router
-        // leg of `Ax25Listener.NegotiateSrejBeforeConnectAsync`): the peer's XID
-        // response to a probe we sent. Merge it into our offer via the §6.3.2
-        // reverts-to (`apply_negotiated`) — settling SREJ/window/N1/T1/N2 to the
-        // mutual result — then proceed to connect by converting this drive into the
-        // deferred `DL-CONNECT-request` (the SABM the probe was holding back). The
-        // negotiated `srej_enabled` is staged on the context and survives the SABM's
-        // figc4.1 `Set Version 2.0` into the established link (proven by the responder
-        // path). A mod-8 probe never merges to mod-128 (our offer is mod-8), so the
-        // deferred connect is always a plain SABM.
-        let mut proceed_to_connect = false;
-        if let Event::XidReceived(fi) = &event {
-            if fi.is_response() && slot.xid_probe.is_some() {
-                let response_info = fi.info.clone();
-                let probe = slot.xid_probe.take().expect("is_some checked above");
-                let response = info_field::parse(&response_info).unwrap_or_default();
-                super::mdl::apply_negotiated(
-                    &mut slot.session.context,
-                    &probe.offered,
-                    &response,
-                );
-                proceed_to_connect = true;
-            }
-        }
-        if proceed_to_connect {
-            // Fall through to the normal dispatch as the deferred connect request.
-            event = Event::DlConnectRequest;
-        }
+        // ─── XID / FRMR-of-XID routing - these belong to the MDL machine, not the
+        // data-link session (which has no XID handler and would FRMR-handle a FRMR
+        // as a full link reset). Mirrors the C# listener's inbound router order:
+        //   1. XID *command*  → we are the responder (the un-transcribed figc5.1
+        //      responder column - hand-implemented, like C# `RespondToXidCommand`).
+        //   2. XID *response* while negotiating → the figc5.2 tables (apply the
+        //      negotiated parameters / error D).
+        //   3. FRMR while negotiating → the figc5.2 §6.3.2 ¶1 v2.0 fallback.
+        // Outside those, frames fall through to the data-link session unchanged.
 
-        // Pre-session XID *command* responder (mirrors
-        // `Ax25Listener.HandleNoCachedSession`'s XID branch): a peer doing pre-SABM
-        // XID negotiation to us before any link exists — the PDN NET/ROM mod-8
-        // interlink initiator opening with XID. §4.3.3.7 makes answering an XID
-        // command unconditional; the negotiated params stage on this cached slot's
-        // context so the *subsequent* SABM's figc4.1 t14 `Set Version 2.0` (which
-        // clears only `is_extended`) preserves the staged `srej_enabled` into the
-        // established link. We answer directly (connectionless — no LM-SEIZE),
-        // matching C# `RespondToXidCommand`; no ConnectIndication is raised (the
-        // following SABM raises it). Gated on `accept_incoming`, like SABM-accept.
+        // 1. XID *command* responder: answering is unconditional per §4.3.3.7 on a
+        // live link; on a fresh/Disconnected slot it is gated on `accept_incoming`
+        // (like SABM-accept - if we won't accept a connection we shouldn't half-open
+        // from an XID), and seeds the context SREJ-capable so the negotiated params
+        // stage across the peer's subsequent SABM (its figc4.1 t14 `Set Version 2.0`
+        // clears only `is_extended`, preserving the staged `srej_enabled`).
         if let Event::XidReceived(fi) = &event {
-            if fi.is_command
-                && slot.session.state == super::session::State::Disconnected
-                && slot.session.context.accept_incoming
-            {
+            let disconnected = slot.session.state == super::session::State::Disconnected;
+            // A refused pre-session XID command (accept_incoming off) falls through
+            // to the data-link dispatch below, whose figc4.1 catch-all answers DM  -
+            // matching the C# transient-session fall-through.
+            if fi.is_command && (!disconnected || slot.session.context.accept_incoming) {
                 let command_info = fi.info.clone();
-                let response_info = super::mdl::respond_pre_session_xid(
-                    &mut slot.session.context,
-                    &command_info,
-                );
-                // XID is a U-frame (1 octet in both modulos); modulo is immaterial.
+                let response_info = if disconnected {
+                    // Pre-session: seed SREJ-capable, then merge + respond.
+                    super::mdl::respond_pre_session_xid(&mut slot.session.context, &command_info)
+                } else {
+                    // Established link: merge against our CURRENT offer, no
+                    // seeding (mirrors the C# cached-path RespondToXidCommand).
+                    let command = info_field::parse(&command_info).unwrap_or_default();
+                    let agreed =
+                        super::mdl::respond_to_xid_command(&mut slot.session.context, &command);
+                    info_field::encode(&agreed)
+                };
+                // XID is a U-frame (1 octet in both modulos); modulo immaterial.
                 slot.sink.extended = slot.session.context.is_extended;
                 let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
                     is_command: false,
@@ -294,6 +309,57 @@ impl<const N: usize> SessionManager<N> {
                 slot.sink.sent.push(bytes);
                 return core::mem::take(&mut slot.sink.sent);
             }
+        }
+
+        // 2./3. XID response or FRMR while the MDL owns the exchange: drive the
+        // figc5.2 tables. On success the negotiated parameters land on the live
+        // link context (`Apply Negotiated Parameters` → `apply_negotiated`); a
+        // FRMR takes the §6.3.2 ¶1 v2.0 fallback. If this resolves a pre-connect
+        // probe (a deferred dial), fall through into the deferred
+        // `DL-CONNECT-request` - the SABM the probe was holding back; a mod-8
+        // probe never merges to mod-128 (our offer is mod-8), so it is always a
+        // plain SABM. An unresolved exchange (error D keeps Negotiating) just
+        // returns what the drive emitted.
+        let mdl_event = match &event {
+            Event::XidReceived(fi) if fi.is_response() && slot.mdl.is_negotiating() => {
+                Some(MdlEvent::XidResponseReceived {
+                    final_bit: fi.poll_final,
+                    info: fi.info.clone(),
+                })
+            }
+            Event::FrmrReceived(_) if slot.mdl.is_negotiating() => Some(MdlEvent::FrmrReceived),
+            _ => None,
+        };
+        if let Some(mdl_event) = mdl_event {
+            let outcome = slot
+                .mdl
+                .post_event(mdl_event, &mut slot.session.context, timers);
+            let confirmed = outcome.signals.contains(&MdlSignal::NegotiateConfirm);
+            Self::absorb_mdl_outcome(slot, outcome);
+            if slot.deferred_dial.is_some() && !slot.mdl.is_negotiating() {
+                if !confirmed {
+                    super::mdl::revert_pre_connect_xid(&mut slot.session.context);
+                }
+                slot.deferred_dial = None;
+                event = Event::DlConnectRequest; // fall through: the deferred SABM
+            } else {
+                return core::mem::take(&mut slot.sink.sent);
+            }
+        }
+
+        // figc4.1: a session sitting in Disconnected is the same situation as a
+        // peer we have never seen. The classifier's specific events (RR, I, REJ,
+        // FRMR, ...) have no transition in Disconnected, so posting them raw
+        // silently swallows the frame - no DM - and the peer burns its whole
+        // retry budget polling a link we already consider down. Reclassify to
+        // the figure's catch-alls exactly as the C# inbound router does
+        // (`ReclassifyForDisconnectedCatchAll`): the per-frame-type Disconnected
+        // inputs (DISC/UI/UA/SABM/SABME) pass through; any other received
+        // command becomes `all_other_commands` (t05 -> DM); any other received
+        // response becomes the lower-layer catch-all. Local primitives and timer
+        // events are untouched.
+        if slot.session.state == super::session::State::Disconnected {
+            event = reclassify_for_disconnected_catch_all(event);
         }
 
         // Track the link's negotiated modulo so the sink emits 2-octet extended
@@ -323,7 +389,41 @@ impl<const N: usize> SessionManager<N> {
             grants += 1;
         }
 
-        core::mem::take(&mut slot.sink.sent)
+        // The figc4.6 UA path raised MDL-NEGOTIATE Request (a successful v2.2
+        // connect wants its post-UA XID negotiation): hand the poke to the slot's
+        // MDL machine, which opens the exchange off the figc5.1 tables - RC:=0,
+        // our XID command on the wire, TM201 armed. Mirrors the C# listener's
+        // `sendInternal` routing the poke to `mdl.Negotiate()`.
+        if slot.sink.mdl_negotiate_pending {
+            slot.sink.mdl_negotiate_pending = false;
+            let outcome = slot.mdl.post_event(
+                MdlEvent::NegotiateRequest,
+                &mut slot.session.context,
+                timers,
+            );
+            Self::absorb_mdl_outcome(slot, outcome);
+        }
+
+        let out = core::mem::take(&mut slot.sink.sent);
+
+        // A slot minted by THIS call that came out the other side still fully
+        // idle was a transient exchange (a stray RR/REJ/I from an unknown peer
+        // answered by the catch-all DM, a one-shot UI send, ...) - the C#
+        // handles these through a throwaway session and caches nothing. Free it
+        // so stray frames from N spoofed callsigns cannot pin all the slots.
+        // Anything with signals still to drain, a probe open, or actual state
+        // is kept (SABM-accept, XID staging, a dial in progress).
+        if created
+            && slot.session.state == super::session::State::Disconnected
+            && slot.session.context.i_frame_queue.is_empty()
+            && slot.sink.upward.is_empty()
+            && slot.deferred_dial.is_none()
+            && !slot.mdl.is_negotiating()
+        {
+            self.slots[i] = None;
+        }
+
+        out
 
         // NB: a slot whose session has returned to Disconnected is NOT freed
         // here — its upward signals (DisconnectIndication/-Confirm) haven't
@@ -359,7 +459,7 @@ impl<const N: usize> SessionManager<N> {
         extended: bool,
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
-        let Some(i) = self.ensure_slot(peer, local) else {
+        let Some((i, _)) = self.ensure_slot(peer, local) else {
             return Vec::new();
         };
         // Choose the version before posting DL-CONNECT-request (Ax25Listener.cs:412).
@@ -404,23 +504,45 @@ impl<const N: usize> SessionManager<N> {
         timers: &mut dyn TimerService,
     ) -> Vec<Vec<u8>> {
         if plan.pre_connect_xid && !plan.extended {
-            self.begin_xid_probe(local, peer)
+            self.begin_xid_probe(local, peer, timers)
         } else {
             self.connect_extended(local, peer, plan.extended, timers)
         }
     }
 
+    /// Drain one MDL drive's outputs onto the slot: the XID command (if the drive
+    /// ran the `XID_command` verb - always P=1, a U-frame so modulo is
+    /// immaterial) onto the wire queue, and the L3 signals onto the slot's
+    /// signal queue.
+    fn absorb_mdl_outcome(slot: &mut Slot, outcome: MdlOutcome) {
+        if let Some(info) = outcome.xid_command {
+            let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
+                is_command: true, // an initiator XID *command* (our offer)
+                pf: true,         // error A ("XID command without P=1") implies P=1
+                info,
+            });
+            slot.sink.sent.push(bytes);
+        }
+        slot.mdl_signals.extend(outcome.signals);
+    }
+
     /// Begin an initiator pre-connect XID probe to `peer` from `local`: seed the
-    /// session context SREJ-capable ([`super::mdl::begin_pre_connect_xid`]), emit our
-    /// XID *command* advertising that offer, and arm the [`XidProbe`] pending state —
-    /// but do NOT send SABM yet. The deferred SABM is driven later, by [`Self::post`]
-    /// on the peer's XID response (merge + connect) or by [`Self::xid_probe_timeout`]
-    /// (revert + connect). Mirrors the offer step of C#
-    /// `Ax25Listener.NegotiateSrejBeforeConnectAsync`. Returns the XID command frame
-    /// (or empty if the manager is full and `peer` has no slot). A no-op re-arm if a
-    /// probe is already pending — the caller should not double-probe.
-    pub fn begin_xid_probe(&mut self, local: Callsign, peer: Callsign) -> Vec<Vec<u8>> {
-        let Some(i) = self.ensure_slot(peer, local) else {
+    /// session context SREJ-capable ([`super::mdl::begin_pre_connect_xid`]) and
+    /// open the negotiation through the slot's MDL machine - the figc5.1 tables
+    /// emit our XID *command* and arm TM201 - but do NOT send SABM yet. The
+    /// deferred SABM is driven later: by [`Self::post`] when the probe resolves
+    /// (the peer's XID response / FRMR → MDL confirm → connect), or by
+    /// [`Self::xid_probe_timeout`] (the bounded wait - revert + connect). Mirrors
+    /// C# `Ax25Listener.NegotiateSrejBeforeConnectAsync`, which likewise runs the
+    /// probe through the per-session `Ax25ManagementDataLink`. Returns the XID
+    /// command frame (or empty if the manager is full and `peer` has no slot).
+    pub fn begin_xid_probe(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        let Some((i, _)) = self.ensure_slot(peer, local) else {
             return Vec::new();
         };
         let slot = self.slots[i]
@@ -429,19 +551,17 @@ impl<const N: usize> SessionManager<N> {
         slot.sink.sent.clear();
         // A mod-8 probe: the pre-SABM XID exchange only negotiates SREJ; the link
         // stays mod-8 (the SABME path negotiates XID post-UA instead). Force mod-8
-        // before deriving the offer so it advertises modulo128 = false.
+        // before the machine derives the offer, so it advertises modulo128 = false.
         slot.session.context.is_extended = false;
-        let offered = super::mdl::begin_pre_connect_xid(&mut slot.session.context);
-        let info = info_field::encode(&offered);
-        // XID is a U-frame (1 octet in both modulos); keep the sink mod-8 regardless.
+        let _ = super::mdl::begin_pre_connect_xid(&mut slot.session.context);
         slot.sink.extended = false;
-        let bytes = slot.sink.encode_spec(&super::signal::FrameSpec::Xid {
-            is_command: true, // an initiator XID *command* (our offer)
-            pf: true,
-            info,
-        });
-        slot.sink.sent.push(bytes);
-        slot.xid_probe = Some(XidProbe { offered, local });
+        let outcome = slot.mdl.post_event(
+            MdlEvent::NegotiateRequest,
+            &mut slot.session.context,
+            timers,
+        );
+        Self::absorb_mdl_outcome(slot, outcome);
+        slot.deferred_dial = Some(local);
         core::mem::take(&mut slot.sink.sent)
     }
 
@@ -451,7 +571,7 @@ impl<const N: usize> SessionManager<N> {
     pub fn xid_probe_pending(&self, peer: &Callsign) -> bool {
         self.index_of(peer)
             .and_then(|i| self.slots[i].as_ref())
-            .is_some_and(|slot| slot.xid_probe.is_some())
+            .is_some_and(|slot| slot.deferred_dial.is_some())
     }
 
     /// The bounded-wait expiry for a pending pre-connect XID probe to `peer`: no XID
@@ -459,10 +579,12 @@ impl<const N: usize> SessionManager<N> {
     /// ([`super::mdl::revert_pre_connect_xid`] — never SREJ unilaterally) and proceed
     /// to the deferred plain mod-8 SABM. Mirrors the `if (!confirmed)` fallback of C#
     /// `NegotiateSrejBeforeConnectAsync` composed with the subsequent
-    /// `DL-CONNECT-request`. Returns the SABM frame(s); a no-op (empty) if no probe is
-    /// pending for `peer`. After this resolves the caller records the no-response
-    /// outcome (`dialed_pre_connect_xid = true`, `observed_srej_enabled = false`) into
-    /// the capability cache, so the peer is learned a non-answerer.
+    /// `DL-CONNECT-request`. Like the C#, the MDL machine itself is left running  -
+    /// TM201 keeps retrying the XID command until it gives up (error C), which is
+    /// harmless (deployed stacks ignore an XID on an active link). Returns the SABM
+    /// frame(s); a no-op (empty) if no probe is pending for `peer`. After this
+    /// resolves the caller records the no-response outcome into the capability
+    /// cache, so the peer is learned a non-answerer.
     pub fn xid_probe_timeout(
         &mut self,
         peer: Callsign,
@@ -471,16 +593,59 @@ impl<const N: usize> SessionManager<N> {
         let Some(i) = self.index_of(&peer) else {
             return Vec::new();
         };
-        let slot = self.slots[i]
-            .as_mut()
-            .expect("index_of returned Some");
-        let Some(probe) = slot.xid_probe.take() else {
+        let slot = self.slots[i].as_mut().expect("index_of returned Some");
+        let Some(local) = slot.deferred_dial.take() else {
             return Vec::new(); // no probe pending — nothing to time out
         };
         super::mdl::revert_pre_connect_xid(&mut slot.session.context);
-        let local = probe.local;
         // The slot borrow ends here; proceed to the deferred SABM.
         self.post_with_local(local, peer, Event::DlConnectRequest, timers)
+    }
+
+    /// Route a TM201 expiry to `peer`'s MDL machine: the figc5.2 tables retry the
+    /// XID command (RC+1, re-arm) or give up at NM201 (MDL-ERROR C → `Ready`). If
+    /// the give-up resolves a pre-connect probe, the deferred SABM fires (revert
+    /// to go-back-N first - never SREJ unilaterally), matching the C# probe's
+    /// `!confirmed` fallback the moment the MDL leaves `Negotiating`. Returns the
+    /// wire frames emitted (an XID retry, or the fallback SABM); empty if `peer`
+    /// has no slot. The firmware's timer glue calls this for
+    /// [`super::timer::TimerId::Tm201`] instead of posting a data-link event.
+    pub fn tm201_expiry(&mut self, peer: Callsign, timers: &mut dyn TimerService) -> Vec<Vec<u8>> {
+        let Some(i) = self.index_of(&peer) else {
+            return Vec::new();
+        };
+        let slot = self.slots[i].as_mut().expect("index_of returned Some");
+        slot.sink.sent.clear();
+        let outcome = slot
+            .mdl
+            .post_event(MdlEvent::Tm201Expiry, &mut slot.session.context, timers);
+        Self::absorb_mdl_outcome(slot, outcome);
+        let mut sent = core::mem::take(&mut slot.sink.sent);
+        if slot.deferred_dial.is_some() && !slot.mdl.is_negotiating() {
+            // Gave up (error C) with a dial still deferred: revert + SABM now.
+            let local = slot.deferred_dial.take().expect("is_some checked above");
+            super::mdl::revert_pre_connect_xid(&mut slot.session.context);
+            sent.extend(self.post_with_local(local, peer, Event::DlConnectRequest, timers));
+        }
+        sent
+    }
+
+    /// Whether `peer`'s MDL machine is mid-negotiation (an XID command of ours is
+    /// outstanding - pre-connect probe or post-UA exchange). `false` if no slot.
+    pub fn mdl_negotiating(&self, peer: &Callsign) -> bool {
+        self.index_of(peer)
+            .and_then(|i| self.slots[i].as_ref())
+            .is_some_and(|slot| slot.mdl.is_negotiating())
+    }
+
+    /// Drain the MDL→L3 signals `peer`'s machine has raised since the last call
+    /// (MDL-NEGOTIATE Confirm / MDL-ERROR Indicate B/C/D) - the pico analogue of
+    /// subscribing the C# `MdlSignalEmitted` event. Empty if the peer has no slot.
+    pub fn take_mdl_signals(&mut self, peer: &Callsign) -> Vec<MdlSignal> {
+        match self.index_of(peer).and_then(|i| self.slots[i].as_mut()) {
+            Some(slot) => core::mem::take(&mut slot.mdl_signals),
+            None => Vec::new(),
+        }
     }
 
     /// Drain the DL signals a peer's session has raised upward since the last call
@@ -499,8 +664,13 @@ impl<const N: usize> SessionManager<N> {
     pub fn reap(&mut self, peer: &Callsign) -> bool {
         if let Some(i) = self.index_of(peer) {
             if let Some(slot) = &self.slots[i] {
+                // A Disconnected session with a pre-connect probe open (deferred
+                // dial / MDL negotiating) is mid-establishment, not torn down  -
+                // reaping it would lose the probe.
                 if slot.session.state == super::session::State::Disconnected
                     && slot.session.context.i_frame_queue.is_empty()
+                    && slot.deferred_dial.is_none()
+                    && !slot.mdl.is_negotiating()
                 {
                     self.slots[i] = None;
                     return true;
@@ -508,6 +678,30 @@ impl<const N: usize> SessionManager<N> {
             }
         }
         false
+    }
+}
+
+/// Map a received frame with no per-frame-type input in the Disconnected state
+/// onto the figc4.1 catch-alls, so it is refused with a DM instead of silently
+/// swallowed. Ports the C# `Ax25Listener.ReclassifyForDisconnectedCatchAll`:
+/// DISC/UI/UA/SABM/SABME pass through; any other received command becomes
+/// `all_other_commands` (t05 -> DM); any other received response becomes the
+/// lower-layer catch-all. An XID command only reaches here when the responder
+/// path REFUSED it (accept_incoming off), and then the C# likewise DMs it via
+/// the command catch-all. Events with no frame (local primitives, timers) pass
+/// through untouched.
+fn reclassify_for_disconnected_catch_all(event: Event) -> Event {
+    match event {
+        Event::DiscReceived(_)
+        | Event::UiReceived(_)
+        | Event::UaReceived(_)
+        | Event::SabmReceived(_)
+        | Event::SabmeReceived(_) => event,
+        e => match e.frame() {
+            Some(fi) if fi.is_command => Event::AllOtherCommands(fi.clone()),
+            Some(_) => Event::AllOtherPrimitivesFromLowerLayer,
+            None => e,
+        },
     }
 }
 
@@ -624,7 +818,10 @@ mod tests {
         assert!(matches!(classify(&out[0]), Event::SabmeReceived(_)));
         let s = mgr.session_for(&peer).unwrap();
         assert_eq!(s.state, State::AwaitingV22Connection);
-        assert!(s.context.is_extended, "mod-128 preference set on the session");
+        assert!(
+            s.context.is_extended,
+            "mod-128 preference set on the session"
+        );
     }
 
     #[test]
@@ -693,7 +890,8 @@ mod tests {
         assert!(!s.context.is_extended, "DM degraded the link to mod-8");
         assert_eq!(s.state, State::AwaitingConnection);
         assert!(
-            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
             "expected a mod-8 SABM re-establishment after the DM: {out:02x?}"
         );
     }
@@ -716,7 +914,10 @@ mod tests {
         let from_b = b.post(ca, classify(&sabme[0]), &mut t);
         let sb = b.session_for(&ca).unwrap();
         assert_eq!(sb.state, State::Connected);
-        assert!(sb.context.is_extended, "answerer adopts mod-128 from the SABME");
+        assert!(
+            sb.context.is_extended,
+            "answerer adopts mod-128 from the SABME"
+        );
         assert_eq!(from_b.len(), 1);
         assert!(matches!(classify(&from_b[0]), Event::UaReceived(_)));
 
@@ -756,7 +957,10 @@ mod tests {
         let re_sabm = out
             .iter()
             .any(|b| matches!(classify(b), Event::SabmReceived(_)));
-        assert!(re_sabm, "expected a mod-8 SABM re-establishment: {out:02x?}");
+        assert!(
+            re_sabm,
+            "expected a mod-8 SABM re-establishment: {out:02x?}"
+        );
     }
 
     /// The relay regression: an I-frame received while we have nothing to send
@@ -829,7 +1033,8 @@ mod tests {
     }
 
     fn emitted_rr(out: &[Vec<u8>]) -> bool {
-        out.iter().any(|b| matches!(classify(b), Event::RrReceived(_)))
+        out.iter()
+            .any(|b| matches!(classify(b), Event::RrReceived(_)))
     }
 
     #[test]
@@ -842,7 +1047,10 @@ mod tests {
         let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
 
         // Busy ⇒ the seize (and the RR ack it drives) is deferred, not granted.
-        assert!(!emitted_rr(&out), "busy carrier must defer the ack: {out:02x?}");
+        assert!(
+            !emitted_rr(&out),
+            "busy carrier must defer the ack: {out:02x?}"
+        );
         assert!(
             mgr.seize_pending(&peer),
             "the seize stays pending while the channel is busy"
@@ -859,8 +1067,14 @@ mod tests {
         let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
 
         // Clear ⇒ the seize is granted and the RR ack goes out; nothing left pending.
-        assert!(emitted_rr(&out), "clear carrier must grant the ack: {out:02x?}");
-        assert!(!mgr.seize_pending(&peer), "no seize left pending once granted");
+        assert!(
+            emitted_rr(&out),
+            "clear carrier must grant the ack: {out:02x?}"
+        );
+        assert!(
+            !mgr.seize_pending(&peer),
+            "no seize left pending once granted"
+        );
     }
 
     #[test]
@@ -873,7 +1087,10 @@ mod tests {
         let peer = call("M0LTE-9");
 
         let out = connect_then_receive_i_frame(&mut mgr, peer, &mut t);
-        assert!(emitted_rr(&out), "unknown carrier fails open (grants): {out:02x?}");
+        assert!(
+            emitted_rr(&out),
+            "unknown carrier fails open (grants): {out:02x?}"
+        );
         assert!(!mgr.seize_pending(&peer));
     }
 
@@ -941,7 +1158,10 @@ mod tests {
 
         let reply = Frame::decode(&out[0]).expect("XID reply decodes");
         assert!(reply.is_response(), "the answer is an XID *response*");
-        assert!(reply.poll_final(), "F=1 so the initiator's F_eq_1 diamond fires");
+        assert!(
+            reply.poll_final(),
+            "F=1 so the initiator's F_eq_1 diamond fires"
+        );
         match classify_incoming(&reply) {
             Some(Event::XidReceived(_)) => {}
             other => panic!("expected an XID reply, got {other:?} (must not be a DM)"),
@@ -1005,9 +1225,10 @@ mod tests {
         assert!(!s.context.implicit_reject);
         // The SABM is answered with a UA (not a DM).
         assert!(
-            ua_out
-                .iter()
-                .any(|b| matches!(classify_incoming(&Frame::decode(b).unwrap()), Some(Event::UaReceived(_)))),
+            ua_out.iter().any(|b| matches!(
+                classify_incoming(&Frame::decode(b).unwrap()),
+                Some(Event::UaReceived(_))
+            )),
             "the SABM must be acknowledged with a UA: {ua_out:02x?}"
         );
         assert!(mgr
@@ -1048,7 +1269,10 @@ mod tests {
             &mut MockTimerService::new(),
         );
         assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
-        assert!(!m8.xid_probe_pending(&peer), "no probe on a dial-straight plan");
+        assert!(
+            !m8.xid_probe_pending(&peer),
+            "no probe on a dial-straight plan"
+        );
     }
 
     // ─── Initiator pre-connect XID probe (mirrors NegotiateSrejBeforeConnectAsync) ─
@@ -1112,7 +1336,10 @@ mod tests {
         let cmd = Frame::decode(&out[0]).expect("XID command decodes");
         assert!(cmd.is_command(), "an initiator XID *command*");
         assert!(matches!(classify(&out[0]), Event::XidReceived(_)));
-        assert!(mgr.xid_probe_pending(&peer), "probe pending until the response");
+        assert!(
+            mgr.xid_probe_pending(&peer),
+            "probe pending until the response"
+        );
         assert_eq!(
             mgr.session_for(&peer).map(|s| s.state),
             Some(State::Disconnected),
@@ -1122,28 +1349,44 @@ mod tests {
         // The peer answers with an XID *response* offering SREJ ⇒ merge + deferred SABM.
         let out = mgr.post(peer, xid_response_offering_srej(), &mut t);
         assert!(
-            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
             "the deferred SABM fires on the XID response: {out:02x?}"
         );
         assert!(!mgr.xid_probe_pending(&peer), "probe resolved");
         let s = mgr.session_for(&peer).unwrap();
         assert_eq!(s.state, State::AwaitingConnection);
-        assert!(!s.context.is_extended, "a mod-8 probe never flips to mod-128");
+        assert!(
+            !s.context.is_extended,
+            "a mod-8 probe never flips to mod-128"
+        );
         assert!(s.context.srej_enabled, "both offered SREJ ⇒ negotiated on");
 
         // The peer accepts (UA) ⇒ Connected, the SREJ carried into the link.
         let _ = mgr.post(peer, ua(), &mut t);
         let s = mgr.session_for(&peer).unwrap();
         assert_eq!(s.state, State::Connected);
-        assert!(s.context.srej_enabled, "negotiated SREJ survives establishment");
+        assert!(
+            s.context.srej_enabled,
+            "negotiated SREJ survives establishment"
+        );
         let (obs_ext, obs_srej) = (s.context.is_extended, s.context.srej_enabled);
 
         // record_outcome ⇒ the cache learns the peer answers XID with SREJ.
         cache.record_outcome(
-            PROBE_PORT, peer, plan.extended, obs_ext, plan.pre_connect_xid, obs_srej, PROBE_T0,
+            PROBE_PORT,
+            peer,
+            plan.extended,
+            obs_ext,
+            plan.pre_connect_xid,
+            obs_srej,
+            PROBE_T0,
         );
         assert_eq!(
-            cache.lookup(PROBE_PORT, &peer).unwrap().supports_srej_via_xid,
+            cache
+                .lookup(PROBE_PORT, &peer)
+                .unwrap()
+                .supports_srej_via_xid,
             Some(true)
         );
 
@@ -1159,11 +1402,13 @@ mod tests {
         });
         let out = mgr.post(peer, oos, &mut t);
         assert!(
-            out.iter().any(|b| matches!(classify(b), Event::SrejReceived(_))),
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SrejReceived(_))),
             "the negotiated SREJ must emit an SREJ on the wire: {out:02x?}"
         );
         assert!(
-            !out.iter().any(|b| matches!(classify(b), Event::RejReceived(_))),
+            !out.iter()
+                .any(|b| matches!(classify(b), Event::RejReceived(_))),
             "a negotiated-SREJ link must not fall back to REJ: {out:02x?}"
         );
     }
@@ -1184,7 +1429,10 @@ mod tests {
 
         let plan = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
         let out = mgr.connect_planned(local, peer, plan, &mut t);
-        assert!(Frame::decode(&out[0]).unwrap().is_command(), "XID command out");
+        assert!(
+            Frame::decode(&out[0]).unwrap().is_command(),
+            "XID command out"
+        );
         assert!(mgr.xid_probe_pending(&peer));
         // The context is optimistically SREJ-seeded while the probe is open.
         assert!(mgr.session_for(&peer).unwrap().context.srej_enabled);
@@ -1192,29 +1440,318 @@ mod tests {
         // No response in the budget ⇒ timeout: revert to go-back-N + the deferred SABM.
         let out = mgr.xid_probe_timeout(peer, &mut t);
         assert!(
-            out.iter().any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
             "the fallback SABM fires on timeout: {out:02x?}"
         );
         assert!(!mgr.xid_probe_pending(&peer), "probe cleared on timeout");
         let s = mgr.session_for(&peer).unwrap();
         assert_eq!(s.state, State::AwaitingConnection);
-        assert!(!s.context.srej_enabled, "silent peer ⇒ reverted to go-back-N");
+        assert!(
+            !s.context.srej_enabled,
+            "silent peer ⇒ reverted to go-back-N"
+        );
         assert!(s.context.implicit_reject);
         let (obs_ext, obs_srej) = (s.context.is_extended, s.context.srej_enabled);
 
         // record_outcome ⇒ the cache learns the peer is a non-answerer.
         cache.record_outcome(
-            PROBE_PORT, peer, plan.extended, obs_ext, plan.pre_connect_xid, obs_srej, PROBE_T0,
+            PROBE_PORT,
+            peer,
+            plan.extended,
+            obs_ext,
+            plan.pre_connect_xid,
+            obs_srej,
+            PROBE_T0,
         );
         assert_eq!(
-            cache.lookup(PROBE_PORT, &peer).unwrap().supports_srej_via_xid,
+            cache
+                .lookup(PROBE_PORT, &peer)
+                .unwrap()
+                .supports_srej_via_xid,
             Some(false)
         );
         let next = cache.plan_dial(PROBE_PORT, &peer, PeerDialPolicy::Interlink, PROBE_T0);
-        assert!(!next.pre_connect_xid, "known non-answerer ⇒ skip the probe next time");
+        assert!(
+            !next.pre_connect_xid,
+            "known non-answerer ⇒ skip the probe next time"
+        );
 
         // Timing out with no probe pending is a no-op.
         assert!(mgr.xid_probe_timeout(peer, &mut t).is_empty());
+    }
+
+    // ─── Slot keying + the Disconnected catch-alls ──────────────────────────
+
+    /// Slots are keyed on the (local, peer) pair, mirroring the C# SessionKey:
+    /// an out-dial to a peer on a complemented-SSID local and an inbound link
+    /// from that same peer to the node callsign are two distinct links and must
+    /// never share (and corrupt) one slot.
+    #[test]
+    fn same_peer_under_two_locals_gets_two_slots() {
+        let mut mgr: SessionManager<4> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7XYZ");
+
+        // Console out-dial as the complemented SSID.
+        let out = mgr.connect_extended(call("M0LTE-2"), peer, false, &mut t);
+        assert!(matches!(classify(&out[0]), Event::SabmReceived(_)));
+
+        // The same peer now connects INBOUND to the node callsign.
+        let out = mgr.post(peer, sabm(), &mut t);
+        assert_eq!(mgr.active(), 2, "two links, two slots");
+        assert!(
+            out.iter()
+                .any(|b| matches!(classify(b), Event::UaReceived(_))),
+            "the inbound SABM is accepted on its own slot: {out:02x?}"
+        );
+        // The out-dial slot was not disturbed by the inbound SABM; the inbound
+        // link connected on its own slot.
+        assert_eq!(
+            mgr.session_for_pair(&call("M0LTE-2"), &peer)
+                .map(|s| s.state),
+            Some(State::AwaitingConnection)
+        );
+        assert_eq!(
+            mgr.session_for_pair(&call("M0LTE-1"), &peer)
+                .map(|s| s.state),
+            Some(State::Connected)
+        );
+    }
+
+    /// A stray command frame (RR here) from a peer with no session must be
+    /// refused with a DM via the figc4.1 catch-all - and must NOT pin a session
+    /// slot (the C# runs these through a throwaway transient session).
+    #[test]
+    fn stray_command_from_unknown_peer_gets_dm_and_pins_no_slot() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+
+        for (n, peer) in ["G7AAA", "G7BBB", "G7CCC"].iter().enumerate() {
+            let rr = Event::RrReceived(FrameInfo {
+                nr: 0,
+                poll_final: true,
+                is_command: true,
+                ..Default::default()
+            });
+            let out = mgr.post(call(peer), rr, &mut t);
+            assert!(
+                out.iter()
+                    .any(|b| matches!(classify(b), Event::DmReceived(_))),
+                "stray {n}: the catch-all answers DM: {out:02x?}"
+            );
+            assert_eq!(mgr.active(), 0, "stray {n}: no slot pinned");
+        }
+    }
+
+    /// The same reclassify applies to a CACHED session sitting in Disconnected
+    /// (a link we already tore down): a peer still polling with RR gets the DM
+    /// straight away instead of burning its whole retry budget on silence.
+    #[test]
+    fn cached_disconnected_session_answers_stray_rr_with_dm() {
+        let mut mgr: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut t = MockTimerService::new();
+        let peer = call("G7AAA");
+
+        mgr.post(peer, sabm(), &mut t);
+        let disc = Event::DiscReceived(FrameInfo {
+            poll_final: true,
+            is_command: true,
+            ..Default::default()
+        });
+        mgr.post(peer, disc, &mut t);
+        assert_eq!(
+            mgr.session_for(&peer).map(|s| s.state),
+            Some(State::Disconnected)
+        );
+
+        // The peer's RR poll after our teardown: DM, not silence.
+        let rr = Event::RrReceived(FrameInfo {
+            nr: 0,
+            poll_final: true,
+            is_command: true,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, rr, &mut t);
+        assert!(
+            out.iter()
+                .any(|b| matches!(classify(b), Event::DmReceived(_))),
+            "Disconnected catch-all answers DM: {out:02x?}"
+        );
+    }
+
+    // ─── The MDL machine on the wire (figc5.x via the generated tables) ─────
+
+    /// The figc4.6 post-UA MDL negotiation, end-to-end over real wire octets:
+    /// A dials SABME, B answers UA; A's UA processing raises MDL-NEGOTIATE
+    /// Request, so A's XID command goes out (TM201 armed); B - connected, so the
+    /// responder path with no SREJ seeding - answers an XID response (F=1); A's
+    /// figc5.2 applies the negotiated parameters and confirms. Mirrors the C#
+    /// listener wiring `sendInternal → mdl.Negotiate()`.
+    #[test]
+    fn v22_connect_negotiates_xid_post_ua_through_the_mdl_tables() {
+        use crate::ax25::Frame;
+        use crate::sdl::mdl::MdlSignal;
+        use crate::sdl::TimerId;
+
+        let mut a: SessionManager<2> = SessionManager::new(call("M0LTE-1"));
+        let mut b: SessionManager<2> = SessionManager::new(call("M0LTE-2"));
+        let mut t = MockTimerService::new();
+        let (ca, cb) = (call("M0LTE-1"), call("M0LTE-2"));
+
+        // A → SABME; B → UA (Connected, mod-128 adopted).
+        let sabme = a.connect_extended(ca, cb, true, &mut t);
+        let from_b = b.post(ca, classify(&sabme[0]), &mut t);
+        assert!(matches!(classify(&from_b[0]), Event::UaReceived(_)));
+
+        // A processes the UA: ConnectConfirm AND the post-UA XID command.
+        let from_a = a.post(cb, classify(&from_b[0]), &mut t);
+        assert_eq!(a.session_for(&cb).unwrap().state, State::Connected);
+        assert_eq!(
+            from_a.len(),
+            1,
+            "the MDL's XID command goes out: {from_a:02x?}"
+        );
+        let xid_cmd = Frame::decode(&from_a[0]).expect("XID command decodes");
+        assert!(xid_cmd.is_command(), "an XID *command* (our offer)");
+        assert!(xid_cmd.poll_final(), "P=1 (error A implies it)");
+        assert!(matches!(classify(&from_a[0]), Event::XidReceived(_)));
+        assert!(a.mdl_negotiating(&cb), "A's MDL is mid-exchange");
+        assert!(t.is_running(TimerId::Tm201), "TM201 armed for the retry");
+        assert!(
+            !a.xid_probe_pending(&cb),
+            "post-UA negotiation defers no dial - the link is already up"
+        );
+
+        // B answers the command with an XID response, F=1 (responder path).
+        let from_b = b.post(ca, classify(&from_a[0]), &mut t);
+        assert_eq!(from_b.len(), 1, "one XID response: {from_b:02x?}");
+        let resp = Frame::decode(&from_b[0]).expect("XID response decodes");
+        assert!(resp.is_response() && resp.poll_final());
+
+        // A's figc5.2 F=1 path: apply negotiated + StopTM201 + Confirm.
+        let _ = a.post(cb, classify(&from_b[0]), &mut t);
+        assert!(!a.mdl_negotiating(&cb), "exchange complete");
+        assert!(!t.is_running(TimerId::Tm201), "TM201 stopped");
+        assert!(a
+            .take_mdl_signals(&cb)
+            .contains(&MdlSignal::NegotiateConfirm));
+        let s = a.session_for(&cb).unwrap();
+        assert_eq!(s.state, State::Connected, "the data link never noticed");
+        assert!(
+            s.context.is_extended,
+            "both offered mod-128 ⇒ it survives the merge"
+        );
+    }
+
+    /// figc5.2's TM201 leg: each expiry below NM201 retries the XID command
+    /// (RC+1, re-arm); at RC == NM201 the machine gives up with MDL-ERROR C  -
+    /// and a probe's deferred dial then falls back to a plain go-back-N SABM.
+    #[test]
+    fn tm201_retries_the_xid_command_then_gives_up_and_the_probe_falls_back() {
+        use crate::sdl::mdl::MdlSignal;
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let mut t = MockTimerService::new();
+
+        let out = mgr.begin_xid_probe(local, peer, &mut t);
+        assert!(matches!(classify(&out[0]), Event::XidReceived(_)));
+        let nm201 = mgr.session_for(&peer).unwrap().context.n2;
+
+        // Every expiry with RC < NM201 is a retry: another XID command, no SABM.
+        for i in 0..nm201 {
+            let out = mgr.tm201_expiry(peer, &mut t);
+            assert_eq!(out.len(), 1, "retry {i}: one XID command: {out:02x?}");
+            assert!(matches!(classify(&out[0]), Event::XidReceived(_)));
+            assert!(mgr.mdl_negotiating(&peer));
+        }
+
+        // The NM201'th expiry gives up (error C) and the deferred SABM fires,
+        // reverted to go-back-N.
+        let out = mgr.tm201_expiry(peer, &mut t);
+        assert!(
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "give-up falls back to the deferred SABM: {out:02x?}"
+        );
+        assert!(!mgr.mdl_negotiating(&peer));
+        assert!(!mgr.xid_probe_pending(&peer));
+        assert!(mgr
+            .take_mdl_signals(&peer)
+            .contains(&MdlSignal::ErrorIndicate("C")));
+        let s = mgr.session_for(&peer).unwrap();
+        assert!(!s.context.srej_enabled, "no answer ⇒ reverted to go-back-N");
+        assert_eq!(s.state, State::AwaitingConnection);
+    }
+
+    /// figc5.2 t02: a FRMR answering our probe's XID command is the pre-v2.2
+    /// peer's refusal - the §6.3.2 ¶1 fallback applies the FULL v2.0 default set,
+    /// confirms, and the deferred dial proceeds as a plain SABM.
+    #[test]
+    fn frmr_answer_to_the_probe_takes_the_v20_fallback_and_dials_sabm() {
+        use crate::sdl::mdl::MdlSignal;
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let mut t = MockTimerService::new();
+
+        let _ = mgr.begin_xid_probe(local, peer, &mut t);
+        let frmr = Event::FrmrReceived(FrameInfo {
+            poll_final: true,
+            is_command: false,
+            ..Default::default()
+        });
+        let out = mgr.post(peer, frmr, &mut t);
+
+        assert!(
+            out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "the FRMR resolves the probe into the deferred SABM: {out:02x?}"
+        );
+        assert!(mgr
+            .take_mdl_signals(&peer)
+            .contains(&MdlSignal::NegotiateConfirm));
+        let s = mgr.session_for(&peer).unwrap();
+        assert!(!s.context.is_extended, "v2.0 defaults applied");
+        assert!(!s.context.srej_enabled);
+        assert_eq!(s.state, State::AwaitingConnection);
+    }
+
+    /// figc5.2's F=0 diamond: an XID response without F=1 is error D - the
+    /// machine stays in Negotiating (still awaiting the real response), so the
+    /// probe's deferred dial keeps waiting.
+    #[test]
+    fn xid_response_without_f1_is_error_d_and_the_probe_keeps_waiting() {
+        use crate::sdl::mdl::MdlSignal;
+
+        let local = call("M0LTE-1");
+        let peer = call("G7XYZ");
+        let mut mgr: SessionManager<2> = SessionManager::new(local);
+        let mut t = MockTimerService::new();
+
+        let _ = mgr.begin_xid_probe(local, peer, &mut t);
+        let mut resp = xid_response_offering_srej();
+        if let Event::XidReceived(fi) = &mut resp {
+            fi.poll_final = false; // F=0
+        }
+        let out = mgr.post(peer, resp, &mut t);
+
+        assert!(
+            !out.iter()
+                .any(|b| matches!(classify(b), Event::SabmReceived(_))),
+            "no SABM on an F=0 response: {out:02x?}"
+        );
+        assert!(
+            mgr.mdl_negotiating(&peer),
+            "still awaiting the real response"
+        );
+        assert!(mgr.xid_probe_pending(&peer));
+        assert!(mgr
+            .take_mdl_signals(&peer)
+            .contains(&MdlSignal::ErrorIndicate("D")));
     }
 
     /// (c) a fresh cache hit ⇒ no probe: dial straight with the cached capabilities.
@@ -1238,7 +1775,10 @@ mod tests {
             matches!(classify(&out[0]), Event::SabmReceived(_)),
             "dials a plain SABM straight, no XID command"
         );
-        assert!(!mgr.xid_probe_pending(&peer), "no probe on a fresh cache hit");
+        assert!(
+            !mgr.xid_probe_pending(&peer),
+            "no probe on a fresh cache hit"
+        );
 
         // Fresh extended positive ⇒ dials SABME straight (still no probe).
         let mut cache2: PeerCapabilityCache<4> = PeerCapabilityCache::new();

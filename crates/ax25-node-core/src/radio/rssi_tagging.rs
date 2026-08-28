@@ -205,9 +205,7 @@ impl RssiTagger {
                 };
                 let stats = self.stats_between(rise, to);
                 let pre_data = if burst_index == 0 {
-                    airtime_us.map(|air| {
-                        received_at_us as i64 - air as i64 - rise as i64
-                    })
+                    airtime_us.map(|air| received_at_us as i64 - air as i64 - rise as i64)
                 } else {
                     None
                 };
@@ -309,16 +307,19 @@ impl RssiTagger {
     fn claim_window(&mut self, chosen: WindowRef) -> (u64, Option<u64>, u16) {
         match chosen {
             WindowRef::Current => {
-                let w = self.current_window.as_mut().expect("current window present");
+                let w = self
+                    .current_window
+                    .as_mut()
+                    .expect("current window present");
                 let bi = w.frames_delivered;
-                w.frames_delivered += 1;
+                w.frames_delivered = w.frames_delivered.saturating_add(1);
                 (w.rise_at_us, w.fall_at_us, bi)
             }
             WindowRef::Closed(i) => {
                 let idx = (self.window_head + i) % WINDOW_CAPACITY;
                 let w = &mut self.windows[idx];
                 let bi = w.frames_delivered;
-                w.frames_delivered += 1;
+                w.frames_delivered = w.frames_delivered.saturating_add(1);
                 (w.rise_at_us, w.fall_at_us, bi)
             }
         }
@@ -436,9 +437,7 @@ mod tests {
         t.carrier_edge(false, 1_100_000);
 
         // First frame of the burst, delivered just after carrier-fall.
-        let meta = t
-            .attribute(1_130_000, 27, Some(9600))
-            .expect("attributed");
+        let meta = t.attribute(1_130_000, 27, Some(9600)).expect("attributed");
         assert_eq!(meta.rssi_dbm_tenths, Some(-500)); // median of −520,−500,−480
         assert_eq!(meta.rssi_min_dbm_tenths, Some(-520));
         assert_eq!(meta.rssi_max_dbm_tenths, Some(-480));
@@ -452,9 +451,7 @@ mod tests {
         assert_eq!(meta.pre_data_carrier_us, Some(105_000));
 
         // Second frame in the same (closed) window: burst index 1, no pre-data.
-        let meta2 = t
-            .attribute(1_140_000, 27, Some(9600))
-            .expect("attributed");
+        let meta2 = t.attribute(1_140_000, 27, Some(9600)).expect("attributed");
         assert_eq!(meta2.burst_index, Some(1));
         assert_eq!(meta2.pre_data_carrier_us, None);
     }

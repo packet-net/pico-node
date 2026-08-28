@@ -68,6 +68,9 @@ pub enum ParseError {
     /// [`Ax25ParseOptions::allow_command_frame_as_response`] was not set
     /// (strict §4.3.3.1 / §6.1.2).
     CommandFrameAsResponse,
+    /// An I or UI frame ended at the control field with no PID octet (§3.4
+    /// requires one on those frames).
+    MissingPid,
 }
 
 /// A decoded AX.25 frame (modulo-8 view of the control field).
@@ -287,15 +290,13 @@ impl Frame {
         let is_i = (control & 0x01) == 0;
         let is_ui = (control & 0xEF) == CONTROL_UI;
         let (pid, info) = if is_i || is_ui {
-            if bytes.len() > offset {
-                (Some(bytes[offset]), bytes[offset + 1..].to_vec())
-            } else {
-                // Lenient: an I/UI frame with no room for a PID octet keeps the
-                // crate's historical acceptance (pid absent, empty info). This is
-                // looser than C# strict (which requires a PID here), but it is not
-                // one of the named flags, so it stays unchanged.
-                (None, Vec::new())
+            if bytes.len() <= offset {
+                // §3.4: every I and UI frame carries a PID octet. The C# TryParse
+                // rejects a frame truncated here under every options preset, so
+                // this is unconditional (not one of the named leniency flags).
+                return Err(ParseError::MissingPid);
             }
+            (Some(bytes[offset]), bytes[offset + 1..].to_vec())
         } else if offset < bytes.len() {
             // A non-I/non-UI frame with trailing bytes. §3.5 permits an info field
             // only on FRMR/XID/TEST among these; S frames and SABM/SABME/DISC/UA/DM
@@ -579,6 +580,52 @@ mod tests {
         assert!(g.is_supervisory());
         assert_eq!(g.pid, None);
         assert!(g.info.is_empty());
+    }
+
+    #[test]
+    fn ui_frame_truncated_at_control_is_rejected() {
+        // A UI frame whose bytes end at the control octet (no PID). C# TryParse
+        // rejects this under every options preset, so both entry points must too.
+        let f = Frame {
+            destination: addr("M0LTE", true),
+            source: addr("G7XYZ", false),
+            digipeaters: Vec::new(),
+            control: CONTROL_UI,
+            pid: None,
+            info: Vec::new(),
+        };
+        let wire = f.encode(); // 14 address octets + control, nothing after
+        assert_eq!(Frame::decode(&wire), Err(ParseError::MissingPid));
+        assert_eq!(
+            Frame::decode_with_options(&wire, &Ax25ParseOptions::LENIENT),
+            Err(ParseError::MissingPid)
+        );
+        assert_eq!(
+            Frame::decode_with_options(&wire, &Ax25ParseOptions::STRICT),
+            Err(ParseError::MissingPid)
+        );
+    }
+
+    #[test]
+    fn i_frame_truncated_at_control_is_rejected() {
+        let f = Frame {
+            destination: addr("M0LTE", true),
+            source: addr("G7XYZ", false),
+            digipeaters: Vec::new(),
+            control: 0x00, // I frame, N(S)=0 N(R)=0 P=0
+            pid: None,
+            info: Vec::new(),
+        };
+        let wire = f.encode();
+        assert_eq!(Frame::decode(&wire), Err(ParseError::MissingPid));
+        // The modulo-aware entry point rejects it too (extended I frames still
+        // require a PID after the 2-octet control field).
+        let mut ext_wire = wire.clone();
+        ext_wire.push(0x00); // second control octet only, still no PID
+        assert_eq!(
+            Frame::decode_with_modulo(&ext_wire, true),
+            Err(ParseError::MissingPid)
+        );
     }
 
     #[test]

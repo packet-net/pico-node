@@ -21,10 +21,10 @@
 
 [package]
 name = "ax25-node-fw"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/m0lte/pico-node"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/packet-net/pico-node"
 description = "RP2040 / Pico W AX.25 packet-node firmware (Embassy + cyw43 + embassy-net), wiring ax25-node-core to WiFi/UART."
 publish = false
 

@@ -109,12 +109,18 @@ pub fn eval_atom(
         Ax25Guard::ResponseAndFEq1 => frame
             .map(|f| f.is_response() && f.poll_final)
             .unwrap_or(false),
-        // Enquiry_Response's compound: F set AND the frame is RR/RNR/I. We only
-        // hold a FrameInfo (already classified), so honour it for the
-        // poll-able-shape frames the runtime actually feeds (I/RR/RNR all arrive
-        // with poll_final set on a poll); REJ/SREJ never carry it into this path.
+        // Enquiry_Response's compound: F set AND the frame is RR/RNR/I. The
+        // frame type is the trigger's classified variant, so test it there -
+        // C# `FEq1AndSupervisoryOrI` requires `PollFinal && (isI || isRR ||
+        // isRNR)`, which excludes a REJ/SREJ command poll (that falls through
+        // to Enquiry_Response's plain-RR t07 branch instead of the
+        // stored-frame SREJ/RNR branches).
         Ax25Guard::FEq1AndFrameEqRROrFrameEqRNROrFrameEqI => {
-            frame.map(|f| f.poll_final).unwrap_or(false)
+            let shape_matches = matches!(
+                trigger,
+                Event::IReceived(_) | Event::RrReceived(_) | Event::RnrReceived(_)
+            );
+            shape_matches && frame.map(|f| f.poll_final).unwrap_or(false)
         }
 
         // ─── Frame-aware: received N(s)/N(r) comparisons ────────────────
