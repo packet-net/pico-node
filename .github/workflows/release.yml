@@ -39,6 +39,19 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
+      # Tags cut before this workflow landed carry a package-ota.sh that
+      # hard-requires picotool (absent on the runner) and no bin2uf2.py.
+      # Backfill just the packaging tooling from main for those tags; the crate
+      # sources stay exactly the tag's. Self-retiring: any tag from v0.5.0's
+      # successor onward has the files, so this step is a no-op.
+      - name: Backfill the packaging tooling for pre-workflow tags
+        run: |
+          if [ ! -f scripts/bin2uf2.py ]; then
+            echo "tag predates bin2uf2.py; taking scripts/ tooling from main"
+            git fetch -q origin main
+            git checkout origin/main -- scripts/bin2uf2.py scripts/package-ota.sh
+          fi
+
       # Same sibling-clone dance as ci.yml, but the SHA is read from
       # parity-manifest.toml's [sdl] pin so this workflow never becomes a third
       # hardcoded copy to bump.
