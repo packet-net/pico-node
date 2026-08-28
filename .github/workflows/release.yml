@@ -1,0 +1,81 @@
+name: release
+
+# Build + publish the flashable release artifacts for a version tag, on the
+# same self-hosted runner CI uses (it carries the embedded toolchain). Fires on
+# any v* tag push; workflow_dispatch takes a tag input to (re)cut a release for
+# an existing tag (e.g. one pushed before this workflow landed).
+#
+# The artifacts mirror the hand-cut v0.4.x releases (docs/OTA.md,
+# scripts/package-ota.sh): pico-node-app.bin (the OTA upload payload), the two
+# contiguous BOOTSEL UF2s, the app ELF, and SHA256SUMS. package-ota.sh clears
+# the machine-specific option_env! values, so the images are same-for-everyone
+# and credential-free by construction.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + release (e.g. v0.5.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: package + publish
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Resolve the tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "releasing $TAG"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # Same sibling-clone dance as ci.yml, but the SHA is read from
+      # parity-manifest.toml's [sdl] pin so this workflow never becomes a third
+      # hardcoded copy to bump.
+      - name: Check out the ax25sdl sibling (path dependency)
+        run: |
+          PIN=$(grep -oP '^pin\s*=\s*"\K[0-9a-f]{40}' parity-manifest.toml)
+          echo "ax25sdl pin: $PIN"
+          rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
+          git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git "$PIN"
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
+
+      # llvm-tools backs rust-objcopy for the bootloader build (the fw crate's
+      # own rust-toolchain.toml already lists it for the app build).
+      - name: Install Rust 1.93.1 (+ thumbv6m target, llvm-tools)
+        uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: thumbv6m-none-eabi
+          components: llvm-tools
+
+      - name: Ensure flip-link + rust-objcopy
+        run: |
+          command -v flip-link >/dev/null || cargo install flip-link --locked
+          command -v rust-objcopy >/dev/null || cargo install cargo-binutils --locked
+
+      - name: Flash-layout guard
+        run: ./scripts/check-layout.sh
+
+      - name: Build + package the artifacts
+        run: OTA_BUILD_TAG="${{ steps.tag.outputs.tag }}" ./scripts/package-ota.sh dist
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" \
+            dist/pico-node-app.bin dist/pico-node-app.elf \
+            dist/pico-node-firmware.uf2 dist/pico-node-blobs.uf2 dist/SHA256SUMS \
+            --verify-tag --title "$TAG" --generate-notes
