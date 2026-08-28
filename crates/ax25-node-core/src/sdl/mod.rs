@@ -28,6 +28,11 @@
 //! - [`loop_exec`] — the `loop_while` expander ([`ax25sdl::LoopRange`]).
 //! - [`quirks`] — the named figc4.x spec-defect fixes (default-on, as in packet.net's `Ax25SessionQuirks`).
 //! - [`session`] — the [`session::Session`] driver tying it together.
+//! - [`mdl`] - the management-data-link machine ([`MdlMachine`]) driving the
+//!   generated figc5.1/figc5.2 pages (post-UA XID negotiation + the pre-connect
+//!   probe), plus the §6.3.2 negotiator merge and the figc5.1 responder.
+//! - [`manager`] - the fixed-capacity, `(local, peer)`-keyed [`SessionManager`]
+//!   (sessions + per-link MDL + the inbound XID/FRMR router).
 //!
 //! ## Status
 //!
@@ -62,7 +67,7 @@ pub use loop_exec::{run_loop, MAX_ITERATIONS};
 pub use manager::{SessionManager, Slot};
 pub use mdl::{
     apply_negotiated, apply_version_20_defaults, default_offer_for, respond_pre_session_xid,
-    respond_to_xid_command,
+    respond_to_xid_command, MdlEvent, MdlMachine, MdlOutcome, MdlSignal, MdlState, TM201_MS,
 };
 pub use quirks::Quirks;
 pub use session::{Session, State};

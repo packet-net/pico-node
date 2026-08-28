@@ -92,6 +92,12 @@ pub struct WireSink {
     /// and awaits an [`super::Event::LmSeizeConfirm`]. Set by `send_link_mux`,
     /// cleared by the driver when it grants the seize.
     pub seize_pending: bool,
+    /// The figc4.6 UA path raised `MDL-NEGOTIATE Request` (a successful v2.2
+    /// connect wants its post-UA XID negotiation). Set by `send_internal`,
+    /// cleared by the driver when it hands the poke to the slot's
+    /// [`super::mdl::MdlMachine`] - the pico analogue of the C# listener's
+    /// `sendInternal: sig => { if (sig is MdlNegotiateRequestSignal) mdl.Negotiate(); }`.
+    pub mdl_negotiate_pending: bool,
 }
 
 impl WireSink {
@@ -106,6 +112,7 @@ impl WireSink {
             sent: Vec::new(),
             upward: Vec::new(),
             seize_pending: false,
+            mdl_negotiate_pending: false,
         }
     }
 
@@ -277,7 +284,11 @@ impl SessionSink for WireSink {
             self.seize_pending = true;
         }
     }
-    fn send_internal(&mut self, _signal: InternalSignal) {}
+    fn send_internal(&mut self, signal: InternalSignal) {
+        if signal == InternalSignal::MdlNegotiateRequest {
+            self.mdl_negotiate_pending = true;
+        }
+    }
 }
 
 /// Classify a received **modulo-8** [`Frame`] into the runtime [`Event`] that should
@@ -398,7 +409,10 @@ mod tests {
                 assert_eq!(fi.info, info, "raw XID info bytes carried through");
                 // The carried info re-parses to the offered parameters.
                 let p = info_field::parse(&fi.info).expect("info round-trips");
-                assert_eq!(p.hdlc_optional_functions.unwrap().reject, RejectMode::SelectiveReject);
+                assert_eq!(
+                    p.hdlc_optional_functions.unwrap().reject,
+                    RejectMode::SelectiveReject
+                );
             }
             other => panic!("expected XidReceived, got {other:?}"),
         }

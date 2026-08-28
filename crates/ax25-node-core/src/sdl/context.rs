@@ -216,12 +216,18 @@ impl SessionContext {
     /// quirk off (or SREJ disabled — a go-back-N link) it is just [`k`](Self::k),
     /// reproducing the figure-literal unbounded window. Used by both the send-side
     /// window checks (`can_transmit_i_frame`, the `v_s_eq_v_a_plus_k` guard) and the
-    /// #40 receive-window discard. Ports `Ax25SessionContext.EffectiveWindow`.
+    /// #40 receive-window discard. Ports `Ax25SessionContext.EffectiveWindow`,
+    /// including its final `min(window, modulus - 1)`: the retransmit store keys
+    /// frames by the bare N(S), so a window of `k >= modulus` would let V(S) lap
+    /// V(A) and alias two in-flight frames onto one sequence number. Latent with
+    /// the defaults (k = 4) but real for a configured/negotiated k at or above
+    /// the modulus on a mod-8 link.
     pub fn effective_window(&self) -> u32 {
+        let cap = self.modulus() as u32 - 1;
         if self.quirks.clamp_srej_window_to_half_modulus && self.srej_enabled {
             self.k.min(self.modulus() as u32 / 2)
         } else {
-            self.k
+            self.k.min(cap)
         }
     }
 

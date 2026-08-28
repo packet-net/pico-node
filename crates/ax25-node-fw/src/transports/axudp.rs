@@ -705,6 +705,22 @@ pub async fn task(
                     let expired = ps.timers.take_expired(now);
                     for id in expired {
                         defmt::debug!("axudp: timer expiry ({=u8})", id as u8);
+                        let Some(event) = session::expiry_event(id) else {
+                            // TM201 (the MDL XID retry timer): not a data-link
+                            // event - the manager drives the peer's MDL machine,
+                            // which retries the XID command or, on give-up, fires
+                            // a probe's deferred SABM.
+                            let (frames, ep) = {
+                                let Some(ps) = peers[i].as_mut() else {
+                                    break;
+                                };
+                                let peer = ps.peer;
+                                let ep = ps.endpoint;
+                                (sessions.tm201_expiry(peer, &mut ps.timers), ep)
+                            };
+                            send_all(&socket, ep, frames).await;
+                            continue;
+                        };
                         drive(
                             &mut sessions,
                             &mut peers,
@@ -719,7 +735,7 @@ pub async fn task(
                                 inp3: inp3.as_mut(),
                             },
                             i,
-                            session::expiry_event(id),
+                            event,
                             &console_id,
                             &prompt,
                         )
