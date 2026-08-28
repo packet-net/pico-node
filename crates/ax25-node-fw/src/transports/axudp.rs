@@ -1387,34 +1387,32 @@ async fn ensure_interlinks(
         if heard_lookup(heard, &nbr).is_none() {
             continue; // no endpoint to reach it — wait until we hear it
         }
-        match start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
-            Ok(i) => {
-                let mut name = [0u8; 16];
-                defmt::info!(
-                    "axudp: bringing up interlink to {=str}",
-                    call_str(&nbr, &mut name)
-                );
-                drive(
-                    sessions,
-                    peers,
-                    socket,
-                    heard,
-                    beacon_ep,
-                    my_call,
-                    &mut L4 {
-                        connector,
-                        netrom,
-                        circuits,
-                        inp3: inp3.as_deref_mut(),
-                    },
-                    i,
-                    Event::DlConnectRequest,
-                    console_id,
-                    prompt,
-                )
-                .await;
-            }
-            Err(_) => {} // busy/no-slot — fine, try again next pass
+        // Err from start_outbound (busy/no-slot) is fine; try again next pass.
+        if let Ok(i) = start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
+            let mut name = [0u8; 16];
+            defmt::info!(
+                "axudp: bringing up interlink to {=str}",
+                call_str(&nbr, &mut name)
+            );
+            drive(
+                sessions,
+                peers,
+                socket,
+                heard,
+                beacon_ep,
+                my_call,
+                &mut L4 {
+                    connector,
+                    netrom,
+                    circuits,
+                    inp3: inp3.as_deref_mut(),
+                },
+                i,
+                Event::DlConnectRequest,
+                console_id,
+                prompt,
+            )
+            .await;
         }
     }
 }

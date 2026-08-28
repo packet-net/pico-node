@@ -154,7 +154,7 @@ pub fn save(
 
     // Sized up to the write granularity so a padded write can never index
     // past the buffer, whatever MAX_BODY grows to.
-    const RECORD_CAPACITY: usize = (HEADER_LEN + MAX_BODY + 2 + 255) / 256 * 256;
+    const RECORD_CAPACITY: usize = (HEADER_LEN + MAX_BODY + 2).div_ceil(256) * 256;
     let mut record = [0xFFu8; RECORD_CAPACITY];
     record[0..4].copy_from_slice(MAGIC);
     record[4] = VERSION;
@@ -179,7 +179,7 @@ pub fn save(
     let total = at + 2;
     let padded = total.div_ceil(256) * 256;
 
-    let offset = if generation % 2 == 0 {
+    let offset = if generation.is_multiple_of(2) {
         SECTOR_A
     } else {
         SECTOR_B
@@ -279,7 +279,7 @@ pub fn load(flash: &mut ConfigFlash, netrom: &mut NetRom, my_call: Callsign) -> 
     let mut replayed = 0usize;
 
     for r in &routes {
-        if done.iter().any(|c| *c == r.neighbour) {
+        if done.contains(&r.neighbour) {
             continue;
         }
         let _ = done.push(r.neighbour);
