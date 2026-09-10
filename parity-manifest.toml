@@ -37,7 +37,7 @@ reference = "packet-net/packet.net"   # C# Packet.* is the reference runtime
 # quirk) is mirrored in `sdl::quirks` - see that module's docs.
 crate        = "ax25sdl"
 repo         = "packet-net/ax25sdl"   # formerly m0lte/ax25sdl (GitHub org-rename redirect)
-rust_crate   = "0.8.0"                # the Rust crate version this pin provides (no_std backend; AGPL-3.0)
+rust_crate   = "0.9.0"                # the Rust crate version this pin provides (no_std backend; AGPL-3.0)
 csharp_nuget = "0.10.2"               # what C# pins - carries the same corrected figc4.5 tables
 pin          = "4212c1e1b9bc27f5520e820c995c10204838cee8"  # reproducible latest; MUST match ci.yml
 

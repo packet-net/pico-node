@@ -28,11 +28,6 @@ pub struct Quirks {
     /// (packet.net#674). It replaces the retired `srej_selective_retransmit`
     /// (#38) rewrite, which the corrected figure absorbed (packet.net#682).
     pub srej_command_ignored: bool,
-    /// figc4.4's out-of-sequence I_received path has no receive-window guard, so a
-    /// duplicate behind V(R) provokes an endless out-of-window re-send (the SREJ
-    /// livelock). OR the out-of-window condition into `reject_exception`'s
-    /// discard-vs-reject switch (X.25 §2.4.6.4; ax25spec#40, packet.net#242).
-    pub discard_out_of_window_i_frames: bool,
     /// `Select_T1_Value`'s SRT IIR self-amplifies on a timeout sample (no clean
     /// round-trip measurement), growing T1V unbounded. Karn's algorithm: skip the
     /// SRT update when T1 wasn't stopped by an ack (ax25spec#41, packet.net#241).
@@ -99,7 +94,6 @@ impl Default for Quirks {
     fn default() -> Self {
         Self {
             srej_command_ignored: true,
-            discard_out_of_window_i_frames: true,
             karn_srt_sampling: true,
             srej_targets_gap: true,
             dl_flow_off_enters_busy: true,
@@ -118,7 +112,6 @@ impl Quirks {
     pub fn strictly_faithful() -> Self {
         Self {
             srej_command_ignored: false,
-            discard_out_of_window_i_frames: false,
             karn_srt_sampling: false,
             srej_targets_gap: false,
             dl_flow_off_enters_busy: false,

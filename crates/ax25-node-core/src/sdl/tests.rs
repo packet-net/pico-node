@@ -643,6 +643,108 @@ fn go_back_n_link_emits_rej_not_srej_on_out_of_sequence_i_frame() {
     );
 }
 
+/// figc4.4 and figc4.5 gained the X.25 2.4.6.4(a) receive-window test in
+/// ax25spec#40 (`ax25sdl` 0.11.0), drawn as the decision
+/// "V(r) < N(s) < V(r) + k?" ahead of the reject-exception/SREJ split. An N(s)
+/// outside the window this station granted is a duplicate of a frame already
+/// received and acknowledged, so it is discarded: no SREJ, no REJ, nothing
+/// stored, V(r) untouched. Before the figure carried it this was the
+/// `discard_out_of_window_i_frames` quirk (packet.net#242), now retired.
+///
+/// This is the on-air fault from 2026-09-09 (axcall to GB7RDG, LinBPQ): the
+/// peer's checkpoint retransmission redelivered an acknowledged N(s), the
+/// figure SREJ'd it, and with an empty sender queue that SREJ named a frame
+/// that would never exist, so nothing could clear it.
+#[test]
+fn out_of_window_duplicate_i_frame_is_discarded_not_rejected() {
+    let mut s = connected_session();
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    s.context.vr = 2; // frames 0 and 1 already received and acknowledged
+    s.context.k = 4; // granted window is the open interval (2, 6)
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // N(s) = 1 is behind V(r): a duplicate of an already-acknowledged frame.
+    s.post_event(Event::IReceived(rx_i(1, 0, false)), &mut t, &mut r);
+
+    let sup = r.supervisory();
+    assert!(
+        !sup.iter()
+            .any(|(k, _)| *k == SupervisoryKind::Srej || *k == SupervisoryKind::Rej),
+        "no frame is missing, so a duplicate must raise no reject exception: {sup:?}"
+    );
+    assert!(
+        !s.context.stored_received_i_frames.contains_key(&1),
+        "a discarded duplicate must not land in the receive buffer"
+    );
+    assert_eq!(s.context.vr, 2, "a discarded duplicate must not move V(r)");
+    assert!(
+        r.upward.is_empty(),
+        "the duplicate's information field is discarded, never delivered: {:?}",
+        r.upward
+    );
+}
+
+/// The contrast, so the test above cannot pass by discarding everything: an
+/// out-of-sequence N(s) that IS inside the granted window is a real gap and
+/// still recovers with SREJ exactly as before.
+#[test]
+fn in_window_out_of_sequence_i_frame_still_srejs() {
+    let mut s = connected_session();
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    s.context.vr = 2;
+    s.context.k = 4;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    // N(s) = 3 is inside the open interval (2, 6): a genuine single-frame gap
+    // at V(r) = 2. It must be N(s) = V(r)+1, because the figure routes a wider
+    // gap (`N(s) > V(r)+1`) to REJ even on an SREJ link - Selective Reject can
+    // only name one missing frame.
+    s.post_event(Event::IReceived(rx_i(3, 0, false)), &mut t, &mut r);
+
+    let sup = r.supervisory();
+    assert!(
+        sup.iter()
+            .any(|(k, nr)| *k == SupervisoryKind::Srej && *nr == 2),
+        "an in-window single-frame gap must still draw an SREJ for V(r): {sup:?}"
+    );
+    assert!(
+        s.context.stored_received_i_frames.contains_key(&3),
+        "an in-window out-of-sequence frame is stored pending the gap"
+    );
+}
+
+/// The window bound is the window this receiver GRANTED, not the configured k:
+/// with SREJ negotiated the #13 clamp caps it at modulus/2, so an N(s) inside a
+/// configured k of 7 but outside the granted 4 is still a duplicate.
+#[test]
+fn out_of_window_test_uses_the_effective_window_not_raw_k() {
+    let mut s = connected_session();
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    s.context.vr = 0;
+    s.context.k = 7;
+    assert_eq!(
+        s.context.effective_window(),
+        4,
+        "the SREJ half-modulus clamp is what makes this test meaningful"
+    );
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::IReceived(rx_i(5, 0, false)), &mut t, &mut r);
+
+    let sup = r.supervisory();
+    assert!(
+        !sup.iter()
+            .any(|(k, _)| *k == SupervisoryKind::Srej || *k == SupervisoryKind::Rej),
+        "N(s) past the granted window is a duplicate even when inside the configured k: {sup:?}"
+    );
+}
+
 // ─── Quirk: SREJ command ignored (packet.net#674) ────────────────────────────
 //
 // The corrected figc4.5/figc4.4 tables (ax25sdl v0.10.1+) give every SREJ path a

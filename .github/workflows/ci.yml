@@ -50,7 +50,7 @@ jobs:
           # To advance the SDL, bump this SHA (both jobs) + the
           # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 4212c1e1b9bc27f5520e820c995c10204838cee8
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git cfc8e8fcf662cfb2c77d95d097c49294c275ab8f
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ clippy)
@@ -102,7 +102,7 @@ jobs:
           # To advance the SDL, bump this SHA (both jobs) + the
           # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git 4212c1e1b9bc27f5520e820c995c10204838cee8
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git cfc8e8fcf662cfb2c77d95d097c49294c275ab8f
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ thumbv6m target, clippy)
