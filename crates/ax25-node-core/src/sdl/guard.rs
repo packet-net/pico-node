@@ -8,9 +8,11 @@
 //! renamed atom is a *compile error* here (the exhaustiveness the C# CS8509 buys),
 //! never an unbound-identifier surprise at runtime.
 //!
-//! The two binding-side spec quirks (`discard_out_of_window_i_frames` #40 and
-//! `dl_flow_off_enters_busy` #43) are applied inline where the C# overrides the
-//! base binding after building the table.
+//! The one remaining binding-side spec quirk (`dl_flow_off_enters_busy` #43) is
+//! applied inline, where the C# overrides the base binding after building the
+//! table. Its companion `discard_out_of_window_i_frames` (#40) retired when
+//! figc4.4/figc4.5 gained the window guard natively: it is the
+//! `vr_lt_ns_lt_vr_plus_k` atom below, so it applies with the quirks all off.
 
 use ax25sdl::{Ax25Guard, GuardTerm};
 
@@ -67,7 +69,7 @@ pub fn eval_atom(
         Ax25Guard::OwnReceiverBusy => own_receiver_busy(ctx, trigger),
         Ax25Guard::PeerReceiverBusy => ctx.peer_receiver_busy,
         Ax25Guard::AckPending => ctx.acknowledge_pending,
-        Ax25Guard::RejectException => reject_exception(ctx, trigger),
+        Ax25Guard::RejectException => ctx.reject_exception,
         Ax25Guard::Layer3Initiated => ctx.layer3_initiated,
         Ax25Guard::SREJEnabled => ctx.srej_enabled,
         Ax25Guard::SrejectExceptionGt0 => ctx.srej_exception_count > 0,
@@ -131,6 +133,18 @@ pub fn eval_atom(
                 diff > 1
             })
             .unwrap_or(false),
+        // Is the out-of-sequence N(s) inside the receive window this station
+        // granted? The figure draws the open interval V(r) < N(s) < V(r)+k
+        // (ax25spec#40, matching X.25 2.4.6.4(b)); an N(s) outside it is a
+        // duplicate of a frame already received and acknowledged, and the No
+        // arm discards it. effective_window(), not ctx.k: it carries the #13
+        // SREJ half-modulus clamp and is what this receiver actually granted.
+        Ax25Guard::VrLtNsLtVrPlusK => frame
+            .map(|f| {
+                let offset = ((f.ns as u16 + m) - ctx.vr as u16) % m;
+                offset > 0 && offset < ctx.effective_window() as u16
+            })
+            .unwrap_or(false),
         // N(R) in the window [V(a), V(s)] (inclusive both ends, mod-N).
         Ax25Guard::VaLeNrLeVs => frame
             .map(|f| {
@@ -161,23 +175,4 @@ fn own_receiver_busy(ctx: &SessionContext, trigger: &Event) -> bool {
     } else {
         base
     }
-}
-
-/// `reject_exception` with the #40 out-of-window discard ORed in: for an
-/// `IReceived` trigger (when the quirk is on) a frame whose N(S) is outside the
-/// receive window `[V(r), V(r)+k)` takes the figure's discard path.
-fn reject_exception(ctx: &SessionContext, trigger: &Event) -> bool {
-    let base = ctx.reject_exception;
-    if !ctx.quirks.discard_out_of_window_i_frames {
-        return base;
-    }
-    if let Event::IReceived(f) = trigger {
-        let m = ctx.modulus();
-        let offset = ((f.ns as u16 + m) - ctx.vr as u16) % m;
-        // #13: the receive window bound is the effective (SREJ-clamped) window.
-        if offset >= ctx.effective_window() as u16 {
-            return true; // out of window ⇒ discard
-        }
-    }
-    base
 }
