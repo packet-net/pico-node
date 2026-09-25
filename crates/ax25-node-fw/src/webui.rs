@@ -344,7 +344,26 @@ function poll(){fetch('/tnc/poll?since='+since,{cache:'no-store'}).then(r=>r.jso
 .catch(()=>{$('lk').textContent='The node is not answering; retrying...';setTimeout(poll,2000)})}\
 poll()</script>";
 
-/// The panel section linking to the TNC page.
-pub const TNC_LINK_SECTION: &str = "<section><h2>Radio</h2>\
-<p class=hint>Set the NinoTNC's mode and KISS parameters, watch traffic, send a test \
-frame, and update its firmware.</p><p><a href=/tnc>NinoTNC setup and monitor &rarr;</a></p></section>";
+/// The panel's radio section: the TNC's status and a live monitor (the same
+/// `/tnc/poll` feed as the TNC page), with the link to the full TNC page. Its
+/// script uses its own names so it cannot collide with the panel's others.
+pub const RADIO_SECTION: &str = "<section><h2>Radio</h2>\
+<p class=sub id=rst>Connecting...</p><p class=\"sub mono\" id=rlk></p>\
+<div id=mon></div>\
+<p class=hint><a href=/tnc>NinoTNC setup, test frame, firmware and full monitor &rarr;</a></p>\
+</section><script>\
+(function(){var since=0;function $(i){return document.getElementById(i)}\
+function line(c,t){var m=$('mon'),e=document.createElement('div'),\
+end=m.scrollTop+m.clientHeight>=m.scrollHeight-8;e.className=c;e.textContent=t;m.appendChild(e);\
+while(m.childNodes.length>300)m.removeChild(m.firstChild);if(end)m.scrollTop=m.scrollHeight}\
+function show(d){var now=Date.now(),t=d.tnc;\
+$('rst').textContent=!d.running?'The TNC link is not running (set the node callsign first).':\
+!t?'Waiting for the TNC to report.':'NinoTNC firmware '+t.fw+', running mode '+(t.mode||'?')+\
+(t.ok?'':'. Not in use: pico-node needs '+(t.major||3)+'.44 or later (update it on the NinoTNC page).');\
+$('rlk').textContent=d.rx+' frames heard, '+d.tx+' sent';\
+if(since>0&&d.oldest>since+1)line('ev','(some lines were missed)');\
+d.log.forEach(function(e){line(e[2]=='RX'?'rx':e[2]=='TX'?'tx':'ev',\
+new Date(now-(d.now-e[1])).toTimeString().slice(0,8)+' '+e[2]+' '+e[3])});\
+since=d.next;return d.more}\
+function poll(){fetch('/tnc/poll?since='+since,{cache:'no-store'}).then(r=>r.json()).then(show)\
+.then(m=>setTimeout(poll,m?50:1000)).catch(()=>setTimeout(poll,3000))}poll()})()</script>";

@@ -679,11 +679,12 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
     let _ = parts.push(CSS.as_bytes());
     let _ = parts.push(PANEL_STYLE_MID.as_bytes());
     let _ = parts.push(header.as_bytes());
+    // The radio monitor first: it is what an operator watches.
+    let _ = parts.push(crate::webui::RADIO_SECTION.as_bytes());
     let _ = parts.push(form_a.as_bytes());
     if !ctx.sta {
         let _ = parts.push(form_b.as_bytes());
     }
-    let _ = parts.push(crate::webui::TNC_LINK_SECTION.as_bytes());
     let _ = parts.push(FIRMWARE_SECTION.as_bytes());
     if ctx.sta {
         let _ = parts.push(MAINTENANCE_SECTION.as_bytes());

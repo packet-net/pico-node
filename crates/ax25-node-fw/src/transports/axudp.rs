@@ -1438,7 +1438,7 @@ async fn ensure_interlinks(
 }
 
 /// Create the peer slot + role for an outbound connect to `target`, resolving
-/// its endpoint from the heard-table (beacon target as fallback).
+/// its link: where it was last heard, else the radio port, else the AXUDP peer.
 fn start_outbound(
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
     heard: &[Option<(Callsign, Link)>; 8],
@@ -1450,8 +1450,15 @@ fn start_outbound(
     if find_peer(peers, &target).is_some() {
         return Err("target is busy (session already up)");
     }
-    let Some(ep) = heard_lookup(heard, &target).or(beacon_ep.map(Link::Udp)) else {
-        return Err("no known endpoint for target");
+    // Where to dial: the port the target was last heard on; otherwise the air,
+    // when the radio port is up (a station need not have been heard to be
+    // called over RF); otherwise the configured AXUDP peer.
+    let rf = rf::usable().then_some(Link::Rf);
+    let Some(ep) = heard_lookup(heard, &target)
+        .or(rf)
+        .or(beacon_ep.map(Link::Udp))
+    else {
+        return Err("target not heard, and no radio port or AXUDP peer to try");
     };
     let Some(i) = peer_slot(peers, target, local, ep) else {
         return Err("no free session slot");
