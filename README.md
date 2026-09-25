@@ -31,3 +31,7 @@ cargo build -p ax25-node-core --no-default-features --features alloc   # prove t
 cargo build --manifest-path crates/ax25-node-fw/Cargo.toml --release
 cargo run   --manifest-path crates/ax25-node-fw/Cargo.toml --release   # flash + stream defmt over SWD
 ```
+
+## Next
+
+**[`docs/HILLTOP-NODE-PLAN.md`](docs/HILLTOP-NODE-PLAN.md)** is the plan for the next goal: an unattended hilltop node with two radios, acting as the middle hop between stations that cannot hear each other.
