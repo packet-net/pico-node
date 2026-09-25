@@ -22,6 +22,9 @@
 //! - [`rssi`] — the GETRSSI RX-audio-level reply parser (`NinoTncRssiReading`).
 //! - [`firmware`] — the firmware version + dsPIC chip variant value types.
 //! - [`classify`] — the NinoTNC-aware classifier overlay (`NinoTncFrameClassifier`).
+//! - [`commands`] - the GETALL / GETVER query builders (`NinoTncCommands`, query subset).
+//! - [`mode_set`] - SETHW with GETALL readback and retry (`SetModeAsync` +
+//!   `NinoTncModeVerification`), as a sans-I/O state machine.
 //!
 //! ## Connectivity (device / baud)
 //!
@@ -52,8 +55,10 @@
 pub mod airtest;
 pub mod catalog;
 pub mod classify;
+pub mod commands;
 pub mod cqbeep;
 pub mod firmware;
+pub mod mode_set;
 pub mod rssi;
 pub mod sethw;
 pub mod status;
@@ -63,6 +68,7 @@ pub use airtest::NinoTncAirTestFrame;
 pub use catalog::NinoTncMode;
 pub use classify::{classify, NinoTncInboundEvent};
 pub use firmware::{ChipVariant, FirmwareVersion};
+pub use mode_set::{ModeSetOutcome, ModeSetter, ModeVerifyPolicy};
 pub use rssi::NinoTncRssiReading;
 pub use status::NinoTncStatusFrame;
 pub use txtest::NinoTncTxTestFrame;

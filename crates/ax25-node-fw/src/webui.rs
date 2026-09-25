@@ -41,7 +41,13 @@ button{font-size:16px;border-radius:6px;cursor:pointer}\
 .row{display:flex;gap:.5em;align-items:center;flex-wrap:wrap}\
 .hint{color:var(--mut);font-size:.82em;margin:.6em 0 0}\
 code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;background:#fff;border:1px solid var(--line);border-radius:4px;padding:0 .3em}\
-#log{white-space:pre-wrap;background:#fff;border:1px solid var(--line);border-radius:6px;padding:.6em;margin-top:.8em;min-height:1.4em;font-size:.85em}";
+#log{white-space:pre-wrap;background:#fff;border:1px solid var(--line);border-radius:6px;padding:.6em;margin-top:.8em;min-height:1.4em;font-size:.85em}\
+select{width:100%;padding:.55em .6em;font-size:16px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}\
+label.chk{display:flex;gap:.5em;align-items:center;color:var(--ink);font-size:.9em}\
+label.chk input{width:auto;margin:0}\
+#mon{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid var(--line);border-radius:6px;padding:.5em;margin-top:.6em;height:22em;overflow-y:auto;font:.74em/1.35 ui-monospace,Menlo,Consolas,monospace}\
+.rx{color:var(--ink)}.tx{color:var(--accent)}.ev{color:var(--mut)}\
+.ok{color:var(--accent)}.bad{color:#b42318}";
 
 /// HTML-escape a value for safe interpolation into text or a double-quoted
 /// attribute. Conservative (covers `& < > "`); inputs here are short config
@@ -188,3 +194,118 @@ pub fn notice_reconnect(heading: &str, body_html: &str) -> String {
         ),
     )
 }
+
+// ── The NinoTNC setup page (`GET /tnc`) ──
+//
+// Static top and bottom around one dynamic block (the three forms, pre-filled
+// from the node's saved settings). The script polls `/tnc/poll` once a second
+// for the TNC status and new monitor lines; all rendering is in the browser.
+
+/// Page top: title, the live status lines, and the refresh button.
+pub const TNC_TOP: &str = "<div class=spread><h1>NinoTNC</h1>\
+<a class=sub href=/>&larr; node panel</a></div>\
+<p class=sub id=st>Connecting...</p><p class=\"sub mono\" id=lk></p>\
+<div class=row><button class=ghost onclick=\"act('/tnc/refresh')\">Ask the TNC for its status</button></div>\
+<p class=hint id=msg></p>";
+
+/// The three forms (mode, KISS parameters, test frame), pre-filled from the
+/// node's saved settings. `call` is the node's callsign, the test frame's source.
+pub fn tnc_forms(p: &StoredConfig, call: &str) -> String {
+    use ax25_node_core::kiss::ninotnc::catalog::BY_MODE;
+    use core::fmt::Write;
+
+    let t = &p.tnc;
+    let mut f = String::with_capacity(2400);
+    f += "<section><h2>Operating mode</h2><form onsubmit=\"return post(this,'/tnc/mode')\">\
+<label>Mode</label><select name=mode>";
+    // Mode 15 is the DIP position that hands control to SETHW, not a mode to
+    // select, so the list stops at 14.
+    for m in BY_MODE.iter().take(15) {
+        let sel = if t.mode == Some(m.mode) { " selected" } else { "" };
+        let _ = write!(f, "<option value={}{}>{} - {}</option>", m.mode, sel, m.mode, m.name);
+    }
+    f += "</select><label class=chk><input type=checkbox name=flash> \
+Also store it in the TNC's own memory</label>\
+<button type=submit class=primary>Set mode</button><p class=\"hint res\"></p></form>\
+<p class=hint id=job></p>\
+<p class=hint>Needs all four MODE DIP switches on the TNC set to 1 (on). The node \
+sends this mode every time it starts, without writing the TNC's memory unless you \
+tick the box.</p></section>";
+
+    let ms = |v: Option<u8>| v.map(|u| format!("{}", u as u32 * 10)).unwrap_or_default();
+    let num = |v: Option<u8>| v.map(|u| format!("{u}")).unwrap_or_default();
+    f += "<section><h2>KISS parameters</h2><form onsubmit=\"return post(this,'/tnc/params')\">";
+    let _ = write!(
+        f,
+        "<label>TXDELAY (ms)</label><input name=txdelay inputmode=numeric value=\"{}\" placeholder=\"TNC's own\">\
+<p class=hint>Only used when the TNC's TX DELAY knob is turned fully anticlockwise (zero); \
+otherwise the knob sets it.</p>\
+<label>PERSIST (0-255)</label><input name=persist inputmode=numeric value=\"{}\" placeholder=\"TNC's own\">\
+<label>SLOTTIME (ms)</label><input name=slottime inputmode=numeric value=\"{}\" placeholder=\"TNC's own\">\
+<label>TXTAIL (ms)</label><input name=txtail inputmode=numeric value=\"{}\" placeholder=\"TNC's own\">\
+<label>Duplex</label><select name=duplex><option value=\"\">TNC's own</option>\
+<option value=half{}>Half</option><option value=full{}>Full</option></select>",
+        ms(t.tx_delay),
+        num(t.persist),
+        ms(t.slot_time),
+        ms(t.tx_tail),
+        if t.full_duplex == Some(false) { " selected" } else { "" },
+        if t.full_duplex == Some(true) { " selected" } else { "" },
+    );
+    f += "<button type=submit class=primary>Save and send to the TNC</button><p class=\"hint res\"></p></form>\
+<p class=hint>Times are rounded to 10 ms. Blank fields keep their current value. The \
+node sends these every time it starts.</p></section>";
+
+    let call = esc(call);
+    let _ = write!(
+        f,
+        "<section><h2>Test transmission</h2><form onsubmit=\"return post(this,'/tnc/test')\">\
+<label>To</label><input name=dest value=TEST maxlength=9 {GEN_ATTRS} {CAPS_ATTR}>\
+<label>Text</label><input name=text value=\"Test from {call}\" maxlength=128 {GEN_ATTRS}>\
+<button type=submit class=primary>Transmit one frame</button><p class=\"hint res\"></p></form>\
+<p class=hint>Keys the radio once and sends a UI frame from {call}. It should appear \
+as a TX line in the monitor, and the TNC's PTT light should flash.</p></section>"
+    );
+    f
+}
+
+/// Page bottom: the monitor and the script. The poll comes back quickly while
+/// the node still has a backlog of lines to send, otherwise once a second.
+pub const TNC_BOTTOM: &str = "<section><h2>Monitor</h2>\
+<div class=row><label class=chk><input type=checkbox id=pause> Pause</label>\
+<button class=ghost onclick=\"$('mon').textContent=''\">Clear</button></div>\
+<div id=mon></div></section>\
+<script>\
+var since=0;function $(i){return document.getElementById(i)}\
+function say(m){$('msg').textContent=m}\
+function post(f,u){fetch(u,{method:'POST',body:new URLSearchParams(new FormData(f))})\
+.then(r=>r.text()).then(t=>f.querySelector('.res').textContent=t)\
+.catch(()=>f.querySelector('.res').textContent='Could not reach the node.');return false}\
+function act(u){fetch(u,{method:'POST'}).then(r=>r.text()).then(say)\
+.catch(()=>say('Could not reach the node.'))}\
+function line(c,t){var m=$('mon'),e=document.createElement('div'),\
+end=m.scrollTop+m.clientHeight>=m.scrollHeight-8;e.className=c;e.textContent=t;m.appendChild(e);\
+while(m.childNodes.length>500)m.removeChild(m.firstChild);if(end)m.scrollTop=m.scrollHeight}\
+function show(d){var now=Date.now();\
+if(!d.running)$('st').textContent='The TNC link is not running. Set the node callsign first.';\
+else if(d.tnc)$('st').textContent='Firmware '+d.tnc.fw+', MODE DIPs '+(d.tnc.dip||'?')+\
+', running mode '+(d.tnc.mode||'?');\
+else $('st').textContent='No report from the TNC yet. Check the serial wiring (TX and RX \
+crossed, ground) and that the TNC is powered.';\
+$('lk').textContent=(d.heard==null?'Nothing heard from the TNC yet':'Last heard from the TNC '+\
+Math.round((d.now-d.heard)/1000)+' s ago')+', '+d.rx+' frames heard, '+d.tx+' sent';\
+var j=$('job');if(d.job){j.textContent=d.job.text;j.className='hint '+(d.job.done?(d.job.ok?'ok':'bad'):'')}\
+if($('pause').checked)return 0;\
+if(since>0&&d.oldest>since+1)line('ev','(some lines were missed)');\
+d.log.forEach(function(e){line(e[2]=='RX'?'rx':e[2]=='TX'?'tx':'ev',\
+new Date(now-(d.now-e[1])).toTimeString().slice(0,8)+' '+e[2]+' '+e[3])});\
+since=d.next;return d.more}\
+function poll(){fetch('/tnc/poll?since='+since,{cache:'no-store'}).then(r=>r.json()).then(show)\
+.then(m=>setTimeout(poll,m?50:1000))\
+.catch(()=>{$('lk').textContent='The node is not answering; retrying...';setTimeout(poll,2000)})}\
+poll()</script>";
+
+/// The panel section linking to the TNC page.
+pub const TNC_LINK_SECTION: &str = "<section><h2>Radio</h2>\
+<p class=hint>Set the NinoTNC's mode and KISS parameters, watch traffic, and send a \
+test frame.</p><p><a href=/tnc>NinoTNC setup and monitor &rarr;</a></p></section>";

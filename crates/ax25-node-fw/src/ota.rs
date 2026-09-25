@@ -49,6 +49,9 @@ pub const BUILD_TAG: &str = match option_env!("OTA_BUILD_TAG") {
 /// the captive-portal config form in AP and the node panel in STA).
 const OTA_PORT: u16 = 80;
 
+/// How many web server tasks listen on [`OTA_PORT`] at once.
+pub const HTTP_TASKS: usize = 2;
+
 /// DFU partition capacity (must match memory.x DFU LENGTH). Uploads larger than
 /// this are rejected up front.
 // The largest image that can actually BOOT is the ACTIVE partition (512 KiB);
@@ -88,13 +91,17 @@ pub struct WebCtx {
     pub ap_ssid: &'static str,
     /// The AP's WPA2 passphrase, shown in AP mode for reference.
     pub ap_pass: &'static str,
+    /// The node's callsign (the TNC page's test-frame source).
+    pub callsign: &'static str,
 }
 
 /// The node's single web server — config panel + firmware upload — on :80 in
 /// **both** modes (the AP captive-portal form and the STA panel are the same
 /// server, rendered per [`WebCtx::sta`]). The AP-only DHCP + DNS catch-all live
 /// in `crate::provisioning`.
-#[embassy_executor::task]
+/// Two server tasks share port 80, so the TNC page's once-a-second poll never
+/// leaves a button press facing a closed port.
+#[embassy_executor::task(pool_size = HTTP_TASKS)]
 pub async fn http_task(stack: Stack<'static>, ctx: WebCtx) {
     let mut rx_buf = [0u8; 4096];
     let mut tx_buf = [0u8; 1024];
@@ -149,6 +156,62 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebC
     // took effect (and that a rollback restored the old one).
     if headers.starts_with(b"GET /version") {
         let _ = http_send(socket, "text/plain", BUILD_TAG.as_bytes()).await;
+        let _ = socket.flush().await;
+        return;
+    }
+
+    // The NinoTNC page (crate::tnc): the page, its poll, and its four actions.
+    if headers.starts_with(b"GET /tnc/poll") {
+        let since = parse_query_u32(headers, b"since=").unwrap_or(0);
+        let mut body = [0u8; 3072];
+        let n = crate::tnc::render_poll(&mut body, since);
+        let _ = http_send(socket, "application/json", &body[..n]).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    if headers.starts_with(b"GET /tnc ") || headers.starts_with(b"GET /tnc?") {
+        let _ = write_tnc_page(socket, ctx).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    if headers.starts_with(b"POST /tnc/") {
+        #[derive(Clone, Copy)]
+        enum Action {
+            Mode,
+            Params,
+            Test,
+            Refresh,
+        }
+        let action = [
+            (&b"POST /tnc/mode "[..], Action::Mode),
+            (b"POST /tnc/params ", Action::Params),
+            (b"POST /tnc/test ", Action::Test),
+            (b"POST /tnc/refresh ", Action::Refresh),
+        ]
+        .into_iter()
+        .find(|(p, _)| headers.starts_with(p))
+        .map(|(_, a)| a);
+        let content_len = parse_content_length(headers).unwrap_or(0);
+        while hlen < header_end + content_len && hlen < hdr.len() {
+            match socket.read(&mut hdr[hlen..]).await {
+                Ok(0) => break,
+                Ok(n) => hlen += n,
+                Err(_) => break,
+            }
+        }
+        let body = &hdr[header_end..hlen.min(header_end + content_len)];
+        let reply = match action {
+            Some(Action::Mode) => crate::tnc::post_mode(body),
+            Some(Action::Params) => crate::tnc::post_params(body),
+            Some(Action::Test) => crate::tnc::post_test(body),
+            Some(Action::Refresh) => crate::tnc::post_refresh(),
+            None => Err(alloc::string::String::from("Unknown TNC action.")),
+        };
+        let text = match &reply {
+            Ok(t) => t,
+            Err(e) => e.as_str(),
+        };
+        let _ = http_send(socket, "text/plain; charset=utf-8", text.as_bytes()).await;
         let _ = socket.flush().await;
         return;
     }
@@ -402,6 +465,23 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+/// Parse a decimal query parameter (`key` includes the `=`) from the request
+/// line, e.g. `since=` in `GET /tnc/poll?since=42 HTTP/1.1`.
+fn parse_query_u32(headers: &[u8], key: &[u8]) -> Option<u32> {
+    let line_end = find(headers, b"\r\n").unwrap_or(headers.len());
+    let line = &headers[..line_end];
+    let q = find(line, b"?")?;
+    let at = q + find(&line[q..], key)? + key.len();
+    let digits = line[at..].iter().take_while(|b| b.is_ascii_digit());
+    let mut n: u32 = 0;
+    let mut seen = false;
+    for &d in digits {
+        n = n.checked_mul(10)?.checked_add((d - b'0') as u32)?;
+        seen = true;
+    }
+    seen.then_some(n)
+}
+
 fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
@@ -482,7 +562,7 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
 
     // Assemble the body as an ordered list of byte slices (static + dynamic);
     // measured for Content-Length, written in order. Nothing holds the whole page.
-    let mut parts: heapless::Vec<&[u8], 9> = heapless::Vec::new();
+    let mut parts: heapless::Vec<&[u8], 10> = heapless::Vec::new();
     let _ = parts.push(PANEL_HEAD.as_bytes());
     let _ = parts.push(CSS.as_bytes());
     let _ = parts.push(PANEL_STYLE_MID.as_bytes());
@@ -491,12 +571,47 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
     if !ctx.sta {
         let _ = parts.push(form_b.as_bytes());
     }
+    let _ = parts.push(crate::webui::TNC_LINK_SECTION.as_bytes());
     let _ = parts.push(FIRMWARE_SECTION.as_bytes());
     if ctx.sta {
         let _ = parts.push(MAINTENANCE_SECTION.as_bytes());
     }
     let _ = parts.push(PANEL_TAIL.as_bytes());
 
+    let body_len: usize = parts.iter().map(|s| s.len()).sum();
+    let mut head = heapless::String::<96>::new();
+    let _ = write!(
+        head,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_len
+    );
+    if !write_all(socket, head.as_bytes()).await {
+        return false;
+    }
+    for part in parts {
+        if !write_all(socket, part).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Send the NinoTNC page: the static top and bottom around the pre-filled
+/// forms (the only heap piece, about 2.5 KiB, dropped as soon as it is sent).
+async fn write_tnc_page(socket: &mut TcpSocket<'_>, ctx: WebCtx) -> bool {
+    use crate::webui::{tnc_forms, CSS, TNC_BOTTOM, TNC_TOP};
+    use core::fmt::Write;
+
+    let forms = tnc_forms(&config_store::current_pending(), ctx.callsign);
+    let parts: [&[u8]; 7] = [
+        PANEL_HEAD.as_bytes(),
+        CSS.as_bytes(),
+        PANEL_STYLE_MID.as_bytes(),
+        TNC_TOP.as_bytes(),
+        forms.as_bytes(),
+        TNC_BOTTOM.as_bytes(),
+        PANEL_TAIL.as_bytes(),
+    ];
     let body_len: usize = parts.iter().map(|s| s.len()).sum();
     let mut head = heapless::String::<96>::new();
     let _ = write!(

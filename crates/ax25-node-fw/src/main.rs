@@ -60,6 +60,8 @@ mod provisioning;
 #[cfg(target_os = "none")]
 mod session;
 #[cfg(target_os = "none")]
+mod tnc;
+#[cfg(target_os = "none")]
 mod transports;
 mod webui;
 
@@ -278,15 +280,16 @@ mod firmware {
         // BOTH modes (docs/OTA.md, docs/PROVISIONING.md). Spawned before the
         // config-only gate so an unconfigured node can be set up over its AP, and
         // so firmware can be updated in AP mode (a hilltop node has no USB). ---
-        spawner.spawn(defmt::unwrap!(ota::http_task(
-            stack,
-            ota::WebCtx {
-                sta: sta_ok,
-                hostname: cfg.hostname,
-                ap_ssid,
-                ap_pass: cfg.wifi.ap_passphrase,
-            },
-        )));
+        let web_ctx = ota::WebCtx {
+            sta: sta_ok,
+            hostname: cfg.hostname,
+            ap_ssid,
+            ap_pass: cfg.wifi.ap_passphrase,
+            callsign: alloc::boxed::Box::leak(String::from(call_text).into_boxed_str()),
+        };
+        for _ in 0..ota::HTTP_TASKS {
+            spawner.spawn(defmt::unwrap!(ota::http_task(stack, web_ctx)));
+        }
 
         // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
         // portal are up (so you can set a callsign), but NO on-air transport is
