@@ -365,6 +365,7 @@ mod firmware {
         // supported firmware. ---
         spawner.spawn(defmt::unwrap!(ports::ninotnc::task(
             p.UART1,
+            p.PIO1,
             p.PIN_20,
             p.PIN_21,
             cfg.ninotnc.clone(),

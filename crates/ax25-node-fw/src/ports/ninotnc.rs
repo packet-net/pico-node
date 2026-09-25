@@ -47,9 +47,16 @@ use ax25_node_core::monitor::{write_frame, Direction};
 
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::{PIN_20, PIN_21, UART1};
+use embassy_rp::gpio::Level;
+use embassy_rp::peripherals::{PIN_20, PIN_21, PIO1, UART1};
+use embassy_rp::pio::{
+    Common, Config as PioConfig, Direction as PioDirection, FifoJoin,
+    InterruptHandler as PioInterruptHandler, Pio, ShiftDirection, StateMachine,
+};
+use embassy_rp::pio_programs::clock_divider::calculate_pio_clock_divider;
 use embassy_rp::uart::{
-    BufferedInterruptHandler, BufferedUart, Config as UartConfig, Error as UartError,
+    BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UartConfig,
+    Error as UartError,
 };
 use embassy_rp::Peri;
 use embassy_time::{Duration, Instant, Timer};
@@ -64,11 +71,11 @@ use crate::ports::{self, call_str, ui_frame, Port};
 
 bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
 });
 
-/// A [`ByteStream`] over an `embassy_rp` buffered UART — the embedded byte source the
-/// portable [`SerialKissModem`] runs on. `read`/`write` are the only hardware seam;
-/// everything above (framing, escaping, the modem, the NinoTNC extensions) is the
+/// A [`ByteStream`] over an `embassy_rp` buffered UART (used by the Tait CCDI
+/// link). `read`/`write` are the only hardware seam; everything above is the
 /// host-tested portable core.
 pub struct UartByteStream {
     uart: BufferedUart,
@@ -95,11 +102,98 @@ impl ByteStream for UartByteStream {
     }
 }
 
-type Modem = SerialKissModem<UartByteStream>;
+/// The byte stream to and from the NinoTNC over J5, the source the portable
+/// [`SerialKissModem`] runs on for port 0.
+///
+/// Receive is UART1's hardware receiver (8N1, interrupt-buffered). Transmit is a
+/// PIO state machine on the same TX pin sending 8 data bits and **two** stop
+/// bits. The NinoTNC drops and then misreads bytes that arrive back to back
+/// while it is starting a transmission, and the damage goes on air with a valid
+/// checksum. Measured 2026-09-25: its own USB bridge (MCP2221A) leaves one
+/// bit-time idle after every byte and was never damaged (0 of 19 back-to-back
+/// pairs), while UART1 at one stop bit left none and about one frame in four
+/// that arrived during a transmission was damaged. The TNC receives the extra
+/// stop bit as ordinary idle. The hardware UART cannot do this itself: its stop
+/// bit setting is shared by both directions, and at two it rejects every byte of
+/// the TNC's one-stop-bit replies as a framing error (tried on the bench).
+pub struct J5Link {
+    rx: BufferedUartRx,
+    tx: TwoStopTx,
+}
+
+impl ByteStream for J5Link {
+    type Error = UartError;
+
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        Read::read(&mut self.rx, buf).await
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.tx.write(bytes).await;
+        Ok(())
+    }
+}
+
+/// UART transmit with two stop bits, on a PIO state machine. Returns from
+/// `write` once the last byte is queued in the state machine's 8-deep FIFO.
+struct TwoStopTx {
+    sm: StateMachine<'static, PIO1, 0>,
+    // Holds the PIO block (and so the loaded program) for the link's lifetime.
+    _common: Common<'static, PIO1>,
+}
+
+impl TwoStopTx {
+    fn new(pio: Peri<'static, PIO1>, tx_pin: Peri<'static, PIN_20>, baud: u32) -> Self {
+        let Pio {
+            mut common,
+            mut sm0,
+            ..
+        } = Pio::new(pio, Irqs);
+        // Eight PIO cycles per bit. The line idles high; `pull` stalls with it
+        // high, so the gap after the last byte of a frame is plain idle.
+        let prg = embassy_rp::pio::program::pio_asm!(
+            r#"
+                .side_set 1 opt
+                    pull       side 1 [7]  ; second stop bit, or idle while waiting
+                    set x, 7   side 0 [7]  ; start bit
+                bitloop:
+                    out pins, 1            ; 8 data bits, least significant first
+                    jmp x-- bitloop   [6]
+                    nop        side 1 [7]  ; first stop bit
+            "#
+        );
+        let prg = common.load_program(&prg.program);
+        let pin = common.make_pio_pin(tx_pin);
+        sm0.set_pins(Level::High, &[&pin]);
+        sm0.set_pin_dirs(PioDirection::Out, &[&pin]);
+        let mut cfg = PioConfig::default();
+        cfg.set_out_pins(&[&pin]);
+        cfg.use_program(&prg, &[&pin]);
+        cfg.shift_out.auto_fill = false;
+        cfg.shift_out.direction = ShiftDirection::Right;
+        cfg.fifo_join = FifoJoin::TxOnly;
+        cfg.clock_divider = calculate_pio_clock_divider(8 * baud);
+        sm0.set_config(&cfg);
+        sm0.set_enable(true);
+        Self {
+            sm: sm0,
+            _common: common,
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.sm.tx().wait_push(u32::from(b)).await;
+        }
+    }
+}
+
+type Modem = SerialKissModem<J5Link>;
 
 #[embassy_executor::task]
 pub async fn task(
     uart: Peri<'static, UART1>,
+    pio: Peri<'static, PIO1>,
     tx_pin: Peri<'static, PIN_20>,
     rx_pin: Peri<'static, PIN_21>,
     cfg: NinoTncConfig,
@@ -110,8 +204,8 @@ pub async fn task(
         cfg.baud
     );
 
-    let uart = configure_uart(uart, tx_pin, rx_pin, cfg.baud);
-    let mut modem = SerialKissModem::new(UartByteStream::new(uart));
+    let link = configure_link(uart, pio, tx_pin, rx_pin, cfg.baud);
+    let mut modem = SerialKissModem::new(link);
     tnc::with_state(|s| s.running = true);
     let baud = cfg.baud;
     tnc::log_with(Direction::Info, |w| {
@@ -710,7 +804,6 @@ async fn discard_input(modem: &mut Modem) {
     }
 }
 
-/// Configure UART1 as a buffered 8N1 UART at `baud` on GP20 (TX) / GP21 (RX) —
 /// A plain name for a UART receive error, for the monitor.
 fn line_error_name(e: &ax25_node_core::kiss::serial::ModemError<UartError>) -> &'static str {
     use ax25_node_core::kiss::serial::ModemError;
@@ -723,25 +816,22 @@ fn line_error_name(e: &ax25_node_core::kiss::serial::ModemError<UartError>) -> &
     }
 }
 
-/// the NinoBLE Rev5 NinoTNC link. Static TX/RX ring buffers sized for a couple
-/// of KISS frames.
-fn configure_uart(
+/// Set up the J5 link at `baud`: UART1's receiver on GP21 (8N1, a 256-byte
+/// interrupt-filled ring) and the two-stop-bit PIO transmitter on GP20 (see
+/// [`J5Link`] for why).
+fn configure_link(
     uart: Peri<'static, UART1>,
+    pio: Peri<'static, PIO1>,
     tx_pin: Peri<'static, PIN_20>,
     rx_pin: Peri<'static, PIN_21>,
     baud: u32,
-) -> BufferedUart {
+) -> J5Link {
     let mut config = UartConfig::default();
     config.baudrate = baud;
-    static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
     static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    BufferedUart::new(
-        uart,
-        tx_pin,
-        rx_pin,
-        Irqs,
-        TX_BUF.init([0; 256]),
-        RX_BUF.init([0; 256]),
-        config,
-    )
+    let rx = BufferedUartRx::new(uart, Irqs, rx_pin, RX_BUF.init([0; 256]), config);
+    J5Link {
+        rx,
+        tx: TwoStopTx::new(pio, tx_pin, baud),
+    }
 }
