@@ -432,6 +432,15 @@ pub fn take_flash_for_ota() -> Option<ConfigFlash> {
     CONFIG.lock(|cell| cell.borrow_mut().take().map(|svc| svc.into_flash()))
 }
 
+/// Run `f` with the flash driver (for other stores sharing the chip, such as
+/// the NinoTNC firmware image in APPDATA). `None` if the store is unavailable
+/// (e.g. taken for an OTA). Runs inside the critical section, so keep each call
+/// to one erase / write / read.
+#[allow(dead_code)] // bin build only: the on-target test includes this file without a caller
+pub fn with_flash<R>(f: impl FnOnce(&mut ConfigFlash) -> R) -> Option<R> {
+    CONFIG.lock(|cell| cell.borrow_mut().as_mut().map(|svc| f(&mut svc.flash)))
+}
+
 /// Snapshot the current pending config (what the console/portal would SAVE) —
 /// used by the web panel to pre-fill the config form. Returns defaults if the
 /// store is unavailable (e.g. taken for an in-flight OTA).

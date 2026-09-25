@@ -14,7 +14,7 @@
 //! host-testable on virtual time and lets the firmware drive it from its existing
 //! read pump.
 //!
-//! ## One deliberate divergence from packet.net
+//! ## Deliberate divergences from packet.net
 //!
 //! When a readback shows the MODE DIP switches are **not** `1111`, this gives up
 //! at once with [`ModeSetOutcome::DipNotSoftware`] instead of spending the
@@ -23,10 +23,16 @@
 //! useful thing a setup screen can tell the operator. (If the DIPs happen to
 //! select exactly the requested mode, the running-mode check matches first and the
 //! outcome is [`ModeSetOutcome::Applied`].)
+//!
+//! Likewise, a readback from firmware older than 3/4.41 (which predates SETHW
+//! mode selection) ends it with [`ModeSetOutcome::FirmwareTooOld`]; and
+//! [`refuse_before_sending`] lets a caller that already knows the firmware skip
+//! the SETHW altogether. First seen on a bench NinoTNC running 3.39.
 
 use core::fmt;
 
 use super::catalog::{self, NinoTncMode};
+use super::firmware::{FirmwareVersion, MIN_SETHW_MINOR};
 use super::sethw;
 use super::status::NinoTncStatusFrame;
 
@@ -88,6 +94,13 @@ pub enum ModeSetOutcome {
         requested: u8,
         /// The DIP position the TNC reported (low four bits).
         dip: u8,
+    },
+    /// The TNC's firmware predates SETHW mode selection (3/4.41).
+    FirmwareTooOld {
+        /// The requested mode.
+        requested: u8,
+        /// The firmware the TNC reported.
+        version: FirmwareVersion,
     },
     /// Every attempt was made and the TNC never reported the requested mode.
     NotApplied {
@@ -157,6 +170,22 @@ impl ModeSetter {
         Some((setter, Step::SendSetHardware { payload }))
     }
 
+    /// A mode change that was decided without sending anything (see
+    /// [`refuse_before_sending`]), so it can be shown like any other.
+    pub fn decided(mode: u8, outcome: ModeSetOutcome) -> Self {
+        Self {
+            mode,
+            payload: 0,
+            persist_to_flash: false,
+            policy: ModeVerifyPolicy::default(),
+            attempt: 0,
+            phase: Phase::Done(outcome),
+            last_running: None,
+            last_unknown_byte: None,
+            heard_any: false,
+        }
+    }
+
     /// The requested mode.
     pub fn mode(&self) -> u8 {
         self.mode
@@ -224,6 +253,12 @@ impl ModeSetter {
             None => status.firmware_mode_byte,
         };
 
+        // Checked first: on firmware this old the mode-byte table cannot be
+        // trusted either, so a "match" would prove nothing.
+        if let Some(refused) = refuse_before_sending(self.mode, status.firmware_version) {
+            self.phase = Phase::Done(refused);
+            return None;
+        }
         if status.running_mode.map(|m| m.mode) == Some(self.mode) {
             if let Some(mode) = catalog::try_get_by_mode(self.mode) {
                 self.phase = Phase::Done(ModeSetOutcome::Applied { mode });
@@ -275,9 +310,33 @@ impl ModeSetter {
     }
 }
 
+/// The outcome to report without sending anything, when the TNC's firmware is
+/// known and predates SETHW mode selection. `None` means go ahead (including
+/// when the firmware is not known yet: the readback will catch it).
+pub fn refuse_before_sending(mode: u8, firmware: Option<FirmwareVersion>) -> Option<ModeSetOutcome> {
+    match firmware {
+        Some(version) if !version.supports_sethw_mode() => Some(ModeSetOutcome::FirmwareTooOld {
+            requested: mode,
+            version,
+        }),
+        _ => None,
+    }
+}
+
 /// Describe a finished mode change in plain words.
 pub fn write_outcome<W: fmt::Write + ?Sized>(outcome: &ModeSetOutcome, w: &mut W) -> fmt::Result {
     match *outcome {
+        ModeSetOutcome::FirmwareTooOld { requested, version } => {
+            write!(w, "The TNC cannot set mode ")?;
+            write_mode(requested, w)?;
+            write!(
+                w,
+                " from here: its firmware {}.{} is older than {}.{MIN_SETHW_MINOR}, the first to \
+accept a mode over KISS. Update the TNC firmware below, or set the mode with its MODE DIP \
+switches.",
+                version.major, version.minor, version.major
+            )
+        }
         ModeSetOutcome::Applied { mode } => {
             write!(w, "Mode ")?;
             write_mode(mode.mode, w)?;
@@ -314,7 +373,8 @@ pub fn write_outcome<W: fmt::Write + ?Sized>(outcome: &ModeSetOutcome, w: &mut W
                 }
                 (None, Some(b), _) => write!(
                     w,
-                    "; it reports mode byte 0x{b:02X}, which this firmware table does not know."
+                    "; it reports mode byte 0x{b:02X}, which the node's mode table (firmware \
+x.44) does not know."
                 ),
                 (None, None, true) => write!(w, "; its reply did not say which mode it runs."),
                 (None, None, false) => write!(
@@ -506,6 +566,40 @@ all four MODE switches to 1 (on) to set the mode from here."
             s.outcome(),
             Some(ModeSetOutcome::SentUnverified { mode: 15 })
         );
+    }
+
+    #[test]
+    fn a_3_39_tnc_is_refused_on_the_first_readback() {
+        // The bench NinoTNC on 2026-09-25: firmware 3.39, DIPs 1111, running
+        // mode byte 0x80 (not in the 3.44 table). Before this, the node spent
+        // three SETHWs and blamed an unknown mode byte.
+        let (mut s, _) = ModeSetter::start(5, true, 0, ModeVerifyPolicy::default()).unwrap();
+        s.on_time(1_500);
+        let st = NinoTncStatusFrame {
+            firmware_version: FirmwareVersion::parse("3.39"),
+            firmware_mode_byte: Some(0x80),
+            dip_switches: Some(15),
+            ..Default::default()
+        };
+        assert_eq!(s.on_status(&st, 1_600), None, "no retry");
+        assert_eq!(s.attempt(), 1);
+        assert_eq!(
+            summary(&s),
+            "The TNC cannot set mode 5 (3600 QPSK IL2P+CRC) from here: its firmware 3.39 is \
+older than 3.41, the first to accept a mode over KISS. Update the TNC firmware below, or set \
+the mode with its MODE DIP switches."
+        );
+    }
+
+    #[test]
+    fn known_old_firmware_is_refused_before_sending_anything() {
+        let v = |s| FirmwareVersion::parse(s);
+        assert!(matches!(
+            refuse_before_sending(6, v("3.39")),
+            Some(ModeSetOutcome::FirmwareTooOld { requested: 6, .. })
+        ));
+        assert_eq!(refuse_before_sending(6, v("3.41")), None);
+        assert_eq!(refuse_before_sending(6, None), None, "unknown: let the readback decide");
     }
 
     #[test]

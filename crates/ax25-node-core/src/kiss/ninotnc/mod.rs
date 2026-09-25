@@ -58,6 +58,7 @@ pub mod classify;
 pub mod commands;
 pub mod cqbeep;
 pub mod firmware;
+pub mod flash;
 pub mod mode_set;
 pub mod rssi;
 pub mod sethw;

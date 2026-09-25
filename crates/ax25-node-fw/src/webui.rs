@@ -226,8 +226,8 @@ pub fn tnc_forms(p: &StoredConfig, call: &str) -> String {
     }
     f += "</select><label class=chk><input type=checkbox name=flash> \
 Also store it in the TNC's own memory</label>\
-<button type=submit class=primary>Set mode</button><p class=\"hint res\"></p></form>\
-<p class=hint id=job></p>\
+<button type=submit class=primary id=setmode>Set mode</button><p class=\"hint res\"></p></form>\
+<p class=\"hint bad\" id=modewarn></p><p class=hint id=job></p>\
 <p class=hint>Needs all four MODE DIP switches on the TNC set to 1 (on). The node \
 sends this mode every time it starts, without writing the TNC's memory unless you \
 tick the box.</p></section>";
@@ -271,12 +271,40 @@ as a TX line in the monitor, and the TNC's PTT light should flash.</p></section>
 
 /// Page bottom: the monitor and the script. The poll comes back quickly while
 /// the node still has a backlog of lines to send, otherwise once a second.
-pub const TNC_BOTTOM: &str = "<section><h2>Monitor</h2>\
+pub const TNC_BOTTOM: &str = "<section><h2>TNC firmware</h2>\
+<p class=hint id=fwnow>The TNC has not reported its firmware yet.</p>\
+<p class=hint>Get the file from <a href=https://github.com/ninocarrillo/flashtnc target=_blank \
+rel=noopener>flashtnc on GitHub</a>: <code>N9600A-v3-44.hex</code> for firmware 3.x, \
+<code>N9600A-v4-44.hex</code> for 4.x. The node checks the whole file before storing it.</p>\
+<div class=row><button class=ghost id=gh onclick=gh() hidden>Get it from GitHub</button>\
+<input type=file id=hex accept=.hex><button class=ghost onclick=stage()>Upload to the node</button></div>\
+<p class=hint id=img></p>\
+<button class=primary id=upd onclick=upd() disabled>Update the TNC</button>\
+<p class=hint id=flashst></p>\
+<p class=hint>The update runs on the node over the serial link (no USB needed) and takes a few \
+minutes, with the TNC off the air. Keep the TNC powered. If it is interrupted, run it again: \
+the node picks up where the TNC's bootloader was left. Afterwards the node sends its saved \
+mode and KISS parameters again.</p></section>\
+<section><h2>Monitor</h2>\
 <div class=row><label class=chk><input type=checkbox id=pause> Pause</label>\
 <button class=ghost onclick=\"$('mon').textContent=''\">Clear</button></div>\
 <div id=mon></div></section>\
 <script>\
-var since=0;function $(i){return document.getElementById(i)}\
+var since=0,last={};function $(i){return document.getElementById(i)}\
+function send(blob,name){$('img').textContent='Uploading '+name+' to the node...';\
+fetch('/tnc/firmware?name='+encodeURIComponent(name),{method:'POST',body:blob})\
+.then(r=>r.text()).then(t=>$('img').textContent=t)\
+.catch(()=>$('img').textContent='Could not reach the node.')}\
+function stage(){var f=$('hex').files[0];if(!f){$('img').textContent='Pick a .hex file first.';return}\
+send(f,f.name)}\
+function gh(){var n='N9600A-v'+last.tnc.major+'-44.hex';$('img').textContent='Fetching '+n+' from GitHub...';\
+fetch('https://raw.githubusercontent.com/ninocarrillo/flashtnc/master/'+n).then(r=>{if(!r.ok)throw 0;return r.blob()})\
+.then(b=>send(b,n)).catch(()=>$('img').textContent='Could not fetch it from GitHub; \
+download it yourself and use Upload.')}\
+function upd(){if(!confirm('Update the TNC firmware now? It takes a few minutes, the TNC is off \
+the air meanwhile, and it must stay powered.'))return;\
+fetch('/tnc/update',{method:'POST'}).then(r=>r.text()).then(t=>$('flashst').textContent=t)\
+.catch(()=>$('flashst').textContent='Could not reach the node.')}\
 function say(m){$('msg').textContent=m}\
 function post(f,u){fetch(u,{method:'POST',body:new URLSearchParams(new FormData(f))})\
 .then(r=>r.text()).then(t=>f.querySelector('.res').textContent=t)\
@@ -295,6 +323,16 @@ crossed, ground) and that the TNC is powered.';\
 $('lk').textContent=(d.heard==null?'Nothing heard from the TNC yet':'Last heard from the TNC '+\
 Math.round((d.now-d.heard)/1000)+' s ago')+', '+d.rx+' frames heard, '+d.tx+' sent';\
 var j=$('job');if(d.job){j.textContent=d.job.text;j.className='hint '+(d.job.done?(d.job.ok?'ok':'bad'):'')}\
+last=d;var t=d.tnc,old=t&&t.sethw===false;$('setmode').disabled=old;\
+$('modewarn').textContent=old?'This TNC runs firmware '+t.fw+', which cannot take a mode over KISS \
+(3.41 or later can). Update its firmware below, or set the mode with its MODE DIP switches.':'';\
+$('fwnow').textContent=!t?'The TNC has not reported its firmware yet.':'The TNC runs firmware '+t.fw+\
+(t.old?'. The current release is '+t.major+'.44.':t.old===false?', the current release.':'.');\
+$('gh').hidden=!(t&&(t.major==3||t.major==4));\
+var fl=d.flash,busy=fl&&fl.running;\
+if(d.img)$('img').textContent='Stored on the node: '+d.img.name+', '+d.img.lines+' lines, for '+d.img.chip+'.';\
+$('upd').disabled=!d.img||busy;\
+if(fl){$('flashst').textContent=fl.text;$('flashst').className='hint '+(fl.ok===true?'ok':fl.ok===false?'bad':'')}\
 if($('pause').checked)return 0;\
 if(since>0&&d.oldest>since+1)line('ev','(some lines were missed)');\
 d.log.forEach(function(e){line(e[2]=='RX'?'rx':e[2]=='TX'?'tx':'ev',\

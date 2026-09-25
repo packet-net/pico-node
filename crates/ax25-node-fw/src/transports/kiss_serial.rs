@@ -31,9 +31,13 @@
 //! page's test-frame button covers the bring-up need the old 10 s beacon served.
 
 use ax25_node_core::ax25::{Callsign, PID_NO_LAYER3};
-use ax25_node_core::kiss::ninotnc::mode_set::{write_dip, write_mode, Step};
+use ax25_node_core::kiss::ninotnc::flash::{
+    write_flash_outcome, BootloaderFlasher, FlashAction, FlashOutcome, FlashTimings, MAX_LINE,
+};
+use ax25_node_core::kiss::ninotnc::mode_set::{refuse_before_sending, write_dip, write_mode, Step};
 use ax25_node_core::kiss::ninotnc::{
-    self, commands, ModeSetter, ModeVerifyPolicy, NinoTncInboundEvent, NinoTncStatusFrame,
+    self, commands, ChipVariant, ModeSetter, ModeVerifyPolicy, NinoTncInboundEvent,
+    NinoTncStatusFrame,
 };
 use ax25_node_core::kiss::serial::ByteStream;
 use ax25_node_core::kiss::{classify::InboundEvent, Command, SerialKissModem};
@@ -43,7 +47,7 @@ use ax25_node_core::netrom::{
     NetRomOriginator, NetRomOriginatorOptions, ObserveOutcome, PortId,
 };
 
-use embassy_futures::select::{select4, Either4};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{PIN_20, PIN_21, UART1};
 use embassy_rp::uart::{
@@ -57,7 +61,8 @@ use static_cell::StaticCell;
 use crate::config::{KissSerialConfig, NetRomConfig};
 use crate::config_store::TncSettings;
 use crate::session;
-use crate::tnc::{self, TncCommand};
+use crate::tnc::{self, FlashStatus, TncCommand};
+use crate::tnc_image::{self, LineReader};
 use crate::transports::{call_str, ui_frame};
 
 /// Seconds between housekeeping ticks (NODES origination and the obsolescence
@@ -130,12 +135,8 @@ pub async fn task(
     if settings.mode.is_none() {
         settings.mode = cfg.startup_mode.filter(|m| *m <= 15);
     }
-    send_params(&mut modem, &settings).await;
     let mut mode_job: Option<ModeSetter> = None;
-    match settings.mode {
-        Some(mode) => start_mode(&mut modem, &mut mode_job, mode, false).await,
-        None => send_get_all(&mut modem).await,
-    }
+    apply_saved(&mut modem, &settings, &mut mode_job).await;
 
     // Read-only NET/ROM tap + NODES origination + obsolescence sweep — the same
     // wiring the KISS-TCP transport uses, now over real RF (Gap A + Gap B). Each
@@ -252,6 +253,9 @@ pub async fn task(
                     send_ax25(&mut modem, &frame).await;
                 }
                 TncCommand::Refresh => send_get_all(&mut modem).await,
+                TncCommand::UpdateFirmware => {
+                    run_update(&mut modem, &settings, &mut mode_job).await;
+                }
             },
             Either4::Fourth(()) => {
                 if let Some(job) = mode_job.as_mut() {
@@ -428,8 +432,29 @@ async fn send_params(modem: &mut Modem, t: &TncSettings) {
     }
 }
 
+/// Send the node's saved settings to the TNC: KISS parameters, then the mode
+/// (verified by readback). With no saved mode, a GETALL so the page can show
+/// what the TNC is running. Used at start and after a TNC firmware update.
+async fn apply_saved(modem: &mut Modem, settings: &TncSettings, mode_job: &mut Option<ModeSetter>) {
+    send_params(modem, settings).await;
+    match settings.mode {
+        Some(mode) => start_mode(modem, mode_job, mode, false).await,
+        None => send_get_all(modem).await,
+    }
+}
+
 /// Start a mode change (replacing any in flight) and send its first SETHW.
+/// When the TNC has already reported firmware too old for SETHW, nothing is
+/// sent and the page says why.
 async fn start_mode(modem: &mut Modem, job: &mut Option<ModeSetter>, mode: u8, persist: bool) {
+    let known = tnc::with_state(|s| s.status.and_then(|st| st.firmware_version));
+    if let Some(outcome) = refuse_before_sending(mode, known) {
+        let setter = ModeSetter::decided(mode, outcome);
+        tnc::with_state(|s| s.mode_job = Some(setter));
+        report_outcome(&setter);
+        *job = None;
+        return;
+    }
     let Some((setter, step)) =
         ModeSetter::start(mode, persist, tnc::now_ms(), ModeVerifyPolicy::default())
     else {
@@ -501,6 +526,149 @@ async fn do_step(modem: &mut Modem, setter: &ModeSetter, step: Step) {
 
 fn report_outcome(setter: &ModeSetter) {
     tnc::log_with(Direction::Info, |w| setter.write_summary(w));
+}
+
+/// Write the firmware image stored on the node to the TNC through its
+/// bootloader (the flashtnc procedure, [`BootloaderFlasher`]). Takes over the
+/// serial line for the few minutes it runs; afterwards re-sends the node's saved
+/// settings to the restarted TNC.
+async fn run_update(modem: &mut Modem, settings: &TncSettings, mode_job: &mut Option<ModeSetter>) {
+    fn refuse(why: &'static str) {
+        tnc::with_state(|s| s.flash = FlashStatus::Refused(why));
+        tnc::log(Direction::Info, why);
+    }
+    let Some(image) = tnc::staged_image() else {
+        return refuse("No firmware file is stored on the node; upload one first.");
+    };
+    if !tnc_image::verify(&image) {
+        return refuse("The stored firmware file is damaged; upload it again.");
+    }
+    // The bootloader check is the authority, but a TNC that has told us its
+    // chip lets us refuse the wrong file before touching it at all.
+    let reported = tnc::with_state(|s| s.status.and_then(|st| st.firmware_version));
+    if let Some(chip) = reported.map(|v| v.chip_variant()) {
+        if chip != ChipVariant::Unknown && chip != image.target {
+            return refuse(if chip == ChipVariant::Dspic33Ep512 {
+                "This TNC runs firmware 4.x (dsPIC33EP512GP): upload the v4 file, not v3."
+            } else {
+                "This TNC runs firmware 3.x (dsPIC33EP256GP): upload the v3 file, not v4."
+            });
+        }
+    }
+
+    *mode_job = None;
+    let (name, lines) = (image.name(), image.lines);
+    tnc::log_with(Direction::Info, |w| {
+        write!(w, "Updating the TNC firmware from {name} ({lines} lines). Do not power off the TNC.")
+    });
+    let timings = FlashTimings::default();
+    let (mut flasher, first) = BootloaderFlasher::start(image.target, image.lines, tnc::now_ms(), timings);
+    tnc::with_state(|s| s.flash = FlashStatus::Flashing(flasher));
+    let mut reader = LineReader::new(&image);
+    perform(modem, &mut flasher, first, &mut reader, &timings).await;
+
+    let mut buf = [0u8; 32];
+    while flasher.outcome().is_none() {
+        // Every state but "writing a line" has a deadline, and lines are written
+        // inside `perform`; the fallback only guards against a stall.
+        let deadline = flasher.deadline_ms().unwrap_or(tnc::now_ms() + 1_000);
+        let woke = select(
+            modem.stream_mut().read(&mut buf),
+            Timer::at(Instant::from_millis(deadline)),
+        )
+        .await;
+        match woke {
+            Either::First(Ok(n)) => {
+                for &b in &buf[..n] {
+                    let actions = flasher.on_byte(b, tnc::now_ms());
+                    perform(modem, &mut flasher, actions, &mut reader, &timings).await;
+                    if flasher.outcome().is_some() {
+                        break;
+                    }
+                }
+            }
+            Either::First(Err(_)) => Timer::after_millis(10).await,
+            Either::Second(()) => {
+                let actions = flasher.on_time(tnc::now_ms());
+                perform(modem, &mut flasher, actions, &mut reader, &timings).await;
+            }
+        }
+        tnc::with_state(|s| s.flash = FlashStatus::Flashing(flasher));
+    }
+    tnc::with_state(|s| {
+        s.flash = FlashStatus::Flashing(flasher);
+        s.status = None; // whatever the TNC said before no longer holds
+    });
+    let outcome = flasher.outcome().unwrap_or(FlashOutcome::Failed {
+        kind: ax25_node_core::kiss::ninotnc::flash::FailureKind::NoResponse,
+        line: None,
+        written: 0,
+        byte: None,
+    });
+    tnc::log_with(Direction::Info, |w| write_flash_outcome(&outcome, w));
+    modem.reset_decoder();
+
+    match outcome {
+        FlashOutcome::Done { .. } => {
+            // First boot of new firmware: a bootloader self-update (~2 s), then KISS.
+            Timer::after_secs(5).await;
+            tnc::log(Direction::Info, "Sending the node's saved settings to the updated TNC");
+            apply_saved(modem, settings, mode_job).await;
+        }
+        o if o.nothing_written() => {
+            Timer::after_secs(2).await;
+            send_get_all(modem).await;
+        }
+        // Mid-write failure: the TNC sits in its bootloader until an update
+        // completes, so there is nothing to talk KISS to.
+        _ => {}
+    }
+}
+
+/// Carry out the flasher's actions on the serial line.
+async fn perform(
+    modem: &mut Modem,
+    flasher: &mut BootloaderFlasher,
+    actions: ax25_node_core::kiss::ninotnc::flash::Actions,
+    reader: &mut LineReader,
+    timings: &FlashTimings,
+) {
+    for action in actions {
+        match action {
+            FlashAction::Write(bytes) => {
+                let _ = modem.stream_mut().write(bytes).await;
+            }
+            FlashAction::DiscardInput => discard_input(modem).await,
+            FlashAction::SendLine { index, paced } => {
+                let mut line = [0u8; MAX_LINE + 1];
+                let Some(n) = reader.next_line(index, &mut line) else {
+                    flasher.line_unavailable();
+                    return;
+                };
+                if paced {
+                    for c in &line[..n] {
+                        let _ = modem.stream_mut().write(core::slice::from_ref(c)).await;
+                        Timer::after_millis(timings.first_line_char_delay_ms).await;
+                    }
+                } else {
+                    let _ = modem.stream_mut().write(&line[..n]).await;
+                }
+                flasher.line_sent(tnc::now_ms());
+            }
+        }
+    }
+}
+
+/// Read and drop whatever is waiting on the serial line (at most 2 s' worth).
+async fn discard_input(modem: &mut Modem) {
+    let mut buf = [0u8; 64];
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        match select(modem.stream_mut().read(&mut buf), Timer::after_millis(5)).await {
+            Either::First(_) => continue,
+            Either::Second(()) => break,
+        }
+    }
 }
 
 /// Configure UART1 as a buffered 8N1 UART at `baud` on GP20 (TX) / GP21 (RX) —

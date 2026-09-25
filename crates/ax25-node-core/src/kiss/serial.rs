@@ -104,6 +104,21 @@ impl<S: ByteStream> SerialKissModem<S> {
         &self.stream
     }
 
+    /// Borrow the underlying stream mutably, to speak something other than KISS
+    /// on the same wire (the NinoTNC bootloader's plain-byte protocol). Call
+    /// [`Self::reset_decoder`] before going back to KISS.
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Forget any half-decoded input and queued frames, e.g. after the stream
+    /// carried something other than KISS.
+    pub fn reset_decoder(&mut self) {
+        self.decoder.reset();
+        #[cfg(feature = "alloc")]
+        self.pending.clear();
+    }
+
     /// Frame and send a KISS `Data` frame carrying `ax25_bytes`. Mirrors
     /// `KissSerialModem.SendFrameAsync`. Returns the modem's `Error::TooLarge` if
     /// the body exceeds [`MAX_AX25_BODY`].

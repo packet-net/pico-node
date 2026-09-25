@@ -62,6 +62,8 @@ mod session;
 #[cfg(target_os = "none")]
 mod tnc;
 #[cfg(target_os = "none")]
+mod tnc_image;
+#[cfg(target_os = "none")]
 mod transports;
 mod webui;
 

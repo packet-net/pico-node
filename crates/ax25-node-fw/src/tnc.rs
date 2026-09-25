@@ -16,6 +16,7 @@ use core::fmt::{self, Write};
 
 use ax25_node_core::ax25::Callsign;
 use ax25_node_core::kiss::ninotnc::mode_set::{write_dip, write_mode};
+use ax25_node_core::kiss::ninotnc::flash::{write_chip, BootloaderFlasher, FlashOutcome};
 use ax25_node_core::kiss::ninotnc::{ModeSetter, NinoTncStatusFrame};
 use ax25_node_core::monitor::{Direction, MonitorLog};
 
@@ -42,6 +43,20 @@ pub enum TncCommand {
     },
     /// Ask the TNC for its diagnostic report (GETALL).
     Refresh,
+    /// Write the stored firmware image to the TNC through its bootloader.
+    UpdateFirmware,
+}
+
+/// Where a TNC firmware update is up to.
+#[derive(Clone, Copy)]
+pub enum FlashStatus {
+    Idle,
+    /// Asked for; the serial task has not picked it up yet.
+    Starting,
+    /// Refused before starting, with the reason.
+    Refused(&'static str),
+    /// Running, or finished (the flasher holds the outcome).
+    Flashing(BootloaderFlasher),
 }
 
 /// Web -> serial task. Small: the page sends one command per click.
@@ -60,6 +75,10 @@ pub struct TncState {
     pub status: Option<NinoTncStatusFrame>,
     /// The current or most recent mode change.
     pub mode_job: Option<ModeSetter>,
+    /// The current or most recent TNC firmware update.
+    pub flash: FlashStatus,
+    /// The firmware image stored on the node, once looked up.
+    pub staged: Option<Option<crate::tnc_image::StagedImage>>,
 }
 
 pub static STATE: Mutex<CriticalSectionRawMutex, RefCell<TncState>> =
@@ -70,11 +89,13 @@ pub static STATE: Mutex<CriticalSectionRawMutex, RefCell<TncState>> =
         tx_frames: 0,
         status: None,
         mode_job: None,
+        flash: FlashStatus::Idle,
+        staged: None,
     }));
 
 /// Monitor lines kept, and the width of each.
 const MONITOR_LINES: usize = 40;
-const MONITOR_WIDTH: usize = 120;
+const MONITOR_WIDTH: usize = 224;
 
 pub static MONITOR: Mutex<CriticalSectionRawMutex, RefCell<MonitorLog<MONITOR_LINES, MONITOR_WIDTH>>> =
     Mutex::new(RefCell::new(MonitorLog::new()));
@@ -107,8 +128,30 @@ pub fn submit(cmd: TncCommand) -> Result<(), &'static str> {
     if !with_state(|s| s.running) {
         return Err("The TNC link is not running. Set the node's callsign first.");
     }
+    if flashing() {
+        return Err("The TNC firmware is being updated; wait for it to finish.");
+    }
     CMD.try_send(cmd)
         .map_err(|_| "The TNC link is busy; try again in a moment.")
+}
+
+/// Whether a TNC firmware update is in progress.
+pub fn flashing() -> bool {
+    with_state(|s| match s.flash {
+        FlashStatus::Starting => true,
+        FlashStatus::Flashing(f) => f.outcome().is_none(),
+        _ => false,
+    })
+}
+
+/// The firmware image stored on the node (read from flash once, then cached).
+pub fn staged_image() -> Option<crate::tnc_image::StagedImage> {
+    if let Some(cached) = with_state(|s| s.staged) {
+        return cached;
+    }
+    let found = crate::tnc_image::staged();
+    with_state(|s| s.staged = Some(found));
+    found
 }
 
 /// A `fmt::Write` into a fixed byte buffer that fails when full (so a caller can
@@ -258,12 +301,56 @@ fn write_status_json(w: &mut BufWriter<'_>, now: u64) -> fmt::Result {
                 (None, Some(b)) => json_str(w, |j| write!(j, "unknown (0x{b:02X})"))?,
                 (None, None) => w.write_str("null")?,
             }
+            w.write_str(",\"sethw\":")?;
+            match st.firmware_version {
+                Some(v) => write!(
+                    w,
+                    "{},\"old\":{},\"major\":{}",
+                    v.supports_sethw_mode(),
+                    v.older_than_catalog(),
+                    v.major
+                )?,
+                None => w.write_str("null,\"old\":null,\"major\":null")?,
+            }
             w.write_str(",\"uptime\":")?;
             match st.uptime_ms {
                 Some(u) => write!(w, "{}", u / 1000)?,
                 None => w.write_str("null")?,
             }
             w.write_str("}")?;
+        }
+    }
+    w.write_str(",\"img\":")?;
+    match staged_image() {
+        None => w.write_str("null")?,
+        Some(img) => {
+            w.write_str("{\"name\":")?;
+            json_str(w, |j| j.write_str(img.name()))?;
+            write!(w, ",\"lines\":{},\"chip\":", img.lines)?;
+            json_str(w, |j| write_chip(img.target, j))?;
+            w.write_str("}")?;
+        }
+    }
+    w.write_str(",\"flash\":")?;
+    match with_state(|s| s.flash) {
+        FlashStatus::Idle => w.write_str("null")?,
+        FlashStatus::Starting => {
+            w.write_str("{\"text\":\"Starting the update...\",\"running\":true,\"ok\":null}")?
+        }
+        FlashStatus::Refused(why) => {
+            w.write_str("{\"text\":")?;
+            json_str(w, |j| j.write_str(why))?;
+            w.write_str(",\"running\":false,\"ok\":false}")?;
+        }
+        FlashStatus::Flashing(f) => {
+            w.write_str("{\"text\":")?;
+            json_str(w, |j| f.write_progress(j))?;
+            let ok = match f.outcome() {
+                None => "null",
+                Some(FlashOutcome::Done { .. }) => "true",
+                Some(_) => "false",
+            };
+            write!(w, ",\"running\":{},\"ok\":{ok}}}", f.outcome().is_none())?;
         }
     }
     w.write_str(",\"job\":")?;
@@ -355,4 +442,16 @@ pub fn post_test(body: &[u8]) -> Result<&'static str, alloc::string::String> {
 pub fn post_refresh() -> Result<&'static str, alloc::string::String> {
     submit(TncCommand::Refresh)?;
     Ok("Asked the TNC for its report.")
+}
+
+/// Handle `POST /tnc/update`: write the stored image to the TNC.
+pub fn post_update() -> Result<&'static str, alloc::string::String> {
+    if staged_image().is_none() {
+        return Err("Upload a firmware file first.".into());
+    }
+    submit(TncCommand::UpdateFirmware)?;
+    // Replaces the previous attempt's outcome at once, and makes `submit`
+    // refuse other commands until the serial task has finished.
+    with_state(|s| s.flash = FlashStatus::Starting);
+    Ok("Update started. Keep the TNC powered; progress shows below.")
 }
