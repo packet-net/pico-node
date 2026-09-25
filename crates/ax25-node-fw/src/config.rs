@@ -114,8 +114,12 @@ pub struct TelnetConfig {
 pub struct NetRomConfig {
     /// Originate NODES broadcasts (the C# `netRom.broadcast` opt-in).
     pub originate: bool,
-    /// Seconds between NODES broadcasts. BPQ convention is minutes; the lab
-    /// runs short. Overridable at build time via `NODES_INTERVAL_SECS`.
+    /// Seconds between NODES broadcasts, which is also the obsolescence sweep
+    /// cadence (BPQ NODESINTERVAL). Default 3600 (hourly), packet.net's default:
+    /// routes age one step per interval, so a short interval ages routes learned
+    /// from slower-broadcasting neighbours below the advertise threshold between
+    /// their broadcasts (seen on air at 300 s). Overridable at build time via
+    /// `NODES_INTERVAL_SECS` and in config (`NODES_INTERVAL`).
     pub nodes_interval_secs: u32,
 }
 
@@ -166,7 +170,7 @@ pub fn load() -> NodeConfig {
         telnet: TelnetConfig { port: 8023 },
         netrom: NetRomConfig {
             originate: true,
-            nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
+            nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 3600),
         },
         mqtt_host: option_env!("MQTT_HOST").filter(|s| !s.is_empty()),
         force_ap: false,

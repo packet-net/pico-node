@@ -501,7 +501,7 @@ fn render_show(p: &StoredConfig) -> String {
     };
     out += &match p.nodes_interval_secs {
         Some(v) => format!("  NODES_INTERVAL {v}\n"),
-        None => String::from("  NODES_INTERVAL (default: 300)\n"),
+        None => String::from("  NODES_INTERVAL (default: 3600)\n"),
     };
     out += &match p.originate {
         Some(v) => format!("  ORIGINATE      {v}\n"),
