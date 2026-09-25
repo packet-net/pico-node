@@ -62,7 +62,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
 use crate::config::NetRomConfig;
@@ -283,15 +283,27 @@ pub async fn task(
             .iter()
             .flatten()
             .any(|p| matches!(p.role, Role::TelnetRelay));
+        // Peer bytes waiting for a slow telnet user are fed on as it drains,
+        // including after the link has ended (so the tail still arrives).
         let relay_fut = async {
             if telnet_relay_active {
                 let mut buf = [0u8; 128];
-                match select(relay::USER_TO_AX.read(&mut buf), relay::USER_HANGUP.wait()).await {
-                    Either::First(n) => RelayEvent::UserData(buf, n),
-                    Either::Second(()) => RelayEvent::Hangup,
+                match select3(
+                    relay::USER_TO_AX.read(&mut buf),
+                    relay::USER_HANGUP.wait(),
+                    relay::flush_some(),
+                )
+                .await
+                {
+                    Either3::First(n) => RelayEvent::UserData(buf, n),
+                    Either3::Second(()) => RelayEvent::Hangup,
+                    Either3::Third(()) => RelayEvent::Flushed,
                 }
             } else {
-                RelayEvent::Connect(relay::CONNECT_REQ.receive().await)
+                match select(relay::CONNECT_REQ.receive(), relay::flush_some()).await {
+                    Either::First(target) => RelayEvent::Connect(target),
+                    Either::Second(()) => RelayEvent::Flushed,
+                }
             }
         };
 
@@ -587,6 +599,7 @@ pub async fn task(
                         .await;
                     }
                 }
+                RelayEvent::Flushed => {}
                 RelayEvent::Hangup => {
                     if let Some(i) = find_role(&peers, |r| matches!(r, Role::TelnetRelay)) {
                         peers[i].as_mut().expect("present").role = Role::None;
@@ -756,6 +769,8 @@ enum RelayEvent {
     UserData([u8; 128], usize),
     /// The telnet user went away — disconnect the relay link.
     Hangup,
+    /// Some held-back peer bytes reached the telnet user; nothing else to do.
+    Flushed,
 }
 
 /// Drive one event into `peers[start]`'s session, then apply every cross-peer
@@ -1591,11 +1606,7 @@ fn post_one(
                             data: info,
                         });
                     }
-                    Role::TelnetRelay => {
-                        if relay::AX_TO_USER.try_write(&info).is_err() {
-                            defmt::warn!("node: relay pipe full, dropping {=usize}B", info.len());
-                        }
-                    }
+                    Role::TelnetRelay => relay::to_user(&info),
                     Role::None | Role::Interlink => {}
                 },
                 DataLinkSignal::DisconnectIndication | DataLinkSignal::DisconnectConfirm => {
