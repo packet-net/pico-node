@@ -109,11 +109,16 @@ impl<const N: usize> PeerCapabilityCache<N> {
             policy == PeerDialPolicy::UserConnect
         };
 
-        // Pre-connect XID: moot on the extended path. Off it, send the XID unless we
-        // have freshly learned this peer does NOT answer it.
+        // Pre-connect XID: the same rule on both versions - send the XID unless we
+        // have freshly learned this peer does NOT answer it. It used to be forced
+        // off on the extended path, when a v2.2 dial negotiated after the UA; a dial
+        // now negotiates before the connection on either modulus (§6.3.2 ¶1;
+        // packethacking/ax25spec#113), so an extended dial that skipped it would be
+        // the one link type still negotiating over live traffic. Mirrors C#
+        // `PeerCapabilityCache.Plan` (packet.net#820).
         let known_non_answerer = fresh(rec, rec.and_then(|r| r.supports_srej_via_xid), now_ms)
             && rec.and_then(|r| r.supports_srej_via_xid) == Some(false);
-        let pre_connect_xid = !extended && !known_non_answerer;
+        let pre_connect_xid = !known_non_answerer;
 
         PeerDialPlan {
             extended,
@@ -262,10 +267,11 @@ mod tests {
     // ─── plan_dial: miss ⇒ optimistic policy default ─────────────────────
 
     #[test]
-    fn plan_dial_miss_user_connect_offers_sabme_and_no_xid() {
+    fn plan_dial_miss_user_connect_offers_sabme_and_sends_xid() {
         let plan = cache().plan_dial(PORT, &peer(), PeerDialPolicy::UserConnect, T0);
         assert!(plan.extended);
-        assert!(!plan.pre_connect_xid);
+        // Negotiate before the connect on the extended path too (§6.3.2 ¶1, #820).
+        assert!(plan.pre_connect_xid);
     }
 
     #[test]
@@ -282,6 +288,21 @@ mod tests {
         let mut c = cache();
         c.record_outcome(PORT, peer(), true, true, false, false, T0);
         let plan = c.plan_dial(PORT, &peer(), PeerDialPolicy::Interlink, T0);
+        assert!(plan.extended);
+        assert!(
+            plan.pre_connect_xid,
+            "nothing learned says this peer ignores an XID"
+        );
+    }
+
+    /// C# `PlanDial_extended_skips_the_XID_for_a_peer_freshly_learned_not_to_answer_one`
+    /// (packet.net#820): a dial that sent the XID and saw no SREJ come back means
+    /// this peer does not answer one, on the extended path as on mod-8.
+    #[test]
+    fn plan_dial_extended_skips_the_xid_for_a_fresh_non_answerer() {
+        let mut c = cache();
+        c.record_outcome(PORT, peer(), true, true, true, false, T0);
+        let plan = c.plan_dial(PORT, &peer(), PeerDialPolicy::UserConnect, T0);
         assert!(plan.extended);
         assert!(!plan.pre_connect_xid);
     }

@@ -25,21 +25,26 @@ reference = "packet-net/packet.net"   # C# Packet.* is the reference runtime
 # checkout, so a stale sibling silently builds different tables than CI
 # (exactly the local-vs-CI skew found 2026-08-28).
 #
+# This `pin` line is the ONE source of truth: ci.yml (both jobs) and
+# release.yml read it from here. (Until 2026-09-25 ci.yml hardcoded its own
+# SHA; the two drifted, and the v0.6.0 release built against a stale pin that
+# lacked the ax25spec#40 guard atom and failed to compile.)
+#
 # Versioning note; ax25sdl carries THREE independent version schemes that are NOT
 # comparable: the Rust crate's Cargo.toml version, the git tags (v0.x.y), and the
-# C# `Packet.Ax25.Sdl` NuGet version. Tag v0.10.1 (= 56bbccd) is the corrected
-# figc4.5 (the SREJ selective-retransmit fix, ax25spec#65 / ax25sdl#78); tag
-# v0.10.2 (= 66321e6 = crate-v0.8.0) adds the AGPL-3.0 relicense of the emitted
-# backends. C# pins NuGet 0.10.2; this pin is one tooling-only commit past it
-# (4212c1e, a codegen drift-guard fix - spec/rust is byte-identical to v0.10.2),
-# so pico-node and C# run the SAME state-machine tables. The runtime consequence
-# of the figc4.5 correction (the retired #38 quirk, the new srej_command_ignored
-# quirk) is mirrored in `sdl::quirks` - see that module's docs.
+# C# `Packet.Ax25.Sdl` NuGet version. Tag crate-v0.9.0 (= 40ba9c5) and tag
+# v0.11.0 (the NuGet C# pins) carry the same tables: the ax25spec#40 receive-
+# window guard atom (`Ax25Guard::VrLtNsLtVrPlusK`) on figc4.4/figc4.5 on top of
+# the corrected figc4.5 (ax25spec#65). This pin is ax25sdl main as of
+# 2026-09-25; every commit past crate-v0.9.0 touched only the TS emitter, the
+# conformance/explorer tooling and CI, so spec/rust and spec/json are
+# byte-identical to crate-v0.9.0 and pico-node and C# run the SAME
+# state-machine tables.
 crate        = "ax25sdl"
 repo         = "packet-net/ax25sdl"   # formerly m0lte/ax25sdl (GitHub org-rename redirect)
 rust_crate   = "0.9.0"                # the Rust crate version this pin provides (no_std backend; AGPL-3.0)
-csharp_nuget = "0.10.2"               # what C# pins - carries the same corrected figc4.5 tables
-pin          = "4212c1e1b9bc27f5520e820c995c10204838cee8"  # reproducible latest; MUST match ci.yml
+csharp_nuget = "0.11.0"               # what C# pins - the same tables as crate-v0.9.0
+pin          = "181328ba0c53fd6d3d74d42b35e93bd3e149c7f4"  # read by ci.yml + release.yml
 
 # ---------------------------------------------------------------------------
 # opted-IN: pico-node runs the shared corpus for these; CI fails on any mismatch.

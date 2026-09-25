@@ -2,8 +2,8 @@
   "$comment": "VENDORED SNAPSHOT of the C# reference named-flag / quirk / preset / listener inventory, extracted from packet-net/packet.net src/Packet.Core + src/Packet.Ax25. This is the C# side of the pico-node parity contract, checked in so scripts/parity-check.mjs runs on a self-hosted runner with NO cross-repo token. Refresh it when the C# inventory changes — see parity/README.md. Each item is either mapped to an opted-in manifest vector_set (coverage) OR must be listed in parity-exceptions.json with a reason; the checker fails on any item that is neither.",
   "source": {
     "repo": "packet-net/packet.net",
-    "commit": "9b59ed1",
-    "extractedOn": "2026-07-12",
+    "commit": "1f189ea",
+    "extractedOn": "2026-09-25",
     "files": {
       "parseOptions": "src/Packet.Core/Ax25ParseOptions.cs",
       "quirks": "src/Packet.Ax25/Session/Ax25SessionQuirks.cs",
@@ -54,11 +54,12 @@
     { "section": "listenerOptions", "name": "ParseOptions", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Passthrough of Ax25ParseOptions into the frame parser." },
     { "section": "listenerOptions", "name": "Quirks", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Passthrough of Ax25SessionQuirks into the session FSM." },
     { "section": "listenerOptions", "name": "PreferExtendedConnect", "coverage": { "set": "ax25_mod128", "capability": "negotiate-down-from-mod128" }, "note": "Chooses SABME (mod-128) vs SABM (mod-8) on connect." },
-    { "section": "listenerOptions", "name": "PreConnectXidNegotiatesSrej", "coverage": { "set": "xid", "capability": "xid" }, "note": "Pre-connect XID negotiation of SREJ capability." },
+    { "section": "listenerOptions", "name": "PreConnectXidNegotiatesSrej", "coverage": { "set": "xid", "capability": "xid" }, "note": "Pre-connect XID negotiation (SREJ, modulo, window, timers) before the SABM(E), on both moduli since packet.net#819." },
     { "section": "listenerOptions", "name": "MaxCachedPeers" },
     { "section": "listenerOptions", "name": "ConfigureSession" },
     { "section": "listenerOptions", "name": "CarrierSense" },
     { "section": "listenerOptions", "name": "RestartT1OnTxComplete" },
+    { "section": "listenerOptions", "name": "PortName" },
 
     { "section": "listenerSurface", "name": "ConnectAsync", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "Connected-mode establishment (SABM/SABME -> UA)." },
     { "section": "listenerSurface", "name": "SendUiAsync", "coverage": { "set": "ax25_mod8", "capability": "mod8" }, "note": "UI-frame transmit; mod-8 frame codec." },

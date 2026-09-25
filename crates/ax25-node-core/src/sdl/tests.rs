@@ -862,3 +862,159 @@ fn s_first_i(r: &Recorder) -> (u8, u8, Vec<u8>) {
         .next()
         .expect("expected an I-frame")
 }
+
+// ─── C# engine currency, Sep 2026 (packet.net #804, #813, #818, #819) ───────
+
+/// T3 defaults to 300 s (packet.net#804): the spec gives no figure, 300 s is the
+/// LinBPQ and Linux default, and 30 s put an RR poll pair on air twice a minute
+/// per idle link.
+#[test]
+fn t3_default_is_300_seconds() {
+    let mut s = Session::new();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+
+    s.post_event(Event::DlConnectRequest, &mut t, &mut r);
+    s.post_event(Event::UaReceived(rx(true, false)), &mut t, &mut r);
+    assert_eq!(s.state, State::Connected);
+    assert!(t.is_running(TimerId::T3), "idle connected link runs T3");
+    assert_eq!(t.time_remaining_ms(TimerId::T3), 300_000);
+}
+
+/// Drive a connected session into Timer Recovery with three frames
+/// outstanding, then answer the enquiry with a PARTIAL acknowledgement (RR
+/// F=1, N(R)=1): figc4.5's partial-ack arm runs Invoke Retransmission and ends
+/// with Set Acknowledge Pending.
+fn timer_recovery_partial_ack() -> (Session, MockTimerService, Recorder) {
+    let mut s = connected_session();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    for n in 0..3u8 {
+        s.post_event(
+            Event::DlDataRequest(crate::ax25::PID_NO_LAYER3, vec![n]),
+            &mut t,
+            &mut r,
+        );
+    }
+    assert_eq!(s.context.vs, 3);
+    s.post_event(Event::T1Expiry, &mut t, &mut r);
+    assert_eq!(s.state, State::TimerRecovery);
+    r = Recorder::default();
+    s.post_event(Event::RrReceived(rx_s(1, true, false)), &mut t, &mut r);
+    (s, t, r)
+}
+
+/// packet.net#812/#813: the partial-ack arm's retransmissions are replayed
+/// inline, and each one carries N(r) = V(r), so Acknowledge Pending must not
+/// outlive the arm (in the figure each re-queued frame pops through figc4.4 t03,
+/// which clears it). Before the fix the flag stayed set with no LM-SEIZE behind
+/// it, and the peer's next I frame went unacknowledged until its own T1 poll.
+#[test]
+fn partial_ack_retransmission_leaves_acknowledge_pending_clear() {
+    let (s, _t, r) = timer_recovery_partial_ack();
+    let resent: Vec<u8> = r.i_frames().iter().map(|(ns, _, _)| *ns).collect();
+    assert_eq!(resent, vec![1, 2], "go-back-N replay of the unacked frames");
+    assert!(
+        !s.context.acknowledge_pending,
+        "the inline replay acknowledged; Set Acknowledge Pending is a no-op"
+    );
+}
+
+/// The consequence #813 fixes, on the wire: after the partial-ack recovery the
+/// peer's next in-sequence I frame is acknowledged through the ordinary
+/// LM-SEIZE path instead of hitting the ack-already-pending arm.
+#[test]
+fn peer_i_frame_after_partial_ack_recovery_is_acknowledged() {
+    let (mut s, mut t, _) = timer_recovery_partial_ack();
+    let mut r = Recorder::default();
+    s.post_event(Event::IReceived(rx_i(0, 1, false)), &mut t, &mut r);
+    assert!(
+        r.link_mux.contains(&LinkMultiplexerSignal::SeizeRequest),
+        "the I frame raises LM-SEIZE for its ack: {:?}",
+        r.link_mux
+    );
+    assert!(s.context.acknowledge_pending);
+}
+
+/// Without a retransmission in the chain, Set Acknowledge Pending still sets
+/// the flag (the #813 guard is scoped to the transition that replayed inline).
+#[test]
+fn set_acknowledge_pending_still_sets_without_an_inline_replay() {
+    let mut s = connected_session();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::IReceived(rx_i(0, 0, false)), &mut t, &mut r);
+    assert!(s.context.acknowledge_pending);
+}
+
+/// packet.net#818: an inbound SABME's Set Version 2.2 selects selective reject
+/// (§6.3.2 ¶1426's v2.2 default), so the post-UA XID offer can reach SREJ.
+#[test]
+fn inbound_sabme_selects_selective_reject() {
+    let mut s = Session::new();
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::SabmeReceived(rx(true, true)), &mut t, &mut r);
+    assert!(s.context.is_extended);
+    assert!(s.context.srej_enabled && !s.context.implicit_reject);
+}
+
+/// packet.net#819: once an XID exchange has settled the reject scheme, the
+/// SABME that follows must not undo it (§6.3.2 ¶7).
+#[test]
+fn inbound_sabme_keeps_a_negotiated_implicit_reject() {
+    let mut s = Session::new();
+    s.context.srej_enabled = false;
+    s.context.implicit_reject = true;
+    s.context.parameters_negotiated = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::SabmeReceived(rx(true, true)), &mut t, &mut r);
+    assert!(s.context.is_extended);
+    assert!(!s.context.srej_enabled && s.context.implicit_reject);
+}
+
+/// packet.net#818: an inbound SABM on a link the pre-session XID left at mod-8
+/// with SREJ agreed keeps SREJ (Set Version 2.0 only undoes a v2.2 selection).
+#[test]
+fn inbound_sabm_keeps_srej_agreed_at_modulo_8() {
+    let mut s = Session::new();
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    s.context.parameters_negotiated = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::SabmReceived(rx(true, true)), &mut t, &mut r);
+    assert!(!s.context.is_extended);
+    assert!(s.context.srej_enabled, "mod-8 SREJ survives the SABM");
+}
+
+/// packet.net#818: a v2.2 dial refused with FRMR drops to v2.0 as a whole:
+/// modulo 8 AND implicit reject, since nothing negotiated SREJ with this peer.
+#[test]
+fn extended_frmr_refusal_takes_selective_reject_off() {
+    let mut s = Session::new();
+    s.context.is_extended = true;
+    s.context.srej_enabled = true;
+    s.context.implicit_reject = false;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::DlConnectRequest, &mut t, &mut r);
+    assert_eq!(s.state, State::AwaitingV22Connection);
+    s.post_event(Event::FrmrReceived(rx(true, false)), &mut t, &mut r);
+    assert!(!s.context.is_extended);
+    assert!(!s.context.srej_enabled && s.context.implicit_reject);
+}
+
+/// Parameters are per-connection (packet.net#819): the link going down clears
+/// the negotiated marker so the next connection starts unsettled.
+#[test]
+fn disconnect_clears_parameters_negotiated() {
+    let mut s = connected_session();
+    s.context.parameters_negotiated = true;
+    let mut t = MockTimerService::new();
+    let mut r = Recorder::default();
+    s.post_event(Event::DiscReceived(rx(true, true)), &mut t, &mut r);
+    assert!(r.upward.contains(&DataLinkSignal::DisconnectIndication));
+    assert!(!s.context.parameters_negotiated);
+}

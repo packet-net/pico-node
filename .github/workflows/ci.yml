@@ -43,14 +43,15 @@ jobs:
       # lives outside the checkout, so actions/checkout does not clean it).
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
+          # The pin lives in ONE place, parity-manifest.toml's [sdl] `pin`, read
+          # here exactly as release.yml reads it (a hardcoded copy here drifted
+          # from the manifest and broke the v0.6.0 release). To advance the SDL,
+          # bump that line and fast-forward your local ../ax25sdl to match.
+          PIN=$(grep -oP '^pin\s*=\s*"\K[0-9a-f]{40}' parity-manifest.toml)
+          echo "ax25sdl pin: $PIN"
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          # Pinned to a reproducible ax25sdl commit, the latest SDL source: one
-          # tooling-only commit past v0.10.2/crate-v0.8.0 (spec/rust is identical),
-          # which carries the corrected figc4.5 tables that C# NuGet 0.10.2 runs.
-          # To advance the SDL, bump this SHA (both jobs) + the
-          # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git cfc8e8fcf662cfb2c77d95d097c49294c275ab8f
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git "$PIN"
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ clippy)
@@ -95,14 +96,15 @@ jobs:
       # Same sibling-clone dance as the check job (fw → core → ax25sdl).
       - name: Check out the ax25sdl sibling (path dependency)
         run: |
+          # The pin lives in ONE place, parity-manifest.toml's [sdl] `pin`, read
+          # here exactly as release.yml reads it (a hardcoded copy here drifted
+          # from the manifest and broke the v0.6.0 release). To advance the SDL,
+          # bump that line and fast-forward your local ../ax25sdl to match.
+          PIN=$(grep -oP '^pin\s*=\s*"\K[0-9a-f]{40}' parity-manifest.toml)
+          echo "ax25sdl pin: $PIN"
           rm -rf "${GITHUB_WORKSPACE}/../ax25sdl"
-          # Pinned to a reproducible ax25sdl commit, the latest SDL source: one
-          # tooling-only commit past v0.10.2/crate-v0.8.0 (spec/rust is identical),
-          # which carries the corrected figc4.5 tables that C# NuGet 0.10.2 runs.
-          # To advance the SDL, bump this SHA (both jobs) + the
-          # parity-manifest.toml [sdl] block.
           git init -q "${GITHUB_WORKSPACE}/../ax25sdl"
-          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git cfc8e8fcf662cfb2c77d95d097c49294c275ab8f
+          git -C "${GITHUB_WORKSPACE}/../ax25sdl" fetch --depth 1 https://github.com/packet-net/ax25sdl.git "$PIN"
           git -C "${GITHUB_WORKSPACE}/../ax25sdl" checkout -q FETCH_HEAD
 
       - name: Install Rust 1.93.1 (+ thumbv6m target, clippy)
