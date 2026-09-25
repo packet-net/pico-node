@@ -264,7 +264,7 @@ pub async fn task(
 /// second of a pair loses bytes and the rest are misread until it re-syncs),
 /// seemingly because it is still busy starting the first transmission. The
 /// damage passes its radio checksum, so nothing downstream catches it.
-const FRAME_GAP_MS: u64 = 30;
+const FRAME_GAP_MS: u64 = 1200;
 
 /// How long `len` bytes take on the serial wire (10 bits a byte at the link
 /// rate, plus a few for the KISS framing). A write returns once the bytes are
