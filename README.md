@@ -17,8 +17,6 @@ AXUDP (AX.25 over UDP) was removed on 2026-09-25: it was the bring-up path befor
 
 ## Read first
 
-**[`docs/HILLTOP-NODE-PLAN.md`](docs/HILLTOP-NODE-PLAN.md)** is the plan for the next goal: an unattended hilltop node with two radios on two bands, acting as the middle hop between stations that cannot hear each other.
-
 **[`docs/PLAN.md`](docs/PLAN.md)** is the living plan: architecture, the module breakdown, the SDL integration story, the hands-free dev cycle (build → flash via probe-rs → defmt/RTT logs), the host-side test strategy, the package-approval gate, and the "when the hardware arrives" checklist + blockers.
 
 ## Layout
