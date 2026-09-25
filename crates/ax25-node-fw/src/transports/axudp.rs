@@ -1574,7 +1574,14 @@ fn post_one(
 ) -> (Vec<Vec<u8>>, Vec<FollowUp>) {
     let peer = ps.peer;
     let local = ps.local;
-    let mut to_send = sessions.post_with_local(local, peer, event, &mut ps.timers);
+    // Stream data (console text, bridged or relayed bytes) is framed to the
+    // link's N1; NET/ROM datagrams are atomic SDUs and go as they are.
+    let mut to_send = match event {
+        Event::DlDataRequest(pid, data) if pid != PID_NETROM => {
+            sessions.post_stream(local, peer, pid, data, &mut ps.timers)
+        }
+        other => sessions.post_with_local(local, peer, other, &mut ps.timers),
+    };
     let mut followups = Vec::new();
 
     // Service upward signals until quiescent (each console reply posts a
@@ -1604,10 +1611,11 @@ fn post_one(
                         );
                         ps.role = Role::Console(LineAssembler::default());
                         let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
-                        to_send.extend(sessions.post_with_local(
+                        to_send.extend(sessions.post_stream(
                             local,
                             peer,
-                            Event::DlDataRequest(PID_NO_LAYER3, banner),
+                            PID_NO_LAYER3,
+                            banner,
                             &mut ps.timers,
                         ));
                     }
@@ -1685,10 +1693,11 @@ fn post_one(
                                 reply.extend_from_slice(prompt.as_bytes());
                             }
                             if !reply.is_empty() {
-                                to_send.extend(sessions.post_with_local(
+                                to_send.extend(sessions.post_stream(
                                     local,
                                     peer,
-                                    Event::DlDataRequest(PID_NO_LAYER3, reply),
+                                    PID_NO_LAYER3,
+                                    reply,
                                     &mut ps.timers,
                                 ));
                             }
