@@ -283,7 +283,7 @@ impl Session {
             && t.from == "AwaitingV22Connection"
             && t.on == Sdl::FRMRReceived
         {
-            self.context.is_extended = false;
+            self.force_version_20();
         }
 
         // #48 companion: the DM's match has been substituted for t14_frmr_received
@@ -296,8 +296,21 @@ impl Session {
             && matches!(event, Event::DmReceived(_))
             && t.from == "AwaitingV22Connection"
         {
-            self.context.is_extended = false;
+            self.force_version_20();
         }
+    }
+
+    /// Drop this link to v2.0 ahead of the transition that will re-establish it:
+    /// modulo 8, and implicit reject with it. The reject scheme travels with the
+    /// version, and a v2.2 dial selects selective reject so the XID that follows
+    /// the SABME offers it; a peer that answers FRMR or DM never negotiates
+    /// anything, so the selection comes off with the modulus. Both quirks force
+    /// this before the transition runs, so the `Set Version 2.0` inside it sees a
+    /// link that is already v2.0. Ports C# `Ax25Session.ForceVersion20` (#818).
+    fn force_version_20(&mut self) {
+        self.context.is_extended = false;
+        self.context.srej_enabled = false;
+        self.context.implicit_reject = true;
     }
 
     /// After every dispatch, if the I-frame queue has entries and transmission is

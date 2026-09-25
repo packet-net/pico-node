@@ -98,6 +98,18 @@ pub struct SessionContext {
     pub half_duplex: bool,
     /// `true` if implicit reject (v2.0) is selected; `false` = selective (v2.2).
     pub implicit_reject: bool,
+    /// `true` once an XID exchange has settled this link's parameters (either end
+    /// of it), or a FRMR answer to our XID command has settled them as the v2.0
+    /// set. Cleared when a dial starts and when the link goes down, so it always
+    /// means "negotiated for the connection in hand". Two things read it, both so
+    /// a settled negotiation is not undone by the establishment that follows it
+    /// (§6.3.2 ¶7): `Set Version 2.2` selects selective reject only when it is
+    /// clear, and the figc4.6 UA arm's MDL-NEGOTIATE poke is skipped once it is
+    /// set. §6.3.2 ¶1 puts negotiation before the connection while Figure D.3 and
+    /// figc4.6's editorial MDL-NEGOTIATE box put it after the UA
+    /// (packethacking/ax25spec#113); we negotiate before and keep the post-UA
+    /// exchange as the fallback. Ports C# `Ax25SessionContext.ParametersNegotiated`.
+    pub parameters_negotiated: bool,
 
     // ─── Integer timer parameters (ms) — research §3 integerisation ──────
     /// Acknowledgement-timer T2 duration (ms). Default 3000.
@@ -152,6 +164,7 @@ impl Default for SessionContext {
             segmenter_reassembler_enabled: false,
             half_duplex: true,
             implicit_reject: true,
+            parameters_negotiated: false,
             t2_ms: 3000,
             srt_ms: 3000,
             t1v_ms: 6000,

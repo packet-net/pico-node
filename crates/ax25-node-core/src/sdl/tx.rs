@@ -46,6 +46,14 @@ pub struct Tx<'a> {
     /// A stored out-of-sequence frame staged by `Retrieve Stored V(r) I Frame`
     /// for the next `DL_DATA_indication` in the chain to deliver (PID, info).
     pub retrieved_stored_frame: Option<(u8, Vec<u8>)>,
+    /// True once this transition has replayed a previously-sent I frame inline
+    /// (`Push Old I Frame onto Queue` in figc4.7's Invoke_Retransmission loop, or
+    /// figc4.4/4.5's `Push Old I Frame N(r) on Queue`). In the figure those frames
+    /// are re-queued and pop off after the arm, each pop clearing Acknowledge
+    /// Pending; the runtime emits them at once and runs the pop's acknowledgement
+    /// bookkeeping there, so a `Set Acknowledge Pending` later in the same chain
+    /// must not re-set the flag. Ports C# `TransitionContext.RetransmittedInline`.
+    pub retransmitted_inline: bool,
 }
 
 impl<'a> Tx<'a> {
@@ -63,6 +71,7 @@ impl<'a> Tx<'a> {
             trigger,
             pending: PendingFrame::default(),
             retrieved_stored_frame: None,
+            retransmitted_inline: false,
         }
     }
 }

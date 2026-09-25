@@ -123,7 +123,22 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
         Ax25ActionVerb::ClearOwnReceiverBusy => tx.session.own_receiver_busy = false,
         Ax25ActionVerb::SetPeerReceiverBusy => tx.session.peer_receiver_busy = true,
         Ax25ActionVerb::ClearPeerReceiverBusy => tx.session.peer_receiver_busy = false,
-        Ax25ActionVerb::SetAcknowledgePending => tx.session.acknowledge_pending = true,
+        // Set Acknowledge Pending after an inline retransmission in the same chain
+        // is a no-op. figc4.5's partial-ack arms (t18_rr_received_yes_yes_no,
+        // t19_rnr_received_yes_yes_no: "... Invoke Retransmission, Stop T3, Start
+        // T1, Set Acknowledge Pending") re-queue the frames and set the flag; in the
+        // figure those frames then pop off the queue after the arm and each pop
+        // (figc4.4 t03 "I frame pops off queue") runs Clear Acknowledge Pending, so
+        // the flag never outlives the arm. This runtime replays them inline
+        // ([`emit_old_i_frame`]), which runs the pop's clear itself, so applying the
+        // set now would leave the flag set with no LM-SEIZE behind it and the peer's
+        // next I frame unacknowledged until the peer's own T1 poll. Mirrors C#
+        // packet.net#812/#813; the figure's own end state, so no quirk flag.
+        Ax25ActionVerb::SetAcknowledgePending => {
+            if !tx.retransmitted_inline {
+                tx.session.acknowledge_pending = true;
+            }
+        }
         Ax25ActionVerb::ClearAcknowledgePending => tx.session.acknowledge_pending = false,
         Ax25ActionVerb::SetLayer3Initiated => tx.session.layer3_initiated = true,
         Ax25ActionVerb::ClearLayer3Initiated => tx.session.layer3_initiated = false,
@@ -134,7 +149,7 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
             tx.timers.arm(super::timer::TimerId::T1, d);
         }
         Ax25ActionVerb::StartT3 => {
-            // T3 uses a fixed spec default (30 s); the figures never mutate it.
+            // T3 uses a fixed local default (300 s); the figures never mutate it.
             tx.timers.arm(super::timer::TimerId::T3, T3_MS);
         }
         Ax25ActionVerb::StopT1 => {
@@ -184,10 +199,14 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
             tx.sink.send_upward(DataLinkSignal::ConnectIndication)
         }
         Ax25ActionVerb::DLCONNECTConfirm => tx.sink.send_upward(DataLinkSignal::ConnectConfirm),
+        // Parameters are per-connection: whatever this link agreed dies with it
+        // (C# `SendUpward` clears ParametersNegotiated on both signals, #819).
         Ax25ActionVerb::DLDISCONNECTIndication => {
+            tx.session.parameters_negotiated = false;
             tx.sink.send_upward(DataLinkSignal::DisconnectIndication)
         }
         Ax25ActionVerb::DLDISCONNECTConfirm => {
+            tx.session.parameters_negotiated = false;
             tx.sink.send_upward(DataLinkSignal::DisconnectConfirm)
         }
         Ax25ActionVerb::DLDATAIndication => build_data_indication(tx),
@@ -292,7 +311,7 @@ pub fn execute_verb(verb: Ax25ActionVerb, tx: &mut Tx<'_>) {
 
         // ─── Version / modulus / link params ────────────────────────────
         Ax25ActionVerb::SetVersion20 => set_version_20(tx),
-        Ax25ActionVerb::SetVersion22 => tx.session.is_extended = true,
+        Ax25ActionVerb::SetVersion22 => set_version_22(tx),
         Ax25ActionVerb::SetHalfDuplex => tx.session.half_duplex = true,
         Ax25ActionVerb::SetImplicitReject => {
             tx.session.implicit_reject = true;
@@ -422,8 +441,13 @@ fn apply_verb_quirks(mut verb: Ax25ActionVerb, tx: &Tx<'_>) -> Ax25ActionVerb {
 
 // ─── Spec-default integer constants (research §3) ───────────────────────────
 
-/// T3 (inactive-link timer) default — 30 s.
-const T3_MS: u32 = 30_000;
+/// T3 (inactive-link timer) default: 300 s. The spec gives no figure: §6.7.1.3
+/// says T3 is "locally defined", "should be greater than T1" and "may be very
+/// large on channels of high integrity". 300 s matches LinBPQ's T3=300 default,
+/// the Linux kernel AX.25 default and the C# `ActionDispatcher.DefaultT3`
+/// (packet.net#804). The earlier 30 s put an RR poll pair on air every 30 s per
+/// idle link, which is too chatty for a shared channel.
+const T3_MS: u32 = 300_000;
 /// SRT "Initial Default" (§6.7.1.2) — 3 s ⇒ T1V 6 s.
 const INITIAL_SRT_MS: u32 = 3000;
 
@@ -529,6 +553,19 @@ fn emit_old_i_frame(tx: &mut Tx<'_>, ns: u8, selective_replay: bool) {
         pid: entry.pid,
         info: entry.data,
     });
+
+    // The frame just went out carrying N(r) = V(r), so any pending acknowledgement
+    // has been sent. In the figure a retransmitted frame is re-queued and pops
+    // through figc4.4 t03 "I frame pops off queue", whose chain ends with Clear
+    // Acknowledge Pending; the inline replay never runs that arm, so mirror its
+    // acknowledgement bookkeeping here (T1/T3 stay with the calling arm, which
+    // carries them explicitly). The marker makes a later Set Acknowledge Pending
+    // in the same chain a no-op, because in the figure the pops run after the
+    // arm. This is the pinned inline-replay semantic (ax25sdl docs/explorer.md,
+    // "Pinned delegated semantics" item 1); mirrors C# `EmitOldIFrame` (#813).
+    // pico-node arms no delayed-ack T2, so there is no timer to cancel here.
+    tx.session.acknowledge_pending = false;
+    tx.retransmitted_inline = true;
 }
 
 fn push_on_i_frame_queue(tx: &mut Tx<'_>) {
@@ -577,11 +614,41 @@ fn build_data_indication(tx: &mut Tx<'_>) {
         .send_upward(DataLinkSignal::DataIndication(pid, info));
 }
 
-/// `set_version_2_0` — the data-link figc4.6 semantics: clear `is_extended` (the
-/// other v2.0 verbs in the chain run separately). The MDL driver would override
-/// this with the full §1436 set; the data-link runtime uses the figure default.
+/// `set_version_2_0`, the data-link semantics: drop to modulo 8, and undo the
+/// v2.2 reject-scheme selection when this is a v2.2 link being downgraded
+/// (figc4.6's FRMR / SABM fallbacks out of AwaitingV22Connection, figc4.5's
+/// FRMR). Only a link that is currently extended can be carrying the
+/// [`set_version_22`] selective-reject selection, so the reject scheme is touched
+/// on that downgrade alone: a modulo-8 link is left exactly as it was, which is
+/// what keeps SREJ agreed by the pre-SABM XID probe (the LinBPQ accommodation)
+/// alive across the SABM that follows it. The MDL machine installs the full §1436
+/// v2.0 set through its own verb arm. Mirrors C# `DowngradeToVersion20` (#818).
 fn set_version_20(tx: &mut Tx<'_>) {
+    if tx.session.is_extended {
+        tx.session.srej_enabled = false;
+        tx.session.implicit_reject = true;
+    }
     tx.session.is_extended = false;
+}
+
+/// `set_version_2_2`: lock in modulo 128 and select selective reject, the §6.3.2
+/// ¶1426 v2.2 default reject scheme and what figc4.7's Set_Version_2_2 body
+/// chooses. The reject scheme matters because the XID exchange builds its offer
+/// from this context ([`super::mdl::default_offer_for`]) and the reverts-to-the-
+/// lesser merge can never reach SREJ from an implicit-reject offer.
+///
+/// The selection is a default, not an override: once an XID exchange has settled
+/// this link's parameters (§6.3.2 ¶7), establishment must not undo them, so a
+/// peer that asked for implicit reject keeps it across the SABME. The rest of the
+/// figc4.7 body (k, N1, T2, N2) is deliberately not applied: those are per-port
+/// configurable parameters and establishment must not clobber them. Mirrors the
+/// C# `SetVersion22` arm (#818, #819).
+fn set_version_22(tx: &mut Tx<'_>) {
+    tx.session.is_extended = true;
+    if !tx.session.parameters_negotiated {
+        tx.session.implicit_reject = false;
+        tx.session.srej_enabled = true;
+    }
 }
 
 // ─── Incoming-frame field extraction (mirror Extract* / Require*) ───────────

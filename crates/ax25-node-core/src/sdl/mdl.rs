@@ -22,8 +22,10 @@
 //!   opening with XID before its SABM). Mirrors `RespondToXidCommand` +
 //!   `HandleNoCachedSession`; hand-implemented in C# too, until upstream redraws
 //!   figc5.1. The negotiated params stage on the cached context so the subsequent
-//!   SABM's `Set Version 2.0` (which clears only `is_extended`) preserves the
-//!   staged `srej_enabled` into the established link.
+//!   SABM(E) establishes on them: a link the merge settled at mod-8 keeps its
+//!   `srej_enabled` through the SABM's `Set Version 2.0` (which only undoes a v2.2
+//!   selection), and a SABME's `Set Version 2.2` does not override a settled
+//!   reject scheme.
 //!
 //! `no_std` + `alloc`.
 
@@ -133,6 +135,12 @@ pub fn apply_negotiated(
     if let Some(n2) = max_present(offered.retries, response.retries) {
         context.n2 = n2;
     }
+
+    // This link's parameters are now settled (§6.3.2 ¶7, "Both TNCs set up based
+    // on the values used in the XID response"): keeps the establishment that
+    // follows from undoing them, and stops a second negotiation being opened over
+    // a link that already has one. Mirrors C# `XidNegotiator.ApplyNegotiated`.
+    context.parameters_negotiated = true;
 }
 
 /// Install the complete AX.25 version-2.0 default parameter set per §6.3.2 ¶1 /
@@ -148,6 +156,9 @@ pub fn apply_version_20_defaults(context: &mut SessionContext) {
     context.t1v_ms = 3000; // Acknowledge Timer
     context.srt_ms = 1500; //   keep T1V == 2·SRT
     context.n2 = 10; // Retries
+    // A FRMR answer to our XID command settles the parameters just as an XID
+    // response does: §6.3.2 ¶1, "a version 2.0 connection is made".
+    context.parameters_negotiated = true;
     context.segmenter_reassembler_enabled = false; // v2.2-only (§1621)
 }
 
@@ -168,19 +179,27 @@ pub fn respond_to_xid_command(
 }
 
 /// The pre-session XID-command responder (mirrors `HandleNoCachedSession`'s XID
-/// branch composed with `RespondToXidCommand`): seed `context` SREJ-capable so our
-/// offer advertises SREJ, parse the command's offered parameters (strict; a
+/// branch composed with `RespondToXidCommand`): seed `context` with this station's
+/// capability (SREJ, mod-128) so our offer advertises it, parse the command's
+/// offered parameters (strict; a
 /// malformed / empty info ⇒ "no parameters offered", the merge falls through to the
 /// §4.3.3.7 ¶1024 defaults), run the §6.3.2 merge into `context`, and return the
 /// encoded XID *response* information field (an F=1 response carrying the agreed
-/// values). The staged `srej_enabled` survives the subsequent SABM's `Set Version
-/// 2.0` (which clears only `is_extended`), so the established link adopts SREJ when
-/// both sides offered it.
+/// values). The merge settles the modulo as the lesser of the two offers, so a
+/// mod-8 caller's link is already mod-8 when its SABM arrives and the staged
+/// `srej_enabled` survives that SABM's `Set Version 2.0`: the established link
+/// adopts SREJ when both sides offered it.
 pub fn respond_pre_session_xid(context: &mut SessionContext, command_info: &[u8]) -> Vec<u8> {
-    // Seed SREJ-capable so default_offer_for advertises SREJ; the lesser-of merge
-    // reverts this if the peer's offer lacked SREJ.
+    // Seed the context with what this station CAN do, so default_offer_for
+    // advertises capability rather than the state of a link that does not exist
+    // yet: SREJ, and modulo 128. The lesser-of merge lets the peer's offer decide
+    // both (an XID offering mod-8 and implicit reject settles there), and the
+    // SABM(E) that follows sets the version explicitly either way. Without the
+    // modulo seed a responder always answered "modulo 8", dragging a v2.2 caller's
+    // pre-connection negotiation down to mod-8. Mirrors C# #819.
     context.srej_enabled = true;
     context.implicit_reject = false;
+    context.is_extended = true;
 
     let command = info_field::parse(command_info).unwrap_or_default();
     let agreed = respond_to_xid_command(context, &command);
