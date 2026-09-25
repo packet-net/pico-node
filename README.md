@@ -15,6 +15,15 @@ Over WiFi, administration only:
 
 AXUDP (AX.25 over UDP) was removed on 2026-09-25: it was the bring-up path before a TNC was attached. See [`docs/PLAN.md`](docs/PLAN.md) §11.
 
+## Installing a release
+
+Each [release](https://github.com/packet-net/pico-node/releases) has three files:
+
+- **`pico-node-app.bin`** - the in-place upgrade for a node already running pico-node: upload it in the web panel under **Firmware**. The node restarts on it and rolls back by itself if the new version misbehaves.
+- **`pico-node-firmware.uf2`** + **`pico-node-blobs.uf2`** - a fresh install. Hold BOOTSEL while plugging in the Pico W, drag one file onto the `RPI-RP2` drive, then repeat with the other. Both are needed (either order); the node won't start properly until both are on. First start opens the `pico-setup` access point (passphrase `packetradio`, then `192.168.4.1`) to set the callsign and WiFi; see [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+
+The same guide heads every release's notes (`.github/release-assets.md`). Why there are two UF2s: [`docs/OTA.md`](docs/OTA.md).
+
 ## Read first
 
 **[`docs/PLAN.md`](docs/PLAN.md)** is the living plan: architecture, the module breakdown, the SDL integration story, the hands-free dev cycle (build → flash via probe-rs → defmt/RTT logs), the host-side test strategy, the package-approval gate, and the "when the hardware arrives" checklist + blockers.
