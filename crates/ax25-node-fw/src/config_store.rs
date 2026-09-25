@@ -62,6 +62,14 @@ const TAG_MQTT_HOST: u8 = 13;
 /// "Switch to setup AP" maintenance action). Sticky: stays set across reboots
 /// until a config save clears it.
 const TAG_FORCE_AP: u8 = 14;
+/// NinoTNC link settings (the `/tnc` web page and the console keys of the same
+/// names). The node re-applies them to the TNC every time it starts.
+const TAG_TNC_MODE: u8 = 15;
+const TAG_TNC_TXDELAY: u8 = 16;
+const TAG_TNC_PERSIST: u8 = 17;
+const TAG_TNC_SLOTTIME: u8 = 18;
+const TAG_TNC_TXTAIL: u8 = 19;
+const TAG_TNC_DUPLEX: u8 = 20;
 
 /// The persisted fields. Every field optional: only explicitly-set values are
 /// stored, everything else falls back to the compiled factory defaults.
@@ -83,6 +91,27 @@ pub struct StoredConfig {
     /// When `Some(true)`, boot into the config AP instead of joining WiFi (the
     /// "Switch to setup AP" maintenance action). Sticky until a config save.
     pub force_ap: Option<bool>,
+    /// NinoTNC settings sent over the serial KISS link at boot. `None` = leave
+    /// the TNC's own value alone.
+    pub tnc: TncSettings,
+}
+
+/// The NinoTNC link settings the node owns. Timing values are stored in KISS
+/// 10 ms units (the wire form); the UI and console speak milliseconds.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct TncSettings {
+    /// Operating mode 0-15 for KISS SETHW (needs the MODE DIPs at 1111).
+    pub mode: Option<u8>,
+    /// TXDELAY, 10 ms units (only honoured with the TNC's TX DELAY pot at zero).
+    pub tx_delay: Option<u8>,
+    /// PERSIST, 0-255.
+    pub persist: Option<u8>,
+    /// SLOTTIME, 10 ms units.
+    pub slot_time: Option<u8>,
+    /// TXTAIL, 10 ms units.
+    pub tx_tail: Option<u8>,
+    /// Full duplex.
+    pub full_duplex: Option<bool>,
 }
 
 impl StoredConfig {
@@ -130,6 +159,19 @@ impl StoredConfig {
         if let Some(v) = self.force_ap {
             put(TAG_FORCE_AP, &[v as u8]);
         }
+        let t = &self.tnc;
+        for (tag, v) in [
+            (TAG_TNC_MODE, t.mode),
+            (TAG_TNC_TXDELAY, t.tx_delay),
+            (TAG_TNC_PERSIST, t.persist),
+            (TAG_TNC_SLOTTIME, t.slot_time),
+            (TAG_TNC_TXTAIL, t.tx_tail),
+            (TAG_TNC_DUPLEX, t.full_duplex.map(u8::from)),
+        ] {
+            if let Some(v) = v {
+                put(tag, &[v]);
+            }
+        }
         at
     }
 
@@ -174,6 +216,12 @@ impl StoredConfig {
                 TAG_ORIGINATE if len == 1 => out.originate = Some(data[0] != 0),
                 TAG_MQTT_HOST => out.mqtt_host = s(data),
                 TAG_FORCE_AP if len == 1 => out.force_ap = Some(data[0] != 0),
+                TAG_TNC_MODE if len == 1 && data[0] <= 15 => out.tnc.mode = Some(data[0]),
+                TAG_TNC_TXDELAY if len == 1 => out.tnc.tx_delay = Some(data[0]),
+                TAG_TNC_PERSIST if len == 1 => out.tnc.persist = Some(data[0]),
+                TAG_TNC_SLOTTIME if len == 1 => out.tnc.slot_time = Some(data[0]),
+                TAG_TNC_TXTAIL if len == 1 => out.tnc.tx_tail = Some(data[0]),
+                TAG_TNC_DUPLEX if len == 1 => out.tnc.full_duplex = Some(data[0] != 0),
                 _ => {} // unknown/short tag: skip (forward compatibility)
             }
         }
@@ -384,6 +432,15 @@ pub fn take_flash_for_ota() -> Option<ConfigFlash> {
     CONFIG.lock(|cell| cell.borrow_mut().take().map(|svc| svc.into_flash()))
 }
 
+/// Run `f` with the flash driver (for other stores sharing the chip, such as
+/// the NinoTNC firmware image in APPDATA). `None` if the store is unavailable
+/// (e.g. taken for an OTA). Runs inside the critical section, so keep each call
+/// to one erase / write / read.
+#[allow(dead_code)] // bin build only: the on-target test includes this file without a caller
+pub fn with_flash<R>(f: impl FnOnce(&mut ConfigFlash) -> R) -> Option<R> {
+    CONFIG.lock(|cell| cell.borrow_mut().as_mut().map(|svc| f(&mut svc.flash)))
+}
+
 /// Snapshot the current pending config (what the console/portal would SAVE) —
 /// used by the web panel to pre-fill the config form. Returns defaults if the
 /// store is unavailable (e.g. taken for an in-flight OTA).
@@ -470,10 +527,120 @@ fn render_show(p: &StoredConfig) -> String {
         None => String::from("  MQTT_HOST      (unset)\n"),
     };
     out += &match p.force_ap {
-        Some(true) => String::from("  FORCE_AP       true (boots into setup AP)"),
-        _ => String::from("  FORCE_AP       false"),
+        Some(true) => String::from("  FORCE_AP       true (boots into setup AP)\n"),
+        _ => String::from("  FORCE_AP       false\n"),
+    };
+    out += &render_tnc(&p.tnc);
+    out
+}
+
+/// The NinoTNC keys for SHOW, in the same units SET takes.
+fn render_tnc(t: &TncSettings) -> String {
+    fn ms(v: Option<u8>) -> String {
+        match v {
+            Some(u) => format!("{} ms", u as u32 * 10),
+            None => String::from("(TNC's own)"),
+        }
+    }
+    let mut out = match t.mode {
+        Some(m) => format!("  TNC_MODE       {m}\n"),
+        None => String::from("  TNC_MODE       (TNC's own)\n"),
+    };
+    out += &format!("  TXDELAY        {}\n", ms(t.tx_delay));
+    out += &match t.persist {
+        Some(v) => format!("  PERSIST        {v}\n"),
+        None => String::from("  PERSIST        (TNC's own)\n"),
+    };
+    out += &format!("  SLOTTIME       {}\n", ms(t.slot_time));
+    out += &format!("  TXTAIL         {}\n", ms(t.tx_tail));
+    out += match t.full_duplex {
+        Some(true) => "  DUPLEX         full",
+        Some(false) => "  DUPLEX         half",
+        None => "  DUPLEX         (TNC's own)",
     };
     out
+}
+
+/// Validate one NinoTNC key into `t`. `value` "none" clears it (the node then
+/// leaves the TNC's own setting alone). Timing keys take milliseconds.
+pub fn set_tnc_field(t: &mut TncSettings, key: &str, value: &str) -> Result<(), String> {
+    use ax25_node_core::kiss::params::ms_to_ten_ms_units;
+    let value = value.trim();
+    let clear = value.eq_ignore_ascii_case("none");
+    let ms = |what: &str| -> Result<Option<u8>, String> {
+        if clear {
+            return Ok(None);
+        }
+        value
+            .parse::<u32>()
+            .ok()
+            .and_then(ms_to_ten_ms_units)
+            .map(Some)
+            .ok_or_else(|| format!("{what} must be 0-2550 ms"))
+    };
+    match key {
+        "TNC_MODE" => {
+            t.mode = if clear {
+                None
+            } else {
+                match value.parse::<u8>() {
+                    Ok(m) if m <= 15 => Some(m),
+                    _ => return Err(String::from("TNC_MODE must be 0-15")),
+                }
+            }
+        }
+        "TXDELAY" => t.tx_delay = ms("TXDELAY")?,
+        "SLOTTIME" => t.slot_time = ms("SLOTTIME")?,
+        "TXTAIL" => t.tx_tail = ms("TXTAIL")?,
+        "PERSIST" => {
+            t.persist = if clear {
+                None
+            } else {
+                Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|_| String::from("PERSIST must be 0-255"))?,
+                )
+            }
+        }
+        "DUPLEX" => {
+            t.full_duplex = match value {
+                _ if clear => None,
+                "full" | "FULL" | "1" => Some(true),
+                "half" | "HALF" | "0" => Some(false),
+                _ => return Err(String::from("DUPLEX must be full or half")),
+            }
+        }
+        other => return Err(format!("unknown key {other}")),
+    }
+    Ok(())
+}
+
+/// Apply NinoTNC keys to the pending config and save it, all or nothing: any
+/// invalid value leaves both the pending copy and flash untouched. Returns the
+/// saved settings. (Like the console SAVE, this persists the whole pending
+/// record, including anything staged but not yet saved.)
+pub fn set_tnc_and_save(fields: &[(&str, &str)]) -> Result<TncSettings, String> {
+    CONFIG.lock(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(svc) = borrow.as_mut() else {
+            return Err(String::from("config store unavailable"));
+        };
+        let mut t = svc.pending.tnc;
+        for (key, value) in fields {
+            set_tnc_field(&mut t, key, value)?;
+        }
+        if t == svc.pending.tnc {
+            return Ok(t); // nothing changed: spare the flash
+        }
+        let before = svc.pending.tnc;
+        svc.pending.tnc = t;
+        if let Err(e) = svc.save() {
+            svc.pending.tnc = before;
+            return Err(format!("save failed: {e}"));
+        }
+        Ok(t)
+    })
 }
 
 fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
@@ -565,6 +732,12 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
             }
             _ => String::from("expected true/false"),
         },
+        "TNC_MODE" | "TXDELAY" | "PERSIST" | "SLOTTIME" | "TXTAIL" | "DUPLEX" => {
+            match set_tnc_field(&mut p.tnc, key, value) {
+                Ok(()) => format!("{key} staged. SAVE to persist."),
+                Err(e) => e,
+            }
+        }
         other => format!("unknown key {other} (SHOW lists keys)"),
     }
 }

@@ -49,6 +49,9 @@ pub const BUILD_TAG: &str = match option_env!("OTA_BUILD_TAG") {
 /// the captive-portal config form in AP and the node panel in STA).
 const OTA_PORT: u16 = 80;
 
+/// How many web server tasks listen on [`OTA_PORT`] at once.
+pub const HTTP_TASKS: usize = 2;
+
 /// DFU partition capacity (must match memory.x DFU LENGTH). Uploads larger than
 /// this are rejected up front.
 // The largest image that can actually BOOT is the ACTIVE partition (512 KiB);
@@ -88,13 +91,17 @@ pub struct WebCtx {
     pub ap_ssid: &'static str,
     /// The AP's WPA2 passphrase, shown in AP mode for reference.
     pub ap_pass: &'static str,
+    /// The node's callsign (the TNC page's test-frame source).
+    pub callsign: &'static str,
 }
 
 /// The node's single web server — config panel + firmware upload — on :80 in
 /// **both** modes (the AP captive-portal form and the STA panel are the same
 /// server, rendered per [`WebCtx::sta`]). The AP-only DHCP + DNS catch-all live
 /// in `crate::provisioning`.
-#[embassy_executor::task]
+/// Two server tasks share port 80, so the TNC page's once-a-second poll never
+/// leaves a button press facing a closed port.
+#[embassy_executor::task(pool_size = HTTP_TASKS)]
 pub async fn http_task(stack: Stack<'static>, ctx: WebCtx) {
     let mut rx_buf = [0u8; 4096];
     let mut tx_buf = [0u8; 1024];
@@ -153,6 +160,76 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebC
         return;
     }
 
+    // The NinoTNC page (crate::tnc): the page, its poll, and its four actions.
+    if headers.starts_with(b"GET /tnc/poll") {
+        let since = parse_query_u32(headers, b"since=").unwrap_or(0);
+        let mut body = [0u8; 3072];
+        let n = crate::tnc::render_poll(&mut body, since);
+        let _ = http_send(socket, "application/json", &body[..n]).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    if headers.starts_with(b"GET /tnc ") || headers.starts_with(b"GET /tnc?") {
+        let _ = write_tnc_page(socket, ctx).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    // The TNC firmware upload streams (a 700 KB file), so it has its own path.
+    if headers.starts_with(b"POST /tnc/firmware") {
+        let name = parse_query_str(headers, b"name=")
+            .and_then(crate::provisioning::url_decode)
+            .unwrap_or_default();
+        let content_len = parse_content_length(headers).unwrap_or(0);
+        let reply = receive_tnc_image(socket, &hdr[header_end..hlen], content_len, &name).await;
+        let _ = http_send(socket, "text/plain; charset=utf-8", reply.as_bytes()).await;
+        let _ = socket.flush().await;
+        return;
+    }
+    if headers.starts_with(b"POST /tnc/") {
+        #[derive(Clone, Copy)]
+        enum Action {
+            Mode,
+            Params,
+            Test,
+            Refresh,
+            Update,
+        }
+        let action = [
+            (&b"POST /tnc/mode "[..], Action::Mode),
+            (b"POST /tnc/params ", Action::Params),
+            (b"POST /tnc/test ", Action::Test),
+            (b"POST /tnc/refresh ", Action::Refresh),
+            (b"POST /tnc/update ", Action::Update),
+        ]
+        .into_iter()
+        .find(|(p, _)| headers.starts_with(p))
+        .map(|(_, a)| a);
+        let content_len = parse_content_length(headers).unwrap_or(0);
+        while hlen < header_end + content_len && hlen < hdr.len() {
+            match socket.read(&mut hdr[hlen..]).await {
+                Ok(0) => break,
+                Ok(n) => hlen += n,
+                Err(_) => break,
+            }
+        }
+        let body = &hdr[header_end..hlen.min(header_end + content_len)];
+        let reply = match action {
+            Some(Action::Mode) => crate::tnc::post_mode(body),
+            Some(Action::Params) => crate::tnc::post_params(body),
+            Some(Action::Test) => crate::tnc::post_test(body),
+            Some(Action::Refresh) => crate::tnc::post_refresh(),
+            Some(Action::Update) => crate::tnc::post_update(),
+            None => Err(alloc::string::String::from("Unknown TNC action.")),
+        };
+        let text = match &reply {
+            Ok(t) => t,
+            Err(e) => e.as_str(),
+        };
+        let _ = http_send(socket, "text/plain; charset=utf-8", text.as_bytes()).await;
+        let _ = socket.flush().await;
+        return;
+    }
+
     // `POST /save` — apply the identity/config form and reboot to take effect.
     if headers.starts_with(b"POST /save") {
         let content_len = parse_content_length(headers).unwrap_or(0);
@@ -170,15 +247,15 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebC
             // to the AP, so a plain notice is correct there.
             if ctx.sta {
                 let page = crate::webui::notice_reconnect(
-                    "Saved — rebooting",
+                    "Saved, rebooting",
                     "Applying the new configuration and restarting; reconnect in ~20s.",
                 );
                 let _ = http_send(socket, "text/html", page.as_bytes()).await;
             } else {
                 let page = crate::webui::notice(
-                    "Saved — rebooting",
+                    "Saved, rebooting",
                     "Applying the new configuration and restarting in AP mode. If you \
-changed the callsign the AP name changes too — reconnect to it in ~15s.",
+changed the callsign the AP name changes too; reconnect to it in about 15 s.",
                 );
                 let _ = http_send(socket, "text/html", page.as_bytes()).await;
             }
@@ -208,7 +285,7 @@ changed the callsign the AP name changes too — reconnect to it in ~15s.",
         }
         if crate::provisioning::apply_join_form(&hdr[..hlen]) {
             let page = crate::webui::notice(
-                "Joining — rebooting",
+                "Joining, rebooting",
                 "Leaving AP mode and joining the Wi-Fi network. This access point \
 will disappear; reconnect your device to your LAN to find the node again (it \
 returns here only if the network can't be joined).",
@@ -279,19 +356,22 @@ stays in AP mode until you join a network from there.",
     // (untouched, unmarked) current image cleanly — config_store is gone, so a
     // reset is the right way back to a working node.
     if ok {
-        let page = crate::webui::notice(
-            "Firmware staged — rebooting",
-            "Rebooting to swap in the new image (on trial). Reconnect in ~30s. If \
-it misbehaves the node rolls back automatically on the following reboot.",
-        );
-        let _ = http_send(socket, "text/html", page.as_bytes()).await;
+        // Plain text: the panel's uploader shows the reply as-is in its log box.
+        let _ = http_send(
+            socket,
+            "text/plain",
+            b"Firmware received. The node is restarting on the new image (on trial); \
+this page will say when it is back. If it misbehaves, it rolls back automatically on the \
+following restart.",
+        )
+        .await;
         let _ = socket.flush().await;
         defmt::info!("ota: image staged + marked; rebooting to swap");
         crate::nlog!("OTA: staged OK, rebooting to swap");
     } else {
         let _ = http_send(socket, "text/plain", b"OTA write failed; rebooting unchanged").await;
         let _ = socket.flush().await;
-        defmt::warn!("ota: write failed; not marked — rebooting current firmware");
+        defmt::warn!("ota: write failed; not marked, rebooting current firmware");
         crate::nlog!("OTA: write FAILED, rebooting unchanged");
     }
     Timer::after_millis(800).await;
@@ -402,6 +482,118 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+/// The raw (still percent-encoded) value of a query parameter (`key` includes
+/// the `=`) from the request line.
+fn parse_query_str<'a>(headers: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let line_end = find(headers, b"\r\n").unwrap_or(headers.len());
+    let line = &headers[..line_end];
+    let q = find(line, b"?")?;
+    let at = q + find(&line[q..], key)? + key.len();
+    let rest = &line[at..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b'&' || b == b' ')
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Receive a NinoTNC firmware file: validate it line by line as it streams in
+/// and store it packed in APPDATA ([`crate::tnc_image`]). Always reads the whole
+/// body, so the browser gets the reply rather than a reset connection. Returns
+/// the text to show.
+async fn receive_tnc_image(
+    socket: &mut TcpSocket<'_>,
+    initial: &[u8],
+    content_len: usize,
+    name: &str,
+) -> alloc::string::String {
+    use alloc::format;
+    use alloc::string::String;
+    use ax25_node_core::kiss::ninotnc::flash::{write_chip, HexStager};
+
+    if crate::tnc::flashing() {
+        return String::from("The TNC firmware is being updated; wait for it to finish.");
+    }
+    if content_len == 0 {
+        return String::from("The upload was empty.");
+    }
+    let mut writer = match crate::tnc_image::Writer::begin() {
+        Ok(w) => w,
+        Err(e) => return String::from(e),
+    };
+    // Whatever was stored is gone from here on, until this upload commits.
+    crate::tnc::with_state(|s| s.staged = Some(None));
+
+    let mut stager = HexStager::new();
+    let mut error: Option<String> = None;
+    let mut got = 0usize;
+    let finished = {
+        let mut sink = |r: &[u8]| writer.write(r);
+        let take = initial.len().min(content_len);
+        if let Err(e) = stager.push(&initial[..take], &mut sink) {
+            error = Some(format!("{e}"));
+        }
+        got += take;
+        let mut chunk = [0u8; 1024];
+        while got < content_len {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => {
+                    return String::from("The upload was cut short; nothing was stored.");
+                }
+                Ok(n) => {
+                    let n = n.min(content_len - got);
+                    got += n;
+                    if error.is_none() {
+                        if let Err(e) = stager.push(&chunk[..n], &mut sink) {
+                            error = Some(format!("{e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(e) = error {
+            return format!("{e} Nothing was stored.");
+        }
+        stager.finish(&mut sink)
+    };
+    let summary = match finished {
+        Ok(summary) => summary,
+        Err(e) => return format!("{e} Nothing was stored."),
+    };
+    match writer.commit(&summary, name) {
+        Ok(image) => {
+            crate::tnc::with_state(|s| s.staged = Some(Some(image)));
+            let mut chip = String::new();
+            let _ = write_chip(image.target, &mut chip);
+            crate::nlog!("TNC firmware stored: {} lines", image.lines);
+            format!(
+                "Stored {}: {} lines, for {}. Press Update the TNC to write it.",
+                image.name(),
+                image.lines,
+                chip
+            )
+        }
+        Err(e) => String::from(e),
+    }
+}
+
+/// Parse a decimal query parameter (`key` includes the `=`) from the request
+/// line, e.g. `since=` in `GET /tnc/poll?since=42 HTTP/1.1`.
+fn parse_query_u32(headers: &[u8], key: &[u8]) -> Option<u32> {
+    let line_end = find(headers, b"\r\n").unwrap_or(headers.len());
+    let line = &headers[..line_end];
+    let q = find(line, b"?")?;
+    let at = q + find(&line[q..], key)? + key.len();
+    let digits = line[at..].iter().take_while(|b| b.is_ascii_digit());
+    let mut n: u32 = 0;
+    let mut seen = false;
+    for &d in digits {
+        n = n.checked_mul(10)?.checked_add((d - b'0') as u32)?;
+        seen = true;
+    }
+    seen.then_some(n)
+}
+
 fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
@@ -442,7 +634,7 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
         let ip = stack
             .config_v4()
             .map(|c| format!("{}", c.address.address()))
-            .unwrap_or_else(|| String::from("—"));
+            .unwrap_or_else(|| String::from("-"));
         let mut idline = String::new();
         if !alias.is_empty() {
             idline += &esc(alias);
@@ -482,11 +674,13 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
 
     // Assemble the body as an ordered list of byte slices (static + dynamic);
     // measured for Content-Length, written in order. Nothing holds the whole page.
-    let mut parts: heapless::Vec<&[u8], 9> = heapless::Vec::new();
+    let mut parts: heapless::Vec<&[u8], 10> = heapless::Vec::new();
     let _ = parts.push(PANEL_HEAD.as_bytes());
     let _ = parts.push(CSS.as_bytes());
     let _ = parts.push(PANEL_STYLE_MID.as_bytes());
     let _ = parts.push(header.as_bytes());
+    // The radio monitor first: it is what an operator watches.
+    let _ = parts.push(crate::webui::RADIO_SECTION.as_bytes());
     let _ = parts.push(form_a.as_bytes());
     if !ctx.sta {
         let _ = parts.push(form_b.as_bytes());
@@ -497,6 +691,40 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
     }
     let _ = parts.push(PANEL_TAIL.as_bytes());
 
+    let body_len: usize = parts.iter().map(|s| s.len()).sum();
+    let mut head = heapless::String::<96>::new();
+    let _ = write!(
+        head,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_len
+    );
+    if !write_all(socket, head.as_bytes()).await {
+        return false;
+    }
+    for part in parts {
+        if !write_all(socket, part).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Send the NinoTNC page: the static top and bottom around the pre-filled
+/// forms (the only heap piece, about 2.5 KiB, dropped as soon as it is sent).
+async fn write_tnc_page(socket: &mut TcpSocket<'_>, ctx: WebCtx) -> bool {
+    use crate::webui::{tnc_forms, CSS, TNC_BOTTOM, TNC_TOP};
+    use core::fmt::Write;
+
+    let forms = tnc_forms(&config_store::current_pending(), ctx.callsign);
+    let parts: [&[u8]; 7] = [
+        PANEL_HEAD.as_bytes(),
+        CSS.as_bytes(),
+        PANEL_STYLE_MID.as_bytes(),
+        TNC_TOP.as_bytes(),
+        forms.as_bytes(),
+        TNC_BOTTOM.as_bytes(),
+        PANEL_TAIL.as_bytes(),
+    ];
     let body_len: usize = parts.iter().map(|s| s.len()).sum();
     let mut head = heapless::String::<96>::new();
     let _ = write!(
@@ -527,15 +755,18 @@ fails to come up.</p>\
 <script>function log(m){document.getElementById('log').textContent=m}\
 async function up(){var f=document.getElementById('f').files[0];\
 if(!f){log('Pick a .bin file first.');return}\
-log('Uploading '+f.size+' bytes… do not power off.');\
-try{var r=await fetch('/firmware',{method:'POST',body:f});\
-log(await r.text())}catch(e){log('Upload sent; if the node accepted it, it is now \
-rebooting. Reconnect in ~30s.')}}</script>";
+log('Uploading '+f.size+' bytes... do not power off.');\
+try{var r=await fetch('/firmware',{method:'POST',body:f});var t=await r.text();log(t);\
+if(!t.startsWith('Firmware received'))return}catch(e){log('Upload sent; if the node \
+accepted it, it is now restarting.')}\
+var m=document.getElementById('log').textContent;\
+setTimeout(function p(){fetch('/version',{cache:'no-store'}).then(r=>r.text())\
+.then(v=>log(m+' Back online, running '+v+'.')).catch(()=>setTimeout(p,2000))},8000)}</script>";
 
 /// The maintenance section (static, STA only): switch to AP mode — a first-class
 /// operating mode (portable/hilltop), not just setup.
 const MAINTENANCE_SECTION: &str = "<section><h2>Maintenance</h2>\
-<p class=hint>Switch to <strong>AP mode</strong> — run as a standalone access point for \
+<p class=hint>Switch to <strong>AP mode</strong> to run as a standalone access point for \
 portable/hilltop use, or to manage the node without infrastructure Wi-Fi. It stays in AP \
 mode until you join a network from there.</p>\
 <form method=post action=/apmode><button type=submit class=ghost>Switch to AP mode</button></form>\

@@ -23,6 +23,13 @@ pub enum ChipVariant {
     Dspic33Ep512,
 }
 
+/// The oldest NinoTNC firmware pico-node works with: 3.44 / 4.44, the release
+/// the mode catalog's firmware-byte table was taken from. Older firmware lacks
+/// SETHW mode selection (added in 41) and reports mode bytes this table does
+/// not know, so rather than enabling features piecemeal by version the node
+/// refuses to use an older TNC at all, beyond updating its firmware.
+pub const MIN_SUPPORTED_MINOR: u16 = 44;
+
 /// A NinoTNC firmware version in Nino's two-component form, e.g. `3.44` or `4.44`.
 /// The major component encodes the chip variant (`3` = dsPIC33EP256GP, `4` =
 /// dsPIC33EP512GP) per the convention adopted from firmware 2.90 onward.
@@ -49,6 +56,12 @@ impl FirmwareVersion {
             4 => ChipVariant::Dspic33Ep512,
             _ => ChipVariant::Unknown,
         }
+    }
+
+    /// Whether pico-node will use a TNC running this firmware (3.44 / 4.44 or
+    /// later; see [`MIN_SUPPORTED_MINOR`]).
+    pub fn is_supported(self) -> bool {
+        self.chip_variant() != ChipVariant::Unknown && self.minor >= MIN_SUPPORTED_MINOR
     }
 
     /// Parse a firmware version string. Accepts `"3.44"`, `"4.44"`, and the legacy
@@ -116,6 +129,17 @@ mod tests {
                 minor: 44
             }
         );
+    }
+
+    #[test]
+    fn only_x_44_and_later_is_supported() {
+        let v = |s| FirmwareVersion::parse(s).unwrap();
+        assert!(!v("3.39").is_supported());
+        assert!(!v("3.43").is_supported());
+        assert!(v("3.44").is_supported());
+        assert!(v("4.44").is_supported());
+        assert!(v("3.45").is_supported());
+        assert!(!v("2.71").is_supported(), "pre-2.90 numbering: unknown chip");
     }
 
     #[test]

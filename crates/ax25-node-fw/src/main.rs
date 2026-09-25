@@ -60,6 +60,10 @@ mod provisioning;
 #[cfg(target_os = "none")]
 mod session;
 #[cfg(target_os = "none")]
+mod tnc;
+#[cfg(target_os = "none")]
+mod tnc_image;
+#[cfg(target_os = "none")]
 mod transports;
 mod webui;
 
@@ -278,15 +282,16 @@ mod firmware {
         // BOTH modes (docs/OTA.md, docs/PROVISIONING.md). Spawned before the
         // config-only gate so an unconfigured node can be set up over its AP, and
         // so firmware can be updated in AP mode (a hilltop node has no USB). ---
-        spawner.spawn(defmt::unwrap!(ota::http_task(
-            stack,
-            ota::WebCtx {
-                sta: sta_ok,
-                hostname: cfg.hostname,
-                ap_ssid,
-                ap_pass: cfg.wifi.ap_passphrase,
-            },
-        )));
+        let web_ctx = ota::WebCtx {
+            sta: sta_ok,
+            hostname: cfg.hostname,
+            ap_ssid,
+            ap_pass: cfg.wifi.ap_passphrase,
+            callsign: alloc::boxed::Box::leak(String::from(call_text).into_boxed_str()),
+        };
+        for _ in 0..ota::HTTP_TASKS {
+            spawner.spawn(defmt::unwrap!(ota::http_task(stack, web_ctx)));
+        }
 
         // CALLSIGN GATE: an unconfigured node stops here — the AP + captive
         // portal are up (so you can set a callsign), but NO on-air transport is
@@ -320,10 +325,10 @@ mod firmware {
             node_name: String::from(cfg.identity.alias),
             callsign: String::from(call_text),
             grid: Some(String::from(cfg.identity.grid)),
-            ports: alloc::vec![alloc::format!(
-                "axudp [up] udp/0.0.0.0:{}",
-                cfg.axudp.listen_port
-            )],
+            ports: alloc::vec![
+                alloc::format!("axudp [up] udp/0.0.0.0:{}", cfg.axudp.listen_port),
+                String::from("rf [NinoTNC on the serial link]"),
+            ],
             // Filled live per-command by the console tasks from `netrom_view`
             // (the routing table lives in the axudp task, not the console tasks).
             routes: alloc::vec![],
@@ -384,9 +389,7 @@ mod firmware {
             p.PIN_20,
             p.PIN_21,
             cfg.kiss_serial.clone(),
-            cfg.netrom.clone(),
             cfg.identity.callsign,
-            cfg.identity.alias,
         )));
 
         // --- Tait CCDI radio control on a SECOND UART: UART0 GP0(TX)/GP1(RX),

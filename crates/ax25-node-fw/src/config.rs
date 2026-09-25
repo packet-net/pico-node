@@ -94,6 +94,9 @@ pub struct KissSerialConfig {
     /// untouched. From the build env `NINOTNC_MODE`; a §policy knob so the node can
     /// force a known modem mode at startup. Values > 15 are rejected by SETHW.
     pub startup_mode: Option<u8>,
+    /// The NinoTNC settings saved on the node (the `/tnc` page / console keys),
+    /// re-applied every boot. A saved `mode` wins over `startup_mode`.
+    pub tnc: crate::config_store::TncSettings,
 }
 
 /// CCDI-controlled Tait radio on a second UART (radio integration).
@@ -164,6 +167,7 @@ pub fn load() -> NodeConfig {
         kiss_serial: KissSerialConfig {
             baud: 57600,
             startup_mode: option_env!("NINOTNC_MODE").and_then(|s| s.parse::<u8>().ok()),
+            tnc: crate::config_store::TncSettings::default(),
         },
         tait: TaitConfig {
             baud: parse_u32(
@@ -235,6 +239,7 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     if let Some(v) = st.force_ap {
         cfg.force_ap = v;
     }
+    cfg.kiss_serial.tnc = st.tnc;
 }
 
 /// Parse an optional build-env decimal, falling back on absence or garbage.

@@ -228,6 +228,45 @@ impl<const N: usize> SessionManager<N> {
         Some((free, true))
     }
 
+    /// Send `data` over the `(local, peer)` link as a byte stream: split into
+    /// I-frames of at most the link's N1 octets, each its own DL-DATA request.
+    ///
+    /// A connected-mode link is a stream, so a long console reply or relayed
+    /// buffer must be framed to N1 here. A single over-N1 DL-DATA request would
+    /// go out as one oversize I-frame, which peers that hold to N1 (LinBPQ,
+    /// PACLEN 256) silently drop, and the link then retries it until N2 and
+    /// fails. Mirrors packet.net's `Ax25NodeConnection.WriteAsync` chunking.
+    /// Splitting is always correct here: this runtime has no v2.2 segmenter, and
+    /// an at-most-N1 plain I-frame is valid on every link. For atomic SDUs (a
+    /// NET/ROM datagram) post [`Event::DlDataRequest`] directly instead.
+    pub fn post_stream(
+        &mut self,
+        local: Callsign,
+        peer: Callsign,
+        pid: u8,
+        data: Vec<u8>,
+        timers: &mut dyn TimerService,
+    ) -> Vec<Vec<u8>> {
+        let n1 = self
+            .session_for_pair(&local, &peer)
+            .map(|s| s.context.n1 as usize)
+            .unwrap_or(256)
+            .max(1);
+        if data.len() <= n1 {
+            return self.post_with_local(local, peer, Event::DlDataRequest(pid, data), timers);
+        }
+        let mut out = Vec::new();
+        for chunk in data.chunks(n1) {
+            out.extend(self.post_with_local(
+                local,
+                peer,
+                Event::DlDataRequest(pid, chunk.to_vec()),
+                timers,
+            ));
+        }
+        out
+    }
+
     /// Route `event` to `peer`'s session (creating a slot on first contact),
     /// driving it against the shared `timers` and the slot's own sink. Returns the
     /// wire frames the session emitted (drained from the slot's sink), or an empty
@@ -783,6 +822,43 @@ mod tests {
         assert!(mgr
             .take_upward(&call("G7XYZ"))
             .contains(&DataLinkSignal::ConnectIndication));
+    }
+
+    #[test]
+    fn a_long_stream_write_goes_out_as_n1_sized_i_frames() {
+        // The bench failure (2026-09-25): a 400+ byte console reply went out as
+        // one I-frame; LinBPQ (PACLEN 256) never accepted it and the link died.
+        let mut mgr: SessionManager<4> = SessionManager::new(call("M9YYY-9"));
+        let mut t = MockTimerService::new();
+        let (local, peer) = (call("M9YYY-9"), call("M0LTE"));
+        mgr.post(peer, sabm(), &mut t);
+        let data: Vec<u8> = (0..600u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let out = mgr.post_stream(local, peer, 0xF0, data.clone(), &mut t);
+        let infos: Vec<Vec<u8>> = out
+            .iter()
+            .filter_map(|w| crate::ax25::Frame::decode(w).ok())
+            .filter(|f| f.is_information())
+            .map(|f| f.info)
+            .collect();
+        assert_eq!(infos.len(), 3);
+        assert!(infos.iter().all(|i| i.len() <= 256), "{:?}", infos.iter().map(|i| i.len()).collect::<Vec<_>>());
+        assert_eq!(infos.concat(), data, "in order, nothing lost");
+    }
+
+    #[test]
+    fn a_short_stream_write_is_one_i_frame() {
+        let mut mgr: SessionManager<4> = SessionManager::new(call("M9YYY-9"));
+        let mut t = MockTimerService::new();
+        let (local, peer) = (call("M9YYY-9"), call("M0LTE"));
+        mgr.post(peer, sabm(), &mut t);
+        let out = mgr.post_stream(local, peer, 0xF0, b"hello\r".to_vec(), &mut t);
+        let infos: Vec<_> = out
+            .iter()
+            .filter_map(|w| crate::ax25::Frame::decode(w).ok())
+            .filter(|f| f.is_information())
+            .collect();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].info, b"hello\r");
     }
 
     #[test]

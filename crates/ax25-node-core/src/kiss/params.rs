@@ -25,6 +25,12 @@ pub fn encode_param_into(dst: &mut [u8], port: u8, command: Command, value: u8) 
     super::encode_into(dst, port, command, &[value])
 }
 
+/// Convert milliseconds to the 10 ms units TXDELAY / SLOTTIME / TXTAIL take,
+/// rounding to the nearest unit. `None` above 2550 ms (the one-byte ceiling).
+pub fn ms_to_ten_ms_units(ms: u32) -> Option<u8> {
+    u8::try_from(ms.saturating_add(5) / 10).ok()
+}
+
 /// KISS TXDELAY (`0x01`), units of 10 ms. Mirrors `SetTxDelayAsync`.
 #[cfg(feature = "alloc")]
 pub fn tx_delay(port: u8, ten_ms_units: u8) -> Option<Vec<u8>> {
@@ -100,5 +106,17 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = encode_param_into(&mut buf, 0, Command::TxDelay, 50).unwrap();
         assert_eq!(&buf[..n], &[FEND, 0x01, 0x32, FEND]);
+    }
+
+    #[test]
+    fn ms_round_to_the_nearest_ten_ms_unit_and_cap_at_one_byte() {
+        assert_eq!(ms_to_ten_ms_units(0), Some(0));
+        assert_eq!(ms_to_ten_ms_units(4), Some(0));
+        assert_eq!(ms_to_ten_ms_units(5), Some(1));
+        assert_eq!(ms_to_ten_ms_units(300), Some(30));
+        assert_eq!(ms_to_ten_ms_units(2550), Some(255));
+        assert_eq!(ms_to_ten_ms_units(2554), Some(255));
+        assert_eq!(ms_to_ten_ms_units(2555), None);
+        assert_eq!(ms_to_ten_ms_units(u32::MAX), None);
     }
 }

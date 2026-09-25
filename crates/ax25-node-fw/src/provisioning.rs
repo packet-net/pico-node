@@ -317,7 +317,7 @@ fn stage_fields(body: &[u8], scratch: &mut [u8; 1024]) -> bool {
 }
 
 /// Decode application/x-www-form-urlencoded (%XX + `+`). Returns an owned String.
-fn url_decode(bytes: &[u8]) -> Option<alloc::string::String> {
+pub(crate) fn url_decode(bytes: &[u8]) -> Option<alloc::string::String> {
     let mut out = alloc::vec::Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {

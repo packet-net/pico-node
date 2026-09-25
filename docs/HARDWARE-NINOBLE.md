@@ -58,3 +58,19 @@ or OLED). Closing HW-BRINGUP Gate 6 (KISS-over-serial to a real NinoTNC) and
 lighting the OLED both wait on wiring Tom's board to a probe-equipped machine.
 The OLED init mirrors the NinoBLE firmware's known-good sequence for this exact
 panel, so first-light risk is low.
+
+## Setting up the NinoTNC from the web page
+
+Browse to the node and follow **NinoTNC setup and monitor** (or go straight to `/tnc`). The page needs the node's callsign set; until then the serial link does not start.
+
+**Firmware 3.44 / 4.44 or later is required.** At start the node asks the TNC for its report (GETALL, repeated every 10 s until it answers) and uses the TNC only once it has reported supported firmware: then it sends the saved settings and opens the radio port. An older TNC gets no settings and no traffic; the page shows a banner and only the firmware update.
+
+The radio port is a full node port: connected-mode sessions (SABM/UA, the node console, `C` onward to any port), XID answered with DM so v2.2 callers fall back to SABM, NET/ROM (NODES heard and originated, L4 circuits, interlinks), all shared with the AXUDP port and one routing table.
+
+- **Operating mode.** Set all four MODE DIP switches on the NinoTNC to 1 (on), pick the mode and press **Set mode**. The node sends KISS SETHW, waits 1.5 s, asks the TNC which mode it is running, and retries up to three times, so the line under the button ends with either "confirmed by the TNC" or a plain reason (for example the DIP switch position it read). The node remembers the mode and sends it at every start without writing the TNC's own memory; tick **Also store it in the TNC's own memory** only if the TNC should keep it when used without the node.
+- **KISS parameters.** TXDELAY, PERSIST, SLOTTIME, TXTAIL and duplex. TXDELAY is only used when the TNC's TX DELAY knob is fully anticlockwise (zero); otherwise the knob sets it. Values are saved on the node and sent at every start. The console keys `TNC_MODE`, `TXDELAY`, `PERSIST`, `SLOTTIME`, `TXTAIL` and `DUPLEX` set the same things (`SET TXDELAY none` goes back to the TNC's own value).
+- **Test transmission.** Sends one UI frame from the node's callsign. It appears as a TX line in the monitor, and the TNC's PTT light should flash.
+- **Monitor.** Also shown on the node's front page (the Radio section). Frames heard (RX), frames sent (TX) and TNC events such as mode changes and status reports, updated every second. **Ask the TNC for its status** requests a fresh report and shows the answer under the button (firmware version, DIP position, running mode), or says there was none.
+- **TNC firmware.** Updates the NinoTNC over the J5 serial link, so the USB chip is not needed. Download `N9600A-v3-44.hex` (firmware 3.x) or `N9600A-v4-44.hex` (4.x) from [flashtnc](https://github.com/ninocarrillo/flashtnc), choose it and press **Upload to the node**. The node checks every line (record checksums, the end-of-file record, and the chip fingerprint that tells a 3.x file from a 4.x one) while storing it in its APPDATA flash region (about 374 KB). Then **Update the TNC** runs the flashtnc procedure from the node: quiet the line, enter the TNC's bootloader, check the bootloader is for the same chip as the file, and send the file a line at a time. It takes a few minutes with the TNC off the air. A wrong-chip file is refused before anything is written. If an update is interrupted part way, the TNC waits in its bootloader (LEDs dark); pressing **Update the TNC** again finishes it. Afterwards the node asks the updated TNC for its report and then sends its saved mode and KISS parameters.
+
+  The upload is unauthenticated, like the node firmware upload: anyone on the node's network can use it.

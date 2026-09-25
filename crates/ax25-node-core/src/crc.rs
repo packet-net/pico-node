@@ -17,23 +17,61 @@ const REFLECTED_POLYNOMIAL: u16 = 0x8408;
 
 /// Compute the AX.25 FCS over `data` (CRC-16/X.25).
 pub fn compute(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
-    for &byte in data {
-        crc ^= byte as u16;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ REFLECTED_POLYNOMIAL;
-            } else {
-                crc >>= 1;
+    let mut crc = Crc16::new();
+    crc.update(data);
+    crc.finish()
+}
+
+/// The same CRC fed in pieces, for data too large to hold at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crc16(u16);
+
+impl Default for Crc16 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc16 {
+    /// A fresh CRC.
+    pub const fn new() -> Self {
+        Self(0xFFFF)
+    }
+
+    /// Feed more bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        let mut crc = self.0;
+        for &byte in data {
+            crc ^= byte as u16;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ REFLECTED_POLYNOMIAL;
+                } else {
+                    crc >>= 1;
+                }
             }
         }
+        self.0 = crc;
     }
-    crc ^ 0xFFFF
+
+    /// The CRC of everything fed so far.
+    pub fn finish(self) -> u16 {
+        self.0 ^ 0xFFFF
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fed_in_pieces_matches_one_shot() {
+        let mut c = Crc16::new();
+        c.update(b"1234");
+        c.update(b"");
+        c.update(b"56789");
+        assert_eq!(c.finish(), 0x906E);
+    }
 
     #[test]
     fn check_vector_123456789() {
