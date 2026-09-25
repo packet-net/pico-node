@@ -17,5 +17,3 @@ Either order works; the node does not start properly until both are on, so a Pic
 On first start the node has no callsign and stays off the air. It opens a WiFi access point called `pico-setup` (passphrase `packetradio`); join it and browse to `192.168.4.1` to set the callsign and WiFi. See `docs/PROVISIONING.md`.
 
 After a fresh install, later upgrades only ever need `pico-node-app.bin`.
-
-## Changes
