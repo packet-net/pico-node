@@ -154,6 +154,22 @@ Two caveats that keep a "skipped" 🔒 item honest:
 
 **Where this landed:** the capability manifest + documented exceptions are live as of the 2026-07-12 wave, and pico-node already shares AX.25 (mod-8 + mod-128), KISS, AXUDP, NET/ROM (quality/NODES/L4), SREJ, and XID vector sets. The manifest grows with each pick in tables A/B/C/D/E; you never have to implement a 🔒 item just to keep CI green.
 
+## F. Radio-first node: next features (2026-09-25)
+
+Proposed after the NinoTNC setup work (v0.8.0) and the radio-first restructure, in priority order. The hilltop plan ([`HILLTOP-NODE-PLAN.md`](HILLTOP-NODE-PLAN.md)) separately covers the watchdog, one-time-pad sysop authority over RF, per-port ID beacons and the second radio port, so they are not repeated here.
+
+| # | Feature | Why | Status |
+|---|---|---|---|
+| 1 | **Onward connects through NET/ROM** | `C <call or alias>` for a destination known only by NET/ROM route should open an L4 circuit through the best neighbour. Today `C` only ever makes a direct AX.25 connect, and a user who arrived by NET/ROM circuit is told onward connects aren't wired. The core connector can already originate circuits; the node never uses it. The heart of being a node in a network. | In progress |
+| 2 | **Re-assert TNC settings regularly** | The node applies the KISS parameters and mode once at start (and after a mode change). If the NinoTNC browns out and reboots it runs on its own stored mode and defaults, unnoticed. Re-sending the parameters and the mode on a regular cadence heals that without having to detect the reboot. The mode must always be re-asserted RAM-only (SETHW with the +16 offset), never written to the TNC's EEPROM, which a periodic write would wear. | Proposed |
+| 3 | **Lock down the WiFi admin side** | The web panel and telnet are unauthenticated and the access point uses a well-known default passphrase, so anyone within WiFi range of a remote node can reconfigure it or upload firmware. Per-node AP passphrase and an admin login. | Proposed |
+| 4 | **Node firmware update over RF** | With no WiFi on a remote site, every update is a site visit. Design sketch: [`OTA-RADIO.md`](OTA-RADIO.md); gated by the one-time-pad sysop authority. | Proposed |
+| 5 | **Health over the air** | A `STATUS` command: uptime, reset cause, supply voltage and temperature (RP2040 ADC), TNC counters, per-neighbour retries and round-trip time, free heap. Without WiFi it is the only view of a remote node. | Proposed |
+| 6 | **ACKMODE-based link timing** | NinoTNC 3.44 fixed ACKMODE and the core already has the correlator. Knowing when a frame actually left the radio lets T1 be timed properly on slow or busy channels: fewer needless polls and retransmissions. | Proposed |
+| 7 | **Familiar console commands** | `MH`, `L`inks, `U`sers, and a sysop-set connect text (BPQ CTEXT). What users and sysops expect of a node. | Proposed |
+| 8 | **Tait radio health** | SWR and RSSI monitoring over the existing CCDI link, and transmit inhibit on high SWR, so a failed antenna on a remote site is noticed and does not damage the radio. | Proposed |
+| 9 | **Small mailbox** | Store-and-forward messages for users and the sysop in the reserved APPDATA flash, for sites with no BBS in reach. | Proposed |
+
 ---
 
 *Living document. The **decision** columns are the calls made; a ✅ marks what shipped (pico-node PRs #53–#68; cross-repo mirror #605/#73, merged). Last updated 2026-07-12 against the fresh recon, the merged waves, and packet.net's parity discipline.*
