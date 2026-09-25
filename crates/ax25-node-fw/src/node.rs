@@ -50,8 +50,8 @@ use ax25_node_core::netrom::wire::inp3_options::NetRomInp3Options;
 use ax25_node_core::netrom::wire::inp3_rif::Inp3Rif;
 use ax25_node_core::netrom::wire::{Alias, NetRomPacket};
 use ax25_node_core::netrom::{
-    CircuitEvent, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomOriginator,
-    NetRomOriginatorOptions,
+    CircuitEvent, CircuitKey, NetRomCircuitCloseReason, NetRomConnection, NetRomConnector,
+    NetRomConnectorOptions, NetRomOriginator, NetRomOriginatorOptions,
 };
 use ax25_node_core::netrom::ObserveOutcome;
 use ax25_node_core::sdl::{
@@ -110,7 +110,8 @@ enum Role {
     None,
     /// An inbound user at the node console prompt.
     Console(LineAssembler),
-    /// Piped to another AX.25 session (the other end's callsign). `initiator`
+    /// Cross-connected to the `other` leg (another AX.25 session, or a NET/ROM
+    /// circuit when the target was reached through the network). `initiator`
     /// marks the console-user side of the pair (the peer who typed `C`); the
     /// target side carries `initiator: false`. The distinction matters at
     /// teardown: a surviving initiator gets a notice + its console back, a
@@ -118,7 +119,7 @@ enum Role {
     /// this wrong console-attaches to the REMOTE NODE, and two node consoles
     /// answering each other's prompts is a perfect I-frame echo loop (observed
     /// live: "Invalid command" ↔ "Unknown command" at 2.5 Hz until BPQ DISCed).
-    Bridge { other: Callsign, initiator: bool },
+    Bridge { other: Leg, initiator: bool },
     /// Piped to the telnet console relay statics.
     TelnetRelay,
     /// A persistent L2 link to a NET/ROM neighbour — kept up (proactively
@@ -144,24 +145,64 @@ struct PeerState {
     role: Role,
 }
 
-/// Cross-peer work discovered while servicing one peer's signals — applied by
-/// [`drive`] after that peer's borrow is released.
-enum FollowUp {
-    /// A console user asked to connect onward: bridge `console_peer ↔ target`.
-    StartBridge {
-        console_peer: Callsign,
-        target: Callsign,
+/// One side of a cross-connect: an AX.25 session (by the peer's callsign) or a
+/// NET/ROM L4 circuit (by its key). A user's leg and the far side can each be
+/// either, so a user on the air, a user arriving by NET/ROM circuit, and the
+/// telnet relay can all connect onward directly or through the network.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    Peer(Callsign),
+    Circuit(CircuitKey),
+}
+
+/// How many NET/ROM circuits the node keeps attached at once (inbound console
+/// users, onward connects, telnet relays). The connector itself allows 16.
+const MAX_CIRCUITS: usize = 8;
+
+/// What a NET/ROM L4 circuit is attached to.
+enum CircuitMode {
+    /// An inbound circuit at the node console prompt.
+    Console(LineAssembler),
+    /// One side of a cross-connect (see [`Role::Bridge`]); `up` once the
+    /// circuit has connected, so a failure before that reads as "no answer".
+    Bridge {
+        other: Leg,
+        initiator: bool,
+        up: bool,
     },
-    /// Relay I-frame data to the bridged other end.
-    Forward { to: Callsign, data: Vec<u8> },
-    /// A bridged link ended. The surviving side is handled by its own bridge
-    /// direction: a console user gets a notice + prompt, a target gets DISC'd.
-    BridgeEnded { survivor: Callsign },
+    /// The telnet user's onward connect, reached through the network.
+    TelnetRelay { up: bool },
+}
+
+/// A NET/ROM circuit the node has attached to something.
+struct CircuitSlot {
+    conn: NetRomConnection,
+    mode: CircuitMode,
+}
+
+/// Cross-leg work discovered while servicing one session or circuit, applied by
+/// [`drive_all`] once that borrow is released.
+enum FollowUp {
+    /// A console user (on either kind of leg) asked to connect onward.
+    StartBridge { console: Leg, target: Callsign },
+    /// Relay data to the other end of a cross-connect.
+    Forward { to: Leg, data: Vec<u8> },
+    /// One side of a cross-connect ended, with a note for a surviving user. A
+    /// console user gets the note and its prompt back; a target is torn down.
+    BridgeEnded { survivor: Leg, note: &'static str },
     /// An inbound PID-0xCF interlink datagram for the NET/ROM connector.
     NetRom {
         neighbour: Callsign,
         datagram: Vec<u8>,
     },
+    /// The telnet console asked to connect to `target`.
+    StartRelay { target: Callsign },
+    /// Telnet-user bytes for the relay's far end.
+    RelayData(Vec<u8>),
+    /// The telnet user went away: end the relay's far end.
+    RelayHangup,
+    /// A circuit needs an interlink to `neighbour` that is not up: dial it.
+    DialInterlink { neighbour: Callsign },
 }
 
 #[embassy_executor::task]
@@ -210,7 +251,7 @@ pub async fn task(
             ..Default::default()
         },
     );
-    let mut circuits: [Option<CircuitConsole>; 4] = [const { None }; 4];
+    let mut circuits: [Option<CircuitSlot>; MAX_CIRCUITS] = [const { None }; MAX_CIRCUITS];
 
     // INP3 time-routing overlay (the embedded host wiring — the analogue of the C#
     // `NetRomService.Inp3Host` + the ax25-ts connector `inp3` glue). Constructed once
@@ -282,7 +323,11 @@ pub async fn task(
         let telnet_relay_active = peers
             .iter()
             .flatten()
-            .any(|p| matches!(p.role, Role::TelnetRelay));
+            .any(|p| matches!(p.role, Role::TelnetRelay))
+            || circuits
+                .iter()
+                .flatten()
+                .any(|c| matches!(c.mode, CircuitMode::TelnetRelay { .. }));
         // Peer bytes waiting for a slow telnet user are fed on as it drains,
         // including after the link has ended (so the tail still arrives).
         let relay_fut = async {
@@ -365,40 +410,23 @@ pub async fn task(
 
                 // L4 circuit timers (ack/retransmit/idle) ride the housekeeping tick.
                 connector.tick(netrom.table(), now_ms());
-                {
-                    let mut queue: VecDeque<(usize, Event)> = VecDeque::new();
-                    service_l4(
-                        &mut L4 {
-                            connector: &mut connector,
-                            netrom: &mut netrom,
-                            circuits: &mut circuits,
-                            inp3: inp3.as_mut(),
-                        },
-                        &peers,
-                        &mut queue,
-                        &console_id,
-                        &prompt,
-                    );
-                    while let Some((i, ev)) = queue.pop_front() {
-                        drive(
-                            &mut sessions,
-                            &mut peers,
-                            &heard,
-                            my_call,
-                            &mut L4 {
-                                connector: &mut connector,
-                                netrom: &mut netrom,
-                                circuits: &mut circuits,
-                                inp3: inp3.as_mut(),
-                            },
-                            i,
-                            ev,
-                            &console_id,
-                            &prompt,
-                        )
-                        .await;
-                    }
-                }
+                drive_all(
+                    &mut sessions,
+                    &mut peers,
+                    &heard,
+                    my_call,
+                    &mut L4 {
+                        connector: &mut connector,
+                        netrom: &mut netrom,
+                        circuits: &mut circuits,
+                        inp3: inp3.as_mut(),
+                    },
+                    None,
+                    Vec::new(),
+                    &console_id,
+                    &prompt,
+                )
+                .await;
 
                 // INP3 time-routing overlay tick (the embedded host wiring). Rides the
                 // housekeeping tick: the single driver, the core owns no ambient timer (as the
@@ -548,79 +576,30 @@ pub async fn task(
                 }
             }
             Either4::Fourth(ev) => match ev {
-                RelayEvent::Connect(target) => {
-                    match start_outbound(
+                RelayEvent::Flushed => {}
+                ev => {
+                    let work = match ev {
+                        RelayEvent::Connect(target) => FollowUp::StartRelay { target },
+                        RelayEvent::UserData(buf, n) => FollowUp::RelayData(buf[..n].to_vec()),
+                        _ => FollowUp::RelayHangup,
+                    };
+                    drive_all(
+                        &mut sessions,
                         &mut peers,
                         &heard,
-                        target,
                         my_call,
-                        Role::TelnetRelay,
-                    ) {
-                        Ok(i) => {
-                            drive(
-                                &mut sessions,
-                                &mut peers,
-                                &heard,
-                                my_call,
-                                &mut L4 {
-                                    connector: &mut connector,
-                                    netrom: &mut netrom,
-                                    circuits: &mut circuits,
-                                    inp3: inp3.as_mut(),
-                                },
-                                i,
-                                Event::DlConnectRequest,
-                                &console_id,
-                                &prompt,
-                            )
-                            .await;
-                        }
-                        Err(reason) => relay::STATUS.signal(RelayStatus::Failed(reason)),
-                    }
-                }
-                RelayEvent::UserData(buf, n) => {
-                    if let Some(i) = find_role(&peers, |r| matches!(r, Role::TelnetRelay)) {
-                        drive(
-                            &mut sessions,
-                            &mut peers,
-                            &heard,
-                            my_call,
-                            &mut L4 {
-                                connector: &mut connector,
-                                netrom: &mut netrom,
-                                circuits: &mut circuits,
-                                inp3: inp3.as_mut(),
-                            },
-                            i,
-                            Event::DlDataRequest(PID_NO_LAYER3, buf[..n].to_vec()),
-                            &console_id,
-                            &prompt,
-                        )
-                        .await;
-                    }
-                }
-                RelayEvent::Flushed => {}
-                RelayEvent::Hangup => {
-                    if let Some(i) = find_role(&peers, |r| matches!(r, Role::TelnetRelay)) {
-                        peers[i].as_mut().expect("present").role = Role::None;
-                        drive(
-                            &mut sessions,
-                            &mut peers,
-                            &heard,
-                            my_call,
-                            &mut L4 {
-                                connector: &mut connector,
-                                netrom: &mut netrom,
-                                circuits: &mut circuits,
-                                inp3: inp3.as_mut(),
-                            },
-                            i,
-                            Event::DlDisconnectRequest,
-                            &console_id,
-                            &prompt,
-                        )
-                        .await;
-                    }
+                        &mut L4 {
+                            connector: &mut connector,
+                            netrom: &mut netrom,
+                            circuits: &mut circuits,
+                            inp3: inp3.as_mut(),
+                        },
+                        None,
+                        alloc::vec![work],
+                        &console_id,
+                        &prompt,
+                    )
+                    .await;
                 }
             },
         }
@@ -755,12 +734,6 @@ pub async fn task(
     }
 }
 
-/// A node-console session attached to an inbound NET/ROM L4 circuit.
-struct CircuitConsole {
-    conn: NetRomConnection,
-    asm: LineAssembler,
-}
-
 /// What the telnet-relay select-arm produced.
 enum RelayEvent {
     /// The telnet console asked to connect to this callsign.
@@ -773,8 +746,7 @@ enum RelayEvent {
     Flushed,
 }
 
-/// Drive one event into `peers[start]`'s session, then apply every cross-peer
-/// [`FollowUp`] it (transitively) produces. Bounded by `guard`.
+/// Drive one event into `peers[start]`'s session, then everything it leads to.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     sessions: &mut session::Sessions,
@@ -787,16 +759,59 @@ async fn drive(
     console_id: &Identity,
     prompt: &str,
 ) {
+    drive_all(
+        sessions,
+        peers,
+        heard,
+        my_call,
+        l4,
+        Some((start, event)),
+        Vec::new(),
+        console_id,
+        prompt,
+    )
+    .await;
+}
+
+/// The node's work loop: post session events (starting with `start`, if any),
+/// apply the cross-leg [`FollowUp`]s they and `initial` produce, and service
+/// the NET/ROM circuits, until nothing is left. Bounded by `guard`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_all(
+    sessions: &mut session::Sessions,
+    peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
+    heard: &[Option<(Callsign, Port)>; 8],
+    my_call: Callsign,
+    l4: &mut L4<'_>,
+    start: Option<(usize, Event)>,
+    initial: Vec<FollowUp>,
+    console_id: &Identity,
+    prompt: &str,
+) {
     let mut queue: VecDeque<(usize, Event)> = VecDeque::new();
-    queue.push_back((start, event));
+    queue.extend(start);
+    let mut pending: VecDeque<FollowUp> = initial.into_iter().collect();
     let mut guard = 0u32;
 
-    while let Some((i, ev)) = queue.pop_front() {
+    loop {
         guard += 1;
-        if guard > 32 {
+        if guard > 64 {
             defmt::warn!("node: drive guard tripped, dropping remaining work");
             break;
         }
+        while let Some(f) = pending.pop_front() {
+            apply_followup(f, peers, heard, my_call, l4, &mut queue, prompt);
+        }
+        // L4 housekeeping every round: attach consoles to fresh circuits,
+        // service circuit events, and ship the connector's outbound interlink
+        // datagrams over the right L2 sessions.
+        service_l4(l4, peers, &mut queue, &mut pending, console_id, prompt);
+        if !pending.is_empty() {
+            continue;
+        }
+        let Some((i, ev)) = queue.pop_front() else {
+            break;
+        };
         let Some(ps) = peers[i].as_mut() else {
             continue;
         };
@@ -813,116 +828,267 @@ async fn drive(
             cortex_m::peripheral::SCB::sys_reset();
         }
         reap(sessions, peers, i);
+        pending.extend(followups);
+    }
+}
 
-        for f in followups {
-            match f {
-                FollowUp::StartBridge {
-                    console_peer,
-                    target,
-                } => match start_outbound(
-                    peers,
-                    heard,
-                    target,
-                    // The node's own call — the convention real nodes use for
-                    // outgoing links. NOT a per-user callsign: LinBPQ's AXIP
-                    // misbehaves whenever a second callsign appears from one
-                    // IP (a second MAP to the same address poisons its TX/RX
-                    // resolution — CTEXT vanishes, streams never attach), and
-                    // user-SSID variants trip its node-link heuristics. With
-                    // the node call, each BPQ keeps exactly one map per peer
-                    // IP and everything attaches cleanly. (Same-node loops —
-                    // bridging back to the node the user came from — remain
-                    // peer-limited: BPQ can't hold two L2 links under one
-                    // callsign pair; a real network hops to a *different*
-                    // node, which is the supported shape.)
-                    my_call,
-                    Role::Bridge {
-                        other: console_peer,
-                        initiator: false,
-                    },
-                ) {
-                    Ok(ti) => {
-                        if let Some(cp) = find_peer_mut(peers, &console_peer) {
-                            cp.role = Role::Bridge {
-                                other: target,
-                                initiator: true,
-                            };
-                        }
-                        queue.push_back((ti, Event::DlConnectRequest));
-                    }
-                    Err(reason) => {
-                        if let Some(ci) = find_peer(peers, &console_peer) {
-                            let mut msg = Vec::from(b"Failure: ".as_slice());
-                            msg.extend_from_slice(reason.as_bytes());
+/// Send `bytes` to a leg: into an AX.25 session as stream data, or down a
+/// NET/ROM circuit.
+fn tell(
+    leg: Leg,
+    bytes: Vec<u8>,
+    peers: &[Option<PeerState>],
+    l4: &mut L4<'_>,
+    queue: &mut VecDeque<(usize, Event)>,
+) {
+    match leg {
+        Leg::Peer(call) => {
+            if let Some(i) = find_peer(peers, &call) {
+                queue.push_back((i, Event::DlDataRequest(PID_NO_LAYER3, bytes)));
+            }
+        }
+        Leg::Circuit(key) => {
+            if let Some(conn) = l4.circuits.iter().flatten().find(|c| c.conn.key == key).map(|c| c.conn) {
+                l4.connector.write(l4.netrom.table(), &conn, &bytes, now_ms());
+            }
+        }
+    }
+}
+
+/// Point a user leg at its far side once an onward connect has started.
+fn attach_initiator(leg: Leg, far: Leg, peers: &mut [Option<PeerState>], l4: &mut L4<'_>) {
+    match leg {
+        Leg::Peer(call) => {
+            if let Some(ps) = find_peer_mut(peers, &call) {
+                ps.role = Role::Bridge {
+                    other: far,
+                    initiator: true,
+                };
+            }
+        }
+        Leg::Circuit(key) => {
+            if let Some(slot) = l4.circuits.iter_mut().flatten().find(|c| c.conn.key == key) {
+                slot.mode = CircuitMode::Bridge {
+                    other: far,
+                    initiator: true,
+                    up: true,
+                };
+            }
+        }
+    }
+}
+
+/// Try to reach `target` through the network: a NET/ROM L4 circuit to it via the
+/// best neighbour, attached as `mode`. `None` when the routing table has no
+/// route (or no circuit slot is free): the caller falls back to a direct AX.25
+/// connect, as packet.net's `NetRomOutboundConnector` does.
+fn open_circuit(l4: &mut L4<'_>, target: Callsign, user: Callsign, mode: CircuitMode) -> Option<CircuitKey> {
+    let free = l4.circuits.iter().position(|c| c.is_none())?;
+    let mut text = [0u8; 16];
+    let target_text = call_str(&target, &mut text);
+    let conn = l4
+        .connector
+        .connect(l4.netrom.table(), target_text, user, now_ms())
+        .ok()?;
+    let mut name = [0u8; 16];
+    defmt::info!(
+        "node: onward connect to {=str} through NET/ROM",
+        call_str(&target, &mut name)
+    );
+    l4.circuits[free] = Some(CircuitSlot { conn, mode });
+    Some(conn.key)
+}
+
+/// Apply one cross-leg [`FollowUp`].
+fn apply_followup(
+    f: FollowUp,
+    peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
+    heard: &[Option<(Callsign, Port)>; 8],
+    my_call: Callsign,
+    l4: &mut L4<'_>,
+    queue: &mut VecDeque<(usize, Event)>,
+    prompt: &str,
+) {
+    match f {
+        FollowUp::StartBridge { console, target } => {
+            // The originating user a circuit carries: the console user's call,
+            // or for a user who arrived by circuit, the user that circuit was
+            // opened for (not the node it came through), so the far end sees
+            // who is really connecting.
+            let user = match console {
+                Leg::Peer(call) => call,
+                Leg::Circuit(key) => l4
+                    .circuits
+                    .iter()
+                    .flatten()
+                    .find(|c| c.conn.key == key)
+                    .map(|c| c.conn.user)
+                    .unwrap_or(my_call),
+            };
+            let routed = open_circuit(
+                l4,
+                target,
+                user,
+                CircuitMode::Bridge {
+                    other: console,
+                    initiator: false,
+                    up: false,
+                },
+            );
+            if let Some(key) = routed {
+                attach_initiator(console, Leg::Circuit(key), peers, l4);
+                return;
+            }
+            // No NET/ROM route: a direct AX.25 connect, on the port the target
+            // was heard on (else the first usable port).
+            match start_outbound(
+                peers,
+                heard,
+                target,
+                // The node's own call, the convention real nodes use for
+                // outgoing links (a per-user call trips BPQ's node-link
+                // heuristics).
+                my_call,
+                Role::Bridge {
+                    other: console,
+                    initiator: false,
+                },
+            ) {
+                Ok(ti) => {
+                    attach_initiator(console, Leg::Peer(target), peers, l4);
+                    queue.push_back((ti, Event::DlConnectRequest));
+                }
+                Err(reason) => {
+                    let mut msg = Vec::from(b"Failure: ".as_slice());
+                    msg.extend_from_slice(reason.as_bytes());
+                    msg.extend_from_slice(b"\r");
+                    msg.extend_from_slice(prompt.as_bytes());
+                    tell(console, msg, peers, l4, queue);
+                }
+            }
+        }
+        FollowUp::Forward { to, data } => tell(to, data, peers, l4, queue),
+        FollowUp::NetRom {
+            neighbour,
+            datagram,
+        } => {
+            // INP3 peel BEFORE the connector (mirrors the C# `DispatchInp3` /
+            // the ax25-ts `dispatchInp3` precedence): a RIF (0xFF-led) or an
+            // L3RTT is consumed here so it can never reach L4 circuits /
+            // forwarding. `true` means consumed; fall through to the connector
+            // only on `false`. Disjoint-field borrows of `*l4` (inp3 + netrom).
+            let consumed = match l4.inp3.as_deref_mut() {
+                Some(host) => host.dispatch_inbound(neighbour, &datagram, l4.netrom, my_call, now_ms()),
+                None => false,
+            };
+            if !consumed {
+                l4.connector
+                    .on_interlink_data(l4.netrom.table(), neighbour, &datagram, now_ms());
+            }
+        }
+        FollowUp::BridgeEnded { survivor, note } => match survivor {
+            Leg::Peer(call) => {
+                if let Some(si) = find_peer(peers, &call) {
+                    let sp = peers[si].as_mut().expect("present");
+                    match sp.role {
+                        Role::Bridge {
+                            initiator: true, ..
+                        } => {
+                            // The console user survives: the note + its prompt back.
+                            sp.role = Role::Console(LineAssembler::default());
+                            let mut msg = Vec::from(note.as_bytes());
                             msg.extend_from_slice(b"\r");
                             msg.extend_from_slice(prompt.as_bytes());
-                            queue.push_back((ci, Event::DlDataRequest(PID_NO_LAYER3, msg)));
+                            queue.push_back((si, Event::DlDataRequest(PID_NO_LAYER3, msg)));
                         }
-                    }
-                },
-                FollowUp::Forward { to, data } => {
-                    if let Some(ti) = find_peer(peers, &to) {
-                        queue.push_back((ti, Event::DlDataRequest(PID_NO_LAYER3, data)));
-                    }
-                }
-                FollowUp::NetRom {
-                    neighbour,
-                    datagram,
-                } => {
-                    // INP3 peel BEFORE the connector (mirrors the C# `DispatchInp3` /
-                    // the ax25-ts `dispatchInp3` precedence): a RIF (0xFF-led) or an
-                    // L3RTT is consumed here so it can never reach L4 circuits /
-                    // forwarding. `true` ⇒ consumed; fall through to the connector
-                    // only on `false`. Disjoint-field borrows of `*l4` (inp3 + netrom).
-                    let consumed = match l4.inp3.as_deref_mut() {
-                        Some(host) => host.dispatch_inbound(
-                            neighbour,
-                            &datagram,
-                            l4.netrom,
-                            my_call,
-                            now_ms(),
-                        ),
-                        None => false,
-                    };
-                    if !consumed {
-                        l4.connector.on_interlink_data(
-                            l4.netrom.table(),
-                            neighbour,
-                            &datagram,
-                            now_ms(),
-                        );
-                    }
-                }
-                FollowUp::BridgeEnded { survivor } => {
-                    if let Some(si) = find_peer(peers, &survivor) {
-                        let sp = peers[si].as_mut().expect("present");
-                        match sp.role {
-                            Role::Bridge {
-                                initiator: true, ..
-                            } => {
-                                // The console user survives: notice + prompt back.
-                                sp.role = Role::Console(LineAssembler::default());
-                                let mut msg = Vec::from(b"*** Disconnected\r".as_slice());
-                                msg.extend_from_slice(prompt.as_bytes());
-                                queue.push_back((si, Event::DlDataRequest(PID_NO_LAYER3, msg)));
-                            }
-                            _ => {
-                                // The target survives but its user is gone (or
-                                // the survivor is in an unexpected role): tear
-                                // the link down — NEVER console-attach to it.
-                                sp.role = Role::None;
-                                queue.push_back((si, Event::DlDisconnectRequest));
-                            }
+                        _ => {
+                            // The target survives but its user is gone (or the
+                            // survivor is in an unexpected role): tear the link
+                            // down, NEVER console-attach to it (two node consoles
+                            // answering each other is an I-frame echo loop).
+                            sp.role = Role::None;
+                            queue.push_back((si, Event::DlDisconnectRequest));
                         }
                     }
                 }
             }
+            Leg::Circuit(key) => {
+                let Some(slot) = l4.circuits.iter_mut().flatten().find(|c| c.conn.key == key) else {
+                    return;
+                };
+                let conn = slot.conn;
+                if matches!(slot.mode, CircuitMode::Bridge { initiator: true, .. }) {
+                    // A user who arrived by circuit gets the note + its prompt back.
+                    slot.mode = CircuitMode::Console(LineAssembler::default());
+                    let mut msg = Vec::from(note.as_bytes());
+                    msg.extend_from_slice(b"\r");
+                    msg.extend_from_slice(prompt.as_bytes());
+                    l4.connector.write(l4.netrom.table(), &conn, &msg, now_ms());
+                } else {
+                    // A circuit that was the far side: its user is gone.
+                    l4.connector.disconnect(l4.netrom.table(), &conn, now_ms());
+                }
+            }
+        },
+        FollowUp::StartRelay { target } => {
+            if open_circuit(l4, target, my_call, CircuitMode::TelnetRelay { up: false }).is_some() {
+                return; // Connected / Failed is signalled from the circuit's events
+            }
+            match start_outbound(peers, heard, target, my_call, Role::TelnetRelay) {
+                Ok(i) => queue.push_back((i, Event::DlConnectRequest)),
+                Err(reason) => relay::STATUS.signal(RelayStatus::Failed(reason)),
+            }
         }
+        FollowUp::RelayData(data) => {
+            let circuit = l4
+                .circuits
+                .iter()
+                .flatten()
+                .find(|c| matches!(c.mode, CircuitMode::TelnetRelay { .. }))
+                .map(|c| c.conn);
+            if let Some(conn) = circuit {
+                l4.connector.write(l4.netrom.table(), &conn, &data, now_ms());
+            } else if let Some(i) = find_role(peers, |r| matches!(r, Role::TelnetRelay)) {
+                queue.push_back((i, Event::DlDataRequest(PID_NO_LAYER3, data)));
+            }
+        }
+        FollowUp::RelayHangup => {
+            let circuit = l4
+                .circuits
+                .iter()
+                .flatten()
+                .find(|c| matches!(c.mode, CircuitMode::TelnetRelay { .. }))
+                .map(|c| c.conn);
+            if let Some(conn) = circuit {
+                l4.connector.disconnect(l4.netrom.table(), &conn, now_ms());
+            } else if let Some(i) = find_role(peers, |r| matches!(r, Role::TelnetRelay)) {
+                peers[i].as_mut().expect("present").role = Role::None;
+                queue.push_back((i, Event::DlDisconnectRequest));
+            }
+        }
+        FollowUp::DialInterlink { neighbour } => {
+            if find_peer(peers, &neighbour).is_some() {
+                return;
+            }
+            if let Ok(i) = start_outbound(peers, heard, neighbour, my_call, Role::Interlink) {
+                let mut name = [0u8; 16];
+                defmt::info!(
+                    "node: dialling interlink to {=str} for a circuit",
+                    call_str(&neighbour, &mut name)
+                );
+                queue.push_back((i, Event::DlConnectRequest));
+            }
+        }
+    }
+}
 
-        // L4 housekeeping every round: attach consoles to fresh circuits,
-        // service circuit events, and ship the connector's outbound interlink
-        // datagrams over the right L2 sessions.
-        service_l4(l4, peers, &mut queue, console_id, prompt);
+/// The note a user sees when the far side of its connect ended.
+fn close_note(reason: NetRomCircuitCloseReason, was_up: bool) -> &'static str {
+    match reason {
+        NetRomCircuitCloseReason::Normal => "*** Disconnected",
+        NetRomCircuitCloseReason::Refused => "*** Busy or refused",
+        NetRomCircuitCloseReason::Timeout if was_up => "*** Link failure",
+        NetRomCircuitCloseReason::Timeout => "*** No answer",
     }
 }
 
@@ -941,7 +1107,7 @@ fn now_ms() -> u64 {
 struct L4<'a> {
     connector: &'a mut NetRomConnector,
     netrom: &'a mut session::NetRom,
-    circuits: &'a mut [Option<CircuitConsole>; 4],
+    circuits: &'a mut [Option<CircuitSlot>; MAX_CIRCUITS],
     /// The INP3 host (engine + scheduler + per-round withdrawn snapshot), or `None`
     /// when the overlay is off ([`INP3_ENABLED`] false). The inbound tap consults it
     /// in [`drive`]'s `FollowUp::NetRom` arm to peel RIF / L3RTT frames off the 0xCF
@@ -1179,11 +1345,10 @@ fn service_l4(
     l4: &mut L4<'_>,
     peers: &[Option<PeerState>],
     queue: &mut VecDeque<(usize, Event)>,
+    pending: &mut VecDeque<FollowUp>,
     console_id: &Identity,
     prompt: &str,
 ) {
-    let table = l4.netrom.table();
-
     for conn in l4.connector.take_incoming_connections() {
         let mut name = [0u8; 16];
         defmt::info!(
@@ -1191,86 +1356,133 @@ fn service_l4(
             call_str(&conn.peer, &mut name)
         );
         if let Some(slot) = l4.circuits.iter_mut().find(|c| c.is_none()) {
-            *slot = Some(CircuitConsole {
+            *slot = Some(CircuitSlot {
                 conn,
-                asm: LineAssembler::default(),
+                mode: CircuitMode::Console(LineAssembler::default()),
             });
             let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
-            l4.connector.write(table, &conn, &banner, now_ms());
+            l4.connector.write(l4.netrom.table(), &conn, &banner, now_ms());
         } else {
             defmt::warn!("node: circuit table full, disconnecting");
-            l4.connector.disconnect(table, &conn, now_ms());
+            l4.connector.disconnect(l4.netrom.table(), &conn, now_ms());
         }
     }
 
     for (key, event) in l4.connector.take_events() {
+        let Some(index) = l4
+            .circuits
+            .iter()
+            .position(|c| matches!(c, Some(slot) if slot.conn.key == key))
+        else {
+            continue;
+        };
         match event {
-            CircuitEvent::Connected => {} // outbound circuits only; none yet
+            CircuitEvent::Connected => {
+                let slot = l4.circuits[index].as_mut().expect("found");
+                match &mut slot.mode {
+                    CircuitMode::Bridge { up, .. } => *up = true,
+                    CircuitMode::TelnetRelay { up } => {
+                        *up = true;
+                        relay::STATUS.signal(RelayStatus::Connected);
+                    }
+                    CircuitMode::Console(_) => {}
+                }
+            }
             CircuitEvent::DataReceived(data) => {
-                let Some(slot) = l4.circuits.iter_mut().flatten().find(|c| c.conn.key == key)
-                else {
-                    continue;
-                };
+                let slot = l4.circuits[index].as_mut().expect("found");
                 let conn = slot.conn;
-                for line in slot.asm.push(&data) {
-                    let cmd = parse_bytes(&line);
-                    // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes`.
-                    let id = console_id.with_routes(crate::netrom_view::snapshot());
-                    let resp = dispatch(&cmd, &id, TransportKind::Ax25);
-                    let mut reply = resp.body;
-                    let mut disconnect = false;
-                    match resp.outcome {
-                        DispatchOutcome::Continue => {}
-                        DispatchOutcome::Disconnect => disconnect = true,
-                        DispatchOutcome::ConfigOp(op) => {
-                            let (text, reboot) = crate::config_store::handle_op(&op);
-                            reply.extend_from_slice(
-                                &ax25_node_core::console::service::render_line(
-                                    &text,
-                                    TransportKind::Ax25,
-                                ),
-                            );
-                            if reboot {
-                                REBOOT_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+                match &mut slot.mode {
+                    CircuitMode::Bridge { other, .. } => pending.push_back(FollowUp::Forward {
+                        to: *other,
+                        data,
+                    }),
+                    CircuitMode::TelnetRelay { .. } => relay::to_user(&data),
+                    CircuitMode::Console(asm) => {
+                        for line in asm.push(&data) {
+                            let cmd = parse_bytes(&line);
+                            // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes`.
+                            let id = console_id.with_routes(crate::netrom_view::snapshot());
+                            let resp = dispatch(&cmd, &id, TransportKind::Ax25);
+                            let mut reply = resp.body;
+                            let mut disconnect = false;
+                            let mut bridging = false;
+                            match resp.outcome {
+                                DispatchOutcome::Continue => {}
+                                DispatchOutcome::Disconnect => disconnect = true,
+                                DispatchOutcome::ConfigOp(op) => {
+                                    let (text, reboot) = crate::config_store::handle_op(&op);
+                                    reply.extend_from_slice(
+                                        &ax25_node_core::console::service::render_line(
+                                            &text,
+                                            TransportKind::Ax25,
+                                        ),
+                                    );
+                                    if reboot {
+                                        REBOOT_PENDING
+                                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                DispatchOutcome::ConnectThenRelay(target) => {
+                                    // "Connecting to X..." is already in reply; the
+                                    // onward connect itself is cross-leg work.
+                                    bridging = true;
+                                    pending.push_back(FollowUp::StartBridge {
+                                        console: Leg::Circuit(key),
+                                        target,
+                                    });
+                                }
+                            }
+                            if !disconnect && !bridging {
+                                reply.extend_from_slice(prompt.as_bytes());
+                            }
+                            if !reply.is_empty() {
+                                l4.connector.write(l4.netrom.table(), &conn, &reply, now_ms());
+                            }
+                            if disconnect {
+                                l4.connector.disconnect(l4.netrom.table(), &conn, now_ms());
+                            }
+                            if bridging {
+                                // Lines typed after `C` belong to the far side.
+                                break;
                             }
                         }
-                        DispatchOutcome::ConnectThenRelay(_call) => {
-                            reply.extend_from_slice(
-                                b"...onward connects from a NET/ROM circuit aren't wired yet\r",
-                            );
-                        }
-                    }
-                    if !disconnect {
-                        reply.extend_from_slice(prompt.as_bytes());
-                    }
-                    if !reply.is_empty() {
-                        l4.connector.write(table, &conn, &reply, now_ms());
-                    }
-                    if disconnect {
-                        l4.connector.disconnect(table, &conn, now_ms());
                     }
                 }
             }
-            CircuitEvent::Closed(_reason) => {
+            CircuitEvent::Closed(reason) => {
                 defmt::info!("node: NET/ROM circuit closed");
-                for slot in l4.circuits.iter_mut() {
-                    if matches!(slot, Some(c) if c.conn.key == key) {
-                        *slot = None;
+                let slot = l4.circuits[index].take().expect("found");
+                match slot.mode {
+                    CircuitMode::Console(_) => {}
+                    CircuitMode::Bridge { other, up, .. } => {
+                        pending.push_back(FollowUp::BridgeEnded {
+                            survivor: other,
+                            note: close_note(reason, up),
+                        });
+                    }
+                    CircuitMode::TelnetRelay { up } => {
+                        relay::STATUS.signal(if up {
+                            RelayStatus::Disconnected
+                        } else {
+                            RelayStatus::Failed(close_note(reason, false).trim_start_matches("*** "))
+                        });
                     }
                 }
             }
         }
     }
 
+    let mut dialled: heapless::Vec<Callsign, 4> = heapless::Vec::new();
     for send in l4.connector.take_interlink_sends() {
         if let Some(i) = find_peer(peers, &send.neighbour) {
             queue.push_back((i, Event::DlDataRequest(PID_NETROM, send.datagram)));
-        } else {
-            let mut name = [0u8; 16];
-            defmt::warn!(
-                "node: no L2 session to interlink neighbour {=str}, dropping datagram",
-                call_str(&send.neighbour, &mut name)
-            );
+        } else if !dialled.contains(&send.neighbour) {
+            // No L2 link to that neighbour yet: dial it now. This datagram is
+            // dropped; the circuit layer retransmits once the link is up.
+            let _ = dialled.push(send.neighbour);
+            pending.push_back(FollowUp::DialInterlink {
+                neighbour: send.neighbour,
+            });
         }
     }
 }
@@ -1288,7 +1500,7 @@ async fn ensure_interlinks(
     my_call: Callsign,
     netrom: &mut session::NetRom,
     connector: &mut NetRomConnector,
-    circuits: &mut [Option<CircuitConsole>; 4],
+    circuits: &mut [Option<CircuitSlot>; MAX_CIRCUITS],
     mut inp3: Option<&mut Inp3Host>,
     console_id: &Identity,
     prompt: &str,
@@ -1584,7 +1796,7 @@ fn post_one(
                                     // the bridge proper is cross-peer work.
                                     bridging = true;
                                     followups.push(FollowUp::StartBridge {
-                                        console_peer: peer,
+                                        console: Leg::Peer(peer),
                                         target: call,
                                     });
                                 }
@@ -1629,7 +1841,10 @@ fn post_one(
                     match core::mem::replace(&mut ps.role, Role::None) {
                         Role::TelnetRelay => relay::STATUS.signal(RelayStatus::Disconnected),
                         Role::Bridge { other, .. } => {
-                            followups.push(FollowUp::BridgeEnded { survivor: other })
+                            followups.push(FollowUp::BridgeEnded {
+                                survivor: other,
+                                note: "*** Disconnected",
+                            })
                         }
                         _ => {}
                     }

@@ -303,10 +303,70 @@ mod frame_text {
             return Ok(());
         }
         if frame.pid == Some(crate::ax25::frame::PID_NETROM) {
-            return write!(w, " NET/ROM, {} bytes", frame.info.len());
+            return write_netrom(&frame.info, w);
         }
         w.write_char(' ')?;
         super::write_payload_text(&frame.info, w)
+    }
+
+    /// Summarise NET/ROM info. A NODES broadcast (leading `FF`) or anything too
+    /// short for a datagram is shown by length. A datagram is shown as
+    /// `NR ORIG>DEST t<ttl> c<index>/<id> s<tx> r<rx> <OP> [flags] payload`, the
+    /// flags being `M` (more follows), `Z` (compressed), `N` (NAK), `C` (choke).
+    /// An information payload is shown as text so a garbled one can be spotted.
+    fn write_netrom(info: &[u8], w: &mut dyn fmt::Write) -> fmt::Result {
+        use crate::netrom::wire::packet::NetRomPacket;
+        use crate::netrom::wire::transport_header::{FLAG_CHOKE, FLAG_MORE_FOLLOWS, FLAG_NAK};
+        // The compressed bit is shown even on builds without the codec, since
+        // a peer setting it is exactly what the monitor needs to reveal.
+        const FLAG_COMPRESSED: u8 = 0x10;
+        let pkt = match info.first() {
+            Some(0xFF) => None,
+            _ => NetRomPacket::decode(info),
+        };
+        let Some(pkt) = pkt else {
+            return write!(w, " NET/ROM, {} bytes", info.len());
+        };
+        w.write_str(" NR ")?;
+        write_call(&pkt.network.origin, w)?;
+        w.write_char('>')?;
+        write_call(&pkt.network.destination, w)?;
+        let t = &pkt.transport;
+        let op = match t.opcode {
+            0x01 => "CONN",
+            0x02 => "CONN-ACK",
+            0x03 => "DISC",
+            0x04 => "DISC-ACK",
+            0x05 => "INFO",
+            0x06 => "INFO-ACK",
+            0x00 => "PID",
+            _ => "OP?",
+        };
+        write!(
+            w,
+            " t{} c{}/{} s{} r{} {op}",
+            pkt.network.time_to_live, t.circuit_index, t.circuit_id, t.tx_sequence, t.rx_sequence
+        )?;
+        for (bit, ch) in [
+            (FLAG_MORE_FOLLOWS, 'M'),
+            (FLAG_COMPRESSED, 'Z'),
+            (FLAG_NAK, 'N'),
+            (FLAG_CHOKE, 'C'),
+        ] {
+            if t.flags & bit != 0 {
+                w.write_char(' ')?;
+                w.write_char(ch)?;
+            }
+        }
+        if pkt.payload.is_empty() {
+            return Ok(());
+        }
+        if t.opcode == 0x05 {
+            w.write_char(' ')?;
+            super::write_payload_text(pkt.payload, w)
+        } else {
+            write!(w, " +{}", pkt.payload.len())
+        }
     }
 }
 
@@ -393,6 +453,37 @@ mod tests {
         let mut f = ui(&[0xFF, 0x00, 0x01]);
         f.pid = Some(PID_NETROM);
         assert_eq!(render(&f), "M0ABC-1>IDENT: <UI C pid=CF> NET/ROM, 3 bytes");
+    }
+
+    #[test]
+    fn netrom_datagram_is_decoded() {
+        use crate::netrom::wire::network_header::NetRomNetworkHeader;
+        use crate::netrom::wire::packet::NetRomPacket;
+        use crate::netrom::wire::transport_header::NetRomTransportHeader;
+        let pkt = NetRomPacket {
+            network: NetRomNetworkHeader {
+                origin: Callsign::parse("G4XYZ").unwrap(),
+                destination: Callsign::parse("M0ABC-1").unwrap(),
+                time_to_live: 7,
+            },
+            transport: NetRomTransportHeader {
+                circuit_index: 3,
+                circuit_id: 9,
+                tx_sequence: 2,
+                rx_sequence: 5,
+                opcode: 0x05,
+                flags: 0x30,
+            },
+            payload: b"hi",
+        };
+        let mut buf = [0u8; 64];
+        let n = pkt.encode(&mut buf).unwrap();
+        let mut f = ui(&buf[..n]);
+        f.pid = Some(PID_NETROM);
+        assert_eq!(
+            render(&f),
+            "M0ABC-1>IDENT: <UI C pid=CF> NR G4XYZ>M0ABC-1 t7 c3/9 s2 r5 INFO M Z hi"
+        );
     }
 
     #[test]

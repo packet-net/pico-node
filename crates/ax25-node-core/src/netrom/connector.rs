@@ -92,6 +92,10 @@ pub struct NetRomConnection {
     /// The far node's callsign (the destination we dialled, or the remote that
     /// dialled us) — the C# `PeerId`.
     pub peer: Callsign,
+    /// The end user the circuit is on behalf of: the originating user we passed
+    /// to [`connect`](NetRomConnector::connect), or for an inbound circuit the
+    /// user named in the peer's Connect Request (not the node it came from).
+    pub user: Callsign,
 }
 
 /// Construction options for [`NetRomConnector`].
@@ -260,6 +264,7 @@ impl NetRomConnector {
         Ok(NetRomConnection {
             key,
             peer: destination.destination,
+            user: originating_user,
         })
     }
 
@@ -413,6 +418,7 @@ impl NetRomConnector {
             self.incoming.push(NetRomConnection {
                 key: inc.key,
                 peer: inc.remote_node,
+                user: inc.originating_user,
             });
         }
 
@@ -736,6 +742,9 @@ mod tests {
             Some(NetRomCircuitState::Connected)
         );
         assert_eq!(b_conn.peer, a_node(), "B's circuit remote is the dialler A");
+        let user = Callsign::parse("M0LTE-7").unwrap();
+        assert_eq!(conn.user, user);
+        assert_eq!(b_conn.user, user, "B sees the end user, not the node A");
 
         // 3. B's banner reached A.
         assert!(h.a_cap(conn.key).received_text().contains("bnode-prompt"));

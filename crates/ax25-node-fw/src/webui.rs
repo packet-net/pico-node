@@ -318,7 +318,8 @@ else if(d.tnc){var s=desc(d.tnc);$('st').textContent=s[0].toUpperCase()+s.slice(
 else $('st').textContent='No report from the TNC yet. Check the serial wiring (TX and RX \
 crossed, ground) and that the TNC is powered.';\
 $('lk').textContent=(d.heard==null?'Nothing heard from the TNC yet':'Last heard from the TNC '+\
-Math.round((d.now-d.heard)/1000)+' s ago')+', '+d.rx+' frames heard, '+d.tx+' sent';\
+Math.round((d.now-d.heard)/1000)+' s ago')+', '+d.rx+' frames heard, '+d.tx+' sent'+\
+(d.errs?', '+d.errs+' serial errors':'');\
 var j=$('job');if(d.job){j.textContent=d.job.text;j.className='hint '+(d.job.done?(d.job.ok?'ok':'bad'):'')}\
 last=d;var t=d.tnc,ok=!!(t&&t.ok);$('setup').hidden=!ok;\
 $('gate').textContent=!d.running?'':!t?'Waiting for the TNC to report its firmware. The node uses \
@@ -360,7 +361,7 @@ function show(d){var now=Date.now(),t=d.tnc;\
 $('rst').textContent=!d.running?'The TNC link is not running (set the node callsign first).':\
 !t?'Waiting for the TNC to report.':'NinoTNC firmware '+t.fw+', running mode '+(t.mode||'?')+\
 (t.ok?'':'. Not in use: pico-node needs '+(t.major||3)+'.44 or later (update it on the NinoTNC page).');\
-$('rlk').textContent=d.rx+' frames heard, '+d.tx+' sent';\
+$('rlk').textContent=d.rx+' frames heard, '+d.tx+' sent'+(d.errs?', '+d.errs+' serial errors':'');\
 if(since>0&&d.oldest>since+1)line('ev','(some lines were missed)');\
 d.log.forEach(function(e){line(e[2]=='RX'?'rx':e[2]=='TX'?'tx':'ev',\
 new Date(now-(d.now-e[1])).toTimeString().slice(0,8)+' '+e[2]+' '+e[3])});\
