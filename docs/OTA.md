@@ -167,7 +167,8 @@ OTA-over-WiFi is unaffected by all of this — it only ever ships the single
 `scripts/package-ota.sh [outdir]` builds everything (credential-free,
 reproducible): `pico-node-app.bin` (the blobless OTA payload),
 `pico-node-firmware.uf2` + `pico-node-blobs.uf2` (the two first-flash files),
-`pico-node-app.elf`, and `SHA256SUMS`. Internally each UF2 is a single
+`SHA256SUMS` over those three, and `pico-node-app.elf` (local only, for decoding
+defmt logs over a probe; releases don't publish it). Internally each UF2 is a single
 contiguous region built with `picotool uf2 convert` from a packed `.bin`:
 `firmware` = bootloader at the flash base, 0xFF up through the state sector, then
 the app at ACTIVE; `blobs` = the `PBLB` manifest + cyw43 firmware

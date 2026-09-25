@@ -4,7 +4,9 @@
 #                             payload — NO cyw43 blob; that lives in BLOBS)
 #   - pico-node-firmware.uf2  bootloader + STATE-clear + app, for first BOOTSEL
 #   - pico-node-blobs.uf2     cyw43 firmware/CLM/NVRAM, for first BOOTSEL
-#   - pico-node-app.elf       application ELF (symbols)
+#   - pico-node-app.elf       application ELF (symbols), local only: it decodes
+#                             defmt logs over a debug probe. Not in SHA256SUMS
+#                             and not published with releases.
 #
 # Why TWO BOOTSEL files, not one combined? The de-dup puts the cyw43 BLOBS 1 MB
 # above the app (the DFU region sits between them). The RP2040 BOOTSEL bootrom
@@ -97,4 +99,4 @@ rm -f "$OUT/.bl.bin" "$OUT/.fw.bin" "$OUT/.blobs.bin"
 
 echo "==> artifacts in $OUT:"
 ls -la "$OUT"/pico-node-app.bin "$OUT"/pico-node-firmware.uf2 "$OUT"/pico-node-blobs.uf2 "$OUT"/pico-node-app.elf
-( cd "$OUT" && sha256sum pico-node-app.bin pico-node-firmware.uf2 pico-node-blobs.uf2 pico-node-app.elf > SHA256SUMS && cat SHA256SUMS )
+( cd "$OUT" && sha256sum pico-node-app.bin pico-node-firmware.uf2 pico-node-blobs.uf2 > SHA256SUMS && cat SHA256SUMS )

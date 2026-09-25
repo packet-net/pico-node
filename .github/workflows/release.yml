@@ -88,7 +88,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
+          # The asset guide (.github/release-assets.md) heads the notes; the
+          # generated change list follows it. The app ELF is built but not
+          # published: it only serves decoding defmt logs over a debug probe,
+          # and anyone with a probe builds from source.
           gh release create "$TAG" \
-            dist/pico-node-app.bin dist/pico-node-app.elf \
+            dist/pico-node-app.bin \
             dist/pico-node-firmware.uf2 dist/pico-node-blobs.uf2 dist/SHA256SUMS \
-            --verify-tag --title "$TAG" --generate-notes
+            --verify-tag --title "$TAG" \
+            --notes "$(cat .github/release-assets.md)" --generate-notes
