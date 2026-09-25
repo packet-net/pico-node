@@ -126,6 +126,8 @@ pub async fn task(
     }
     let mut link = LinkState::default();
     let mut mode_job: Option<ModeSetter> = None;
+    // When the next frame may be handed to the TNC (see `FRAME_GAP_MS`).
+    let mut next_tx_at = Instant::now();
 
     // Nothing is sent to the TNC, and the radio port stays closed, until it has
     // said which firmware it runs: see `LinkState::on_report`.
@@ -147,13 +149,14 @@ pub async fn task(
                 None => core::future::pending::<()>().await,
             }
         };
-        match select4(
-            modem.read_frame(),
-            tnc::CMD.receive(),
-            timer,
-            ports::take_tx(Port::NINOTNC),
-        )
-        .await
+        // The next frame waits for the previous one to clear the wire. The
+        // wait holds only this arm: inbound frames are still read meanwhile.
+        let gap = next_tx_at;
+        let next_frame = async move {
+            Timer::at(gap).await;
+            ports::take_tx(Port::NINOTNC).await
+        };
+        match select4(modem.read_frame(), tnc::CMD.receive(), timer, next_frame).await
         {
             Either4::First(read) => match read {
                 Ok(Some(frame)) => {
@@ -247,10 +250,28 @@ pub async fn task(
                 // changed since.
                 if ports::usable(Port::NINOTNC) {
                     send_wire(&mut modem, &wire).await;
+                    next_tx_at = Instant::now()
+                        + wire_time(wire.len(), baud)
+                        + Duration::from_millis(FRAME_GAP_MS);
                 }
             }
         }
     }
+}
+
+/// Quiet time on the serial link between frames sent to the TNC. Measured on
+/// air: frames written back to back over J5 arrive at the NinoTNC damaged (the
+/// second of a pair loses bytes and the rest are misread until it re-syncs),
+/// seemingly because it is still busy starting the first transmission. The
+/// damage passes its radio checksum, so nothing downstream catches it.
+const FRAME_GAP_MS: u64 = 30;
+
+/// How long `len` bytes take on the serial wire (10 bits a byte at the link
+/// rate, plus a few for the KISS framing). A write returns once the bytes are
+/// buffered, not sent, so the gap is timed from here.
+fn wire_time(len: usize, baud: u32) -> Duration {
+    let bits = (len as u64 + 4) * 10;
+    Duration::from_micros(bits * 1_000_000 / u64::from(baud.max(1)))
 }
 
 /// How often to repeat GETALL while the TNC has not reported (e.g. wiring not
