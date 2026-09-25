@@ -173,9 +173,18 @@ pub async fn task(
                 // EOF / link-down: a buffered UART doesn't really "close", but on a
                 // read error or zero-read we yield and retry rather than spin.
                 Ok(None) => Timer::after_millis(10).await,
+                // A line error (framing, overrun, break, parity). The UART has
+                // already dropped the bad byte, but KISS has no checksum: the
+                // frame it landed in must not be delivered, so skip to the next
+                // frame boundary and let AX.25 retransmit. No pause: the FIFO
+                // behind the error is only 32 bytes and would overrun.
                 Err(e) => {
                     defmt::warn!("ninotnc: read error: {}", defmt::Debug2Format(&e));
-                    Timer::after_millis(100).await;
+                    modem.resynchronise();
+                    tnc::with_state(|s| s.line_errors = s.line_errors.saturating_add(1));
+                    tnc::log_with(Direction::Info, |w| {
+                        write!(w, "Serial line error ({}); frame dropped", line_error_name(&e))
+                    });
                 }
             },
             Either4::Second(cmd) => match cmd {
@@ -702,6 +711,18 @@ async fn discard_input(modem: &mut Modem) {
 }
 
 /// Configure UART1 as a buffered 8N1 UART at `baud` on GP20 (TX) / GP21 (RX) —
+/// A plain name for a UART receive error, for the monitor.
+fn line_error_name(e: &ax25_node_core::kiss::serial::ModemError<UartError>) -> &'static str {
+    use ax25_node_core::kiss::serial::ModemError;
+    match e {
+        ModemError::Io(UartError::Overrun) => "overrun",
+        ModemError::Io(UartError::Break) => "break",
+        ModemError::Io(UartError::Parity) => "parity",
+        ModemError::Io(UartError::Framing) => "framing",
+        _ => "other",
+    }
+}
+
 /// the NinoBLE Rev5 NinoTNC link. Static TX/RX ring buffers sized for a couple
 /// of KISS frames.
 fn configure_uart(

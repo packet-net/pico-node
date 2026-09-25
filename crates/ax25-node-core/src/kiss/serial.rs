@@ -119,6 +119,13 @@ impl<S: ByteStream> SerialKissModem<S> {
         self.pending.clear();
     }
 
+    /// The line reported an error: drop the frame in progress and skip to the
+    /// next frame boundary (see [`Decoder::resynchronise`]). Frames completed
+    /// before the error are kept.
+    pub fn resynchronise(&mut self) {
+        self.decoder.resynchronise();
+    }
+
     /// Frame and send a KISS `Data` frame carrying `ax25_bytes`. Mirrors
     /// `KissSerialModem.SendFrameAsync`. Returns the modem's `Error::TooLarge` if
     /// the body exceeds [`MAX_AX25_BODY`].

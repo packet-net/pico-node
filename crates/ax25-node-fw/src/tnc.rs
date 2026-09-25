@@ -71,6 +71,8 @@ pub struct TncState {
     /// AX.25 frames heard / sent since boot.
     pub rx_frames: u32,
     pub tx_frames: u32,
+    /// Serial receive errors on the TNC link since boot; each dropped a frame.
+    pub line_errors: u32,
     /// The TNC's last diagnostic or status report, and when it arrived.
     pub status: Option<NinoTncStatusFrame>,
     pub status_at_ms: u64,
@@ -88,6 +90,7 @@ pub static STATE: Mutex<CriticalSectionRawMutex, RefCell<TncState>> =
         last_heard_ms: None,
         rx_frames: 0,
         tx_frames: 0,
+        line_errors: 0,
         status: None,
         status_at_ms: 0,
         mode_job: None,
@@ -291,17 +294,21 @@ fn write_log_entry(
 }
 
 fn write_status_json(w: &mut BufWriter<'_>, now: u64) -> fmt::Result {
-    let (running, heard, rx, tx, status, job) = with_state(|s| {
+    let (running, heard, rx, tx, errs, status, job) = with_state(|s| {
         (
             s.running,
             s.last_heard_ms,
             s.rx_frames,
             s.tx_frames,
+            s.line_errors,
             s.status,
             s.mode_job,
         )
     });
-    write!(w, "{{\"now\":{now},\"running\":{running},\"rx\":{rx},\"tx\":{tx},\"heard\":")?;
+    write!(
+        w,
+        "{{\"now\":{now},\"running\":{running},\"rx\":{rx},\"tx\":{tx},\"errs\":{errs},\"heard\":"
+    )?;
     match heard {
         Some(h) => write!(w, "{h}")?,
         None => w.write_str("null")?,

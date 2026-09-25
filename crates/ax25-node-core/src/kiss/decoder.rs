@@ -135,6 +135,18 @@ impl Decoder {
         self.resynchronising = false;
     }
 
+    /// Drop the partial frame and skip everything up to the next FEND. For a
+    /// driver whose line reported an error (a serial framing error or overrun):
+    /// KISS carries no checksum, so the bytes around the error cannot be trusted,
+    /// and the frame they belong to must not be delivered. The link layer above
+    /// recovers the loss by retransmission.
+    pub fn resynchronise(&mut self) {
+        self.current.clear();
+        self.release_buffer();
+        self.in_escape = false;
+        self.resynchronising = true;
+    }
+
     // Over the bound the partial frame is unusable: drop it, hand the memory back,
     // count it, and skip everything up to the next FEND.
     fn drop_if_oversize(&mut self) {
@@ -251,6 +263,27 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload, vec![0x42]);
         assert_eq!(d.oversize_frames_dropped(), 1);
+    }
+
+    #[test]
+    fn resynchronise_drops_the_damaged_frame_and_keeps_the_next() {
+        let mut d = Decoder::new();
+        // The line reports an error mid-frame: what follows up to the next FEND
+        // (the damaged tail and its closing FEND) is not a frame.
+        assert!(d.push(&[FEND, 0x00, 0x01, 0x02]).is_empty());
+        d.resynchronise();
+        // The damaged tail and its closing FEND, then the next whole frame.
+        let frames = d.push(&[0x99, 0x98, FEND, FEND, 0x00, 0x42, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x42]);
+
+        // The error ate the closing FEND itself: resync ends at the next frame's
+        // opening FEND, and that frame still decodes.
+        d.push(&[FEND, 0x00, 0x05]);
+        d.resynchronise();
+        let frames = d.push(&[0x06, FEND, 0x00, 0x43, FEND]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![0x43]);
     }
 
     #[test]
