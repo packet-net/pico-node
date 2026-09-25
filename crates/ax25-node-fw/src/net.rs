@@ -5,13 +5,14 @@
 //! load the CYW43 firmware + NVRAM + CLM blobs, bring the chip up over PIO-SPI,
 //! spawn the `cyw43` runner task, init `embassy-net` with a DHCPv4 config, and
 //! spawn the net runner task. The returned `Stack` (it is `Copy`) is shared by
-//! every transport task (AXUDP/KISS-TCP/telnet).
+//! every task that uses the network (the web panel, telnet, mDNS, MQTT, KISS-TCP).
 
 use cyw43::{Control, JoinAuth, JoinOptions, NetDriver};
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::{
-    Config, DhcpConfig, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
+    Config, DhcpConfig, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
 };
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
@@ -30,8 +31,9 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
 });
 
-/// Socket-resource pool for the whole node: DHCPv4 + AXUDP (UDP) + KISS-TCP +
-/// telnet, with headroom for a second console connection.
+/// Socket-resource pool for the whole node: DHCPv4, the web panel (two
+/// listeners), telnet, mDNS, MQTT, KISS-TCP, the setup AP's DHCP + DNS, with
+/// headroom.
 const SOCKET_COUNT: usize = 8;
 
 /// The cyw43 chip driver task — services the PIO-SPI bus + chip events forever.
@@ -259,7 +261,7 @@ pub async fn join(control: &mut Control<'static>, wifi: &WifiConfig) {
 }
 
 /// Start the embassy-net stack with DHCPv4 and spawn its runner task. Returns
-/// the `Copy`able stack handle the transports share. Does not wait for a lease —
+/// the `Copy`able stack handle the network tasks share. Does not wait for a lease:
 /// callers that need the network up await `stack.wait_config_up()`.
 ///
 /// `hostname` rides in DHCP option 12, so the node shows up named in the
@@ -284,4 +286,31 @@ pub async fn start_stack(
     );
     spawner.spawn(defmt::unwrap!(net_task(runner)));
     stack
+}
+
+// ── Small network helpers shared by the tasks that use sockets ──
+
+/// Parse `"a.b.c.d:port"` into an endpoint (build-env config; host-side LAN
+/// details are kept out of committed defaults per HW-BRINGUP §5).
+pub fn parse_endpoint(s: &str) -> Option<IpEndpoint> {
+    let (ip, port) = s.split_once(':')?;
+    let ip: core::net::Ipv4Addr = ip.parse().ok()?;
+    let port: u16 = port.parse().ok()?;
+    Some(IpEndpoint::new(ip.into(), port))
+}
+
+/// Write all of `bytes` to a TCP socket, returning `false` on any error or
+/// closed peer (callers drop the connection).
+pub async fn tcp_write_all(socket: &mut TcpSocket<'_>, mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        match socket.write(bytes).await {
+            Ok(0) => return false,
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) => {
+                defmt::warn!("tcp write error {:?}", e);
+                return false;
+            }
+        }
+    }
+    true
 }

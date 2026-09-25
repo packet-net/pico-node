@@ -1,44 +1,44 @@
-//! Capability 1 — AXUDP: AX.25-over-UDP for node↔node connectivity over WiFi.
+//! The node: everything above the modem, for every radio port.
 //!
-//! Ports `Packet.Axudp.AxudpSocket` onto `embassy_net::udp::UdpSocket` (the 1:1
-//! mapping the research note identifies). The UDP payload is the AX.25 frame
-//! body + the mandatory trailing FCS; framing comes from
-//! [`ax25_node_core::axudp`].
+//! One task owns the connected-mode session layer, the node console, NET/ROM
+//! (one routing table for the whole node, NODES heard and originated, L4
+//! circuits, interlinks, INP3) and the telnet connect relay. The port drivers
+//! ([`crate::ports`]) own the modems: they deliver heard frames into
+//! [`ports::RX`] and transmit what this task queues with [`ports::send`].
 //!
-//! Beyond the socket loop + read-only NET/ROM tap, this task owns **the
-//! connected-mode session layer for the AXUDP port**. Each connected peer
-//! carries a [`Role`] deciding where its DL signals go:
+//! Each connected peer is reached on a [`Port`] and carries a [`Role`] deciding
+//! where its DL signals go:
 //!
-//! - [`Role::Console`] — an inbound user at the node prompt
+//! - [`Role::Console`]: an inbound user at the node prompt
 //!   (`TransportKind::Ax25`, CR line discipline).
-//! - [`Role::Bridge`] — piped to *another AX.25 session*: a console user typed
+//! - [`Role::Bridge`]: piped to *another AX.25 session*: a console user typed
 //!   `C <call>` and this task connected onward, relaying I-frame data both
 //!   ways (node-hopping *through* the Pico).
-//! - [`Role::TelnetRelay`] — piped to the telnet console relay
-//!   ([`super::relay`] statics).
+//! - [`Role::TelnetRelay`]: piped to the telnet console relay
+//!   ([`crate::admin::relay`] statics).
+//! - [`Role::Interlink`]: a persistent link to a NET/ROM neighbour.
 //!
 //! Cross-peer work (bridge data forwarding, bridge teardown notices) is queued
-//! as [`FollowUp`]s and drained by [`drive`] — one borrow at a time, bounded.
+//! as [`FollowUp`]s and drained by [`drive`], one borrow at a time, bounded.
 //!
 //! **Timers are live**: each peer carries its own [`session::EmbassyTimers`],
 //! the main select loop wakes at the earliest armed deadline across all peers,
-//! and expiries post the matching `Event::T?Expiry` into that peer's session —
-//! retransmission, ack timing and dead-peer link failure (N2 exhausted →
+//! and expiries post the matching `Event::T?Expiry` into that peer's session:
+//! retransmission, ack timing and dead-peer link failure (N2 exhausted, then
 //! teardown) run exactly as the SDL tables specify.
 //!
 //! **NET/ROM L4 circuits terminate here too**: inbound PID-0xCF I-frames are
 //! interlink datagrams, fed to a [`NetRomConnector`] (the host-tested sans-io
 //! L4 stack). Circuits addressed to this node are auto-accepted and get the
-//! node console attached — `C PICO` from any NET/ROM neighbour lands at the
-//! same prompt L2 users get; the connector's outbound datagrams ride back as
-//! PID-0xCF I-frames over the neighbour's L2 session.
+//! node console attached, so `C <alias>` from any NET/ROM neighbour lands at
+//! the same prompt L2 users get; the connector's outbound datagrams ride back
+//! as PID-0xCF I-frames over the neighbour's L2 session.
 //!
-//! Single-transport ownership (this task owns `Sessions` exclusively) keeps the
-//! `&mut` story trivial; when a second connected-mode transport arrives the
-//! manager moves behind the supervisor seam `session.rs` documents.
+//! Until 2026-09-25 this task was the AXUDP transport (AX.25 over UDP, the
+//! bring-up path before a TNC was attached); the radio-first restructure
+//! removed AXUDP and made the radio ports its only links.
 
 use ax25_node_core::ax25::{Callsign, Frame, PID_NETROM, PID_NO_LAYER3};
-use ax25_node_core::axudp;
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
 use ax25_node_core::console::{DispatchOutcome, LineAssembler, TransportKind};
@@ -53,7 +53,7 @@ use ax25_node_core::netrom::{
     CircuitEvent, NetRomConnection, NetRomConnector, NetRomConnectorOptions, NetRomOriginator,
     NetRomOriginatorOptions,
 };
-use ax25_node_core::netrom::{ObserveOutcome, PortId};
+use ax25_node_core::netrom::ObserveOutcome;
 use ax25_node_core::sdl::{
     classify_incoming, DataLinkSignal, Event, FrameSpec, UnnumberedKind, WireSink,
 };
@@ -62,19 +62,18 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{IpEndpoint, Stack};
-// IpEndpoint remains for the beacon target and the NODES fan-out list.
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
-use crate::config::{AxudpConfig, NetRomConfig};
+use crate::config::NetRomConfig;
 use crate::session;
-use crate::transports::relay::{self, RelayStatus};
-use crate::transports::{call_str, parse_endpoint, rf, ui_frame, Link};
+use crate::admin::relay::{self, RelayStatus};
+use crate::ports::{self, call_str, ui_frame, Port};
 
-/// Seconds between beacon UI frames when a beacon target is configured.
-const BEACON_INTERVAL_SECS: u64 = 10;
+/// Seconds between housekeeping ticks (route-count display, interlinks, flash
+/// save, L4 timers, INP3, the obsolescence sweep and NODES each check their own
+/// cadence on every tick).
+const HOUSEKEEPING_TICK_SECS: u64 = 10;
 /// Seconds between routing-table flash saves (bounds wear; only saves on change).
 const NETROM_SAVE_SECS: u64 = 300;
 /// Seconds between "ensure interlinks" passes — proactively (re)establish an
@@ -83,22 +82,22 @@ const INTERLINK_ENSURE_SECS: u64 = 30;
 
 /// Master gate for the INP3 time-routing overlay on this firmware host (the
 /// analogue of the C# `config.Inp3.Enabled` / the ax25-ts connector `inp3` opt-in).
-/// Default ON for the demo node — flip later via a config knob. Kept a single const
+/// Default ON; build with `INP3_DISABLE` set to leave it out. Kept a single const
 /// here so the whole overlay (engine + scheduler construction, the inbound 0xCF tap,
 /// the tick fan-out) is trivially gateable: when `false` the [`Inp3Host`] is never
 /// constructed and every INP3 step is a no-op.
 const INP3_ENABLED: bool = option_env!("INP3_DISABLE").is_none();
 
-/// Demo-node INP3 cadences (SHORT, so a 2-node lab demo shows the time-route being
-/// LEARNED in seconds, not minutes — production tunables are 60 s / 300 s / 180 s).
-/// L3RTT probe every ~5 s; periodic full RIF every ~10 s; reflection-timeout reset
-/// at ~30 s. Encoded as ms (the netrom no_std idiom).
-const INP3_L3RTT_INTERVAL_MS: u32 = 5_000;
-const INP3_RIF_INTERVAL_MS: u32 = 10_000;
-const INP3_RESET_WINDOW_MS: u32 = 30_000;
-/// The positive-update debounce — must be > 0 and < the RIF interval. Kept short for
-/// the demo so a newly-learned route fans out within ~1 s of its debounce.
-const INP3_POSITIVE_DEBOUNCE_MS: u32 = 1_000;
+/// INP3 cadences: packet.net's production defaults (`NetRomInp3Options`). Every
+/// probe and RIF goes on the air now, so these are the real-network values, not
+/// the old seconds-scale lab-demo ones. L3RTT probe every 60 s; periodic full RIF
+/// every 300 s; reflection-timeout reset at 180 s. Encoded as ms (the netrom
+/// no_std idiom).
+const INP3_L3RTT_INTERVAL_MS: u32 = 60_000;
+const INP3_RIF_INTERVAL_MS: u32 = 300_000;
+const INP3_RESET_WINDOW_MS: u32 = 180_000;
+/// The positive-update debounce: must be > 0 and < the RIF interval.
+const INP3_POSITIVE_DEBOUNCE_MS: u32 = 5_000;
 
 /// Set by a console REBOOT on the AX.25 path; honoured by [`drive`] after the
 /// response frames have been transmitted (so the farewell reaches the user).
@@ -140,8 +139,8 @@ struct PeerState {
     /// against LinBPQ).
     local: Callsign,
     timers: session::EmbassyTimers,
-    /// Where the peer is reached: an AXUDP endpoint or the radio port.
-    endpoint: Link,
+    /// The port the peer is reached on.
+    port: Port,
     role: Role,
 }
 
@@ -167,34 +166,16 @@ enum FollowUp {
 
 #[embassy_executor::task]
 pub async fn task(
-    stack: Stack<'static>,
-    cfg: AxudpConfig,
     netrom_cfg: NetRomConfig,
     my_call: Callsign,
     console_id: Identity,
     prompt: String,
 ) {
-    defmt::info!("axudp: listen udp/{}", cfg.listen_port);
-
-    let mut rx_meta = [PacketMetadata::EMPTY; 4];
-    let mut tx_meta = [PacketMetadata::EMPTY; 4];
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 2048];
-    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
-    defmt::unwrap!(socket.bind(cfg.listen_port));
-
-    // §5: the harness endpoint comes from the build environment (LAN detail,
-    // not committed). Without it the transport still listens + decodes.
-    let beacon_ep: Option<IpEndpoint> = cfg.beacon_target.and_then(parse_endpoint);
-    if beacon_ep.is_none() {
-        defmt::info!("axudp: no AXUDP_BEACON_TARGET set — listen-only");
-    }
+    defmt::info!("node: up, serving {=usize} radio port(s)", ports::PORT_COUNT);
 
     // The read-only NET/ROM tap (the C# FrameTraced-before-DispatchInbound
     // equivalent): fed every decoded inbound frame BEFORE address filtering.
     let mut netrom = session::new_netrom();
-    let port_id = PortId::from_str_lossy("axudp");
-    let rf_port_id = PortId::from_str_lossy("rf");
 
     // Repopulate the routing table from flash (survives power failure — like
     // BPQ's BPQNODES.dat). Replays persisted routes through the live ingest
@@ -211,7 +192,7 @@ pub async fn task(
     // NODES origination: our own broadcasts, built from the live routing table
     // (header alias + an entry per advertisable route, OBSMIN-gated) — the node
     // becomes *visible* in peers' nodes tables. The interval follows the BPQ
-    // convention; the first broadcast goes out on the first beacon tick so a
+    // convention; the first broadcast goes out on the first housekeeping tick so a
     // fresh boot announces promptly.
     let originator = NetRomOriginator::new(NetRomOriginatorOptions {
         enabled: netrom_cfg.originate,
@@ -236,21 +217,21 @@ pub async fn task(
     // here, only when the overlay is on, with the node call already known (the C# sets
     // the engine's local node at AttachPort; we set it at construction, since `my_call`
     // is a parameter). Quality forwarding is left primary
-    // (`set_prefer_inp3_routes(false)`) so the demo shows the time-route being LEARNED,
-    // not yet routed by (AWARENESS ONLY, matching the C#/TS slice). `None` when off —
+    // (`set_prefer_inp3_routes(false)`) so the node learns time-routes without yet
+    // routing by them (AWARENESS ONLY, matching the C#/TS slice). `None` when off:
     // the engine/scheduler are then never even constructed.
     let mut inp3: Option<Inp3Host> = if INP3_ENABLED {
         connector.set_prefer_inp3_routes(false);
         let host = Inp3Host::new(my_call);
         defmt::info!(
-            "axudp: INP3 overlay constructed (probe {=u32}ms, rif {=u32}ms, reset {=u32}ms) — awareness-only, quality forwarding unchanged",
+            "node: INP3 overlay constructed (probe {=u32}ms, rif {=u32}ms, reset {=u32}ms), awareness-only, quality forwarding unchanged",
             INP3_L3RTT_INTERVAL_MS,
             INP3_RIF_INTERVAL_MS,
             INP3_RESET_WINDOW_MS
         );
         Some(host)
     } else {
-        defmt::info!("axudp: INP3 overlay disabled");
+        defmt::info!("node: INP3 overlay disabled");
         None
     };
 
@@ -258,7 +239,7 @@ pub async fn task(
     let mut next_nodes_at = Instant::now(); // announce on the first tick
     if netrom_cfg.originate {
         defmt::info!(
-            "axudp: NODES origination on, every {=u32}s",
+            "node: NODES origination on, every {=u32}s",
             netrom_cfg.nodes_interval_secs
         );
     }
@@ -274,12 +255,11 @@ pub async fn task(
     let mut peers: [Option<PeerState>; session::MAX_SESSIONS] =
         [const { None }; session::MAX_SESSIONS];
 
-    // Callsign → last-heard UDP endpoint (the outbound-connect route table;
-    // LinBPQ's periodic ID/NODES broadcasts keep it warm).
-    let mut heard: [Option<(Callsign, Link)>; 8] = [None; 8];
+    // Callsign -> the port it was last heard on (where to dial it; a station
+    // not in here is dialled on the first usable port).
+    let mut heard: [Option<(Callsign, Port)>; 8] = [None; 8];
 
-    let mut dgram_buf = [0u8; 2048];
-    let mut ticker = Ticker::every(Duration::from_secs(BEACON_INTERVAL_SECS));
+    let mut ticker = Ticker::every(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
     let mut src_buf = [0u8; 16];
     let mut dst_buf = [0u8; 16];
 
@@ -303,48 +283,37 @@ pub async fn task(
             .iter()
             .flatten()
             .any(|p| matches!(p.role, Role::TelnetRelay));
+        // Peer bytes waiting for a slow telnet user are fed on as it drains,
+        // including after the link has ended (so the tail still arrives).
         let relay_fut = async {
             if telnet_relay_active {
                 let mut buf = [0u8; 128];
-                match select(relay::USER_TO_AX.read(&mut buf), relay::USER_HANGUP.wait()).await {
-                    Either::First(n) => RelayEvent::UserData(buf, n),
-                    Either::Second(()) => RelayEvent::Hangup,
+                match select3(
+                    relay::USER_TO_AX.read(&mut buf),
+                    relay::USER_HANGUP.wait(),
+                    relay::flush_some(),
+                )
+                .await
+                {
+                    Either3::First(n) => RelayEvent::UserData(buf, n),
+                    Either3::Second(()) => RelayEvent::Hangup,
+                    Either3::Third(()) => RelayEvent::Flushed,
                 }
             } else {
-                RelayEvent::Connect(relay::CONNECT_REQ.receive().await)
+                match select(relay::CONNECT_REQ.receive(), relay::flush_some()).await {
+                    Either::First(target) => RelayEvent::Connect(target),
+                    Either::Second(()) => RelayEvent::Flushed,
+                }
             }
         };
 
-        // The radio port's heard frames arrive from the serial task (rf::RX);
-        // a frame from either port is handled by the same code below.
-        let woke = select(
-            select4(
-                ticker.next(),
-                socket.recv_from(&mut dgram_buf),
-                timer_wait,
-                relay_fut,
-            ),
-            rf::RX.receive(),
-        )
-        .await;
-        let mut received: Option<(Frame, Link)> = None;
+        // Heard frames arrive from the port drivers (ports::RX), tagged with
+        // their port, and are handled after the match.
+        let woke = select4(ticker.next(), ports::RX.receive(), timer_wait, relay_fut).await;
+        let mut received: Option<(Frame, Port)> = None;
         match woke {
-            Either::Second(frame) => received = Some((frame, Link::Rf)),
-            Either::First(Either4::First(())) => {
-                if let Some(ep) = beacon_ep {
-                    let beacon = ui_frame(
-                        my_call,
-                        Callsign::parse("IDENT").expect("static"),
-                        PID_NO_LAYER3,
-                        b"pico-node AXUDP beacon (HW-BRINGUP Gate 3)",
-                    );
-                    let dgram = axudp::encode_datagram(&beacon);
-                    match socket.send_to(&dgram, ep).await {
-                        Ok(()) => defmt::info!("axudp: beacon sent ({=usize} bytes)", dgram.len()),
-                        Err(e) => defmt::warn!("axudp: beacon send error {:?}", e),
-                    }
-                }
-
+            Either4::Second((port, frame)) => received = Some((frame, port)),
+            Either4::First(()) => {
                 // Reflect the live route counts on the OLED + MQTT status.
                 crate::oled::set_counts(
                     netrom.neighbour_count() as u16,
@@ -367,9 +336,7 @@ pub async fn task(
                     ensure_interlinks(
                         &mut sessions,
                         &mut peers,
-                        &socket,
                         &heard,
-                        beacon_ep,
                         my_call,
                         &mut netrom,
                         &mut connector,
@@ -396,7 +363,7 @@ pub async fn task(
                     }
                 }
 
-                // L4 circuit timers (ack/retransmit/idle) ride the beacon tick.
+                // L4 circuit timers (ack/retransmit/idle) ride the housekeeping tick.
                 connector.tick(netrom.table(), now_ms());
                 {
                     let mut queue: VecDeque<(usize, Event)> = VecDeque::new();
@@ -416,9 +383,7 @@ pub async fn task(
                         drive(
                             &mut sessions,
                             &mut peers,
-                            &socket,
                             &heard,
-                            beacon_ep,
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
@@ -436,7 +401,7 @@ pub async fn task(
                 }
 
                 // INP3 time-routing overlay tick (the embedded host wiring). Rides the
-                // beacon tick — the single driver, the core owns no ambient timer (as the
+                // housekeeping tick: the single driver, the core owns no ambient timer (as the
                 // C# host's 1 s timer / the ax25-ts connector `tick`). Robust: a faulting
                 // INP3 step must not kill the task, and the whole block is a no-op when
                 // the overlay is off (`inp3` is `None`). Drive engine + scheduler in the
@@ -460,9 +425,7 @@ pub async fn task(
                             drive(
                                 &mut sessions,
                                 &mut peers,
-                                &socket,
                                 &heard,
-                                beacon_ep,
                                 my_call,
                                 &mut L4 {
                                     connector: &mut connector,
@@ -479,7 +442,7 @@ pub async fn task(
                         } else {
                             let mut name = [0u8; 16];
                             defmt::debug!(
-                                "axudp: INP3 frame dropped — no interlink up to {=str} (drop, don't dial)",
+                                "node: INP3 frame dropped, no interlink up to {=str} (drop, don't dial)",
                                 call_str(&nbr, &mut name)
                             );
                         }
@@ -493,7 +456,7 @@ pub async fn task(
                     for down in &round.downs {
                         let mut name = [0u8; 16];
                         defmt::info!(
-                            "axudp: INP3 neighbour {=str} down (silent {=u64}ms) — engine state reset (no table teardown wired)",
+                            "node: INP3 neighbour {=str} down (silent {=u64}ms), engine state reset (no table teardown wired)",
                             call_str(&down.neighbour, &mut name),
                             down.silent_for_ms
                         );
@@ -517,64 +480,24 @@ pub async fn task(
                     }
                 }
 
-                // NODES origination rides the beacon tick (10 s granularity is
+                // NODES origination rides the housekeeping tick (10 s granularity is
                 // plenty against minutes-scale intervals).
                 if netrom_cfg.originate && Instant::now() >= next_nodes_at {
                     next_nodes_at = Instant::now() + nodes_interval;
                     let payloads = originator.broadcast_nodes(netrom.table());
-                    // BPQ semantics: NODES go to every B-flagged map. Our
-                    // analogue: the beacon target + every distinct endpoint in
-                    // the heard table (the LAN peers we actually know).
-                    let mut targets: [Option<IpEndpoint>; 9] = [None; 9];
-                    let mut n_targets = 0usize;
-                    for ep in beacon_ep
-                        .iter()
-                        .copied()
-                        .chain(heard.iter().flatten().filter_map(|(_, l)| match l {
-                            Link::Udp(ep) => Some(*ep),
-                            Link::Rf => None,
-                        }))
-                    {
-                        if !targets[..n_targets].iter().flatten().any(|t| *t == ep) {
-                            targets[n_targets] = Some(ep);
-                            n_targets += 1;
-                        }
-                    }
+                    // On every usable port (BPQ: NODES on each port set to
+                    // broadcast them).
                     let dest = NetRomOriginator::nodes_destination();
                     for payload in &payloads {
                         let frame = ui_frame(my_call, dest, NetRomOriginator::PID, payload);
-                        let dgram = axudp::encode_datagram(&frame);
-                        for ep in targets[..n_targets].iter().flatten() {
-                            if let Err(e) = socket.send_to(&dgram, *ep).await {
-                                defmt::warn!("axudp: NODES send error {:?}", e);
-                            }
+                        for port in Port::ALL {
+                            ports::send(port, frame.encode()).await;
                         }
-                        // And on the air, once, when the radio port is usable.
-                        rf::send(frame.encode()).await;
                     }
-                    defmt::info!(
-                        "axudp: NODES broadcast sent ({=usize} frame(s) to {=usize} endpoint(s))",
-                        payloads.len(),
-                        n_targets
-                    );
+                    defmt::info!("node: NODES broadcast sent ({=usize} frame(s))", payloads.len());
                 }
             }
-            Either::First(Either4::Second(Ok((n, meta)))) => {
-                let rx = axudp::decode_datagram(&dgram_buf[..n]);
-                match rx.frame {
-                    Some(frame) => received = Some((frame, Link::Udp(meta.endpoint))),
-                    None => defmt::warn!(
-                        "axudp: {=usize} bytes from {:?} rejected (fcs_valid={=bool})",
-                        n,
-                        meta.endpoint,
-                        rx.fcs_valid
-                    ),
-                }
-            }
-            Either::First(Either4::Second(Err(e))) => {
-                defmt::warn!("axudp: recv error {:?}", e);
-            }
-            Either::First(Either4::Third(())) => {
+            Either4::Third(()) => {
                 // One or more peer timers hit their deadline: post the expiry
                 // events into the owning sessions and flush what they emit.
                 let now = Instant::now();
@@ -584,7 +507,7 @@ pub async fn task(
                     };
                     let expired = ps.timers.take_expired(now);
                     for id in expired {
-                        defmt::debug!("axudp: timer expiry ({=u8})", id as u8);
+                        defmt::debug!("node: timer expiry ({=u8})", id as u8);
                         let Some(event) = session::expiry_event(id) else {
                             // TM201 (the MDL XID retry timer): not a data-link
                             // event - the manager drives the peer's MDL machine,
@@ -595,18 +518,16 @@ pub async fn task(
                                     break;
                                 };
                                 let peer = ps.peer;
-                                let ep = ps.endpoint;
+                                let ep = ps.port;
                                 (sessions.tm201_expiry(peer, &mut ps.timers), ep)
                             };
-                            send_all(&socket, ep, frames).await;
+                            send_all(ep, frames).await;
                             continue;
                         };
                         drive(
                             &mut sessions,
                             &mut peers,
-                            &socket,
                             &heard,
-                            beacon_ep,
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
@@ -626,12 +547,11 @@ pub async fn task(
                     }
                 }
             }
-            Either::First(Either4::Fourth(ev)) => match ev {
+            Either4::Fourth(ev) => match ev {
                 RelayEvent::Connect(target) => {
                     match start_outbound(
                         &mut peers,
                         &heard,
-                        beacon_ep,
                         target,
                         my_call,
                         Role::TelnetRelay,
@@ -640,9 +560,7 @@ pub async fn task(
                             drive(
                                 &mut sessions,
                                 &mut peers,
-                                &socket,
                                 &heard,
-                                beacon_ep,
                                 my_call,
                                 &mut L4 {
                                     connector: &mut connector,
@@ -665,9 +583,7 @@ pub async fn task(
                         drive(
                             &mut sessions,
                             &mut peers,
-                            &socket,
                             &heard,
-                            beacon_ep,
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
@@ -683,15 +599,14 @@ pub async fn task(
                         .await;
                     }
                 }
+                RelayEvent::Flushed => {}
                 RelayEvent::Hangup => {
                     if let Some(i) = find_role(&peers, |r| matches!(r, Role::TelnetRelay)) {
                         peers[i].as_mut().expect("present").role = Role::None;
                         drive(
                             &mut sessions,
                             &mut peers,
-                            &socket,
                             &heard,
-                            beacon_ep,
                             my_call,
                             &mut L4 {
                                 connector: &mut connector,
@@ -716,30 +631,27 @@ pub async fn task(
 
                 // READ-ONLY NET/ROM TAP: every frame, BEFORE the address filter,
                 // so NODES broadcasts (addressed to "NODES", not us) are heard.
-                let port = match link {
-                    Link::Udp(_) => port_id,
-                    Link::Rf => rf_port_id,
-                };
-                let outcome = session::observe_inbound(&mut netrom, &frame, my_call, port);
+                let outcome =
+                    session::observe_inbound(&mut netrom, &frame, my_call, link.netrom_id());
                 if let ObserveOutcome::Ingested { .. } = outcome {
                     defmt::info!(
-                        "axudp: NODES broadcast ingested ({=u32} destinations known)",
+                        "node: NODES broadcast ingested ({=u32} destinations known)",
                         netrom.destination_count() as u32
                     );
                     crate::mqtt::log("NODES broadcast ingested");
                 }
 
                 defmt::info!(
-                    "axudp: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B from {:?}",
+                    "node: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B on {=str}",
                     call_str(&frame.source.callsign, &mut src_buf),
                     call_str(&frame.destination.callsign, &mut dst_buf),
                     frame.control,
                     frame.info.len(),
-                    link
+                    link.name()
                 );
                 if frame.is_ui() && !frame.info.is_empty() {
                     if let Ok(text) = core::str::from_utf8(&frame.info) {
-                        defmt::info!("axudp: rx UI text: {=str}", text);
+                        defmt::info!("node: rx UI text: {=str}", text);
                     }
                 }
 
@@ -767,7 +679,7 @@ pub async fn task(
                     // other unclassified frame.
                     const XID: u8 = 0xAF;
                     if frame.control & !0x10 == XID && sessions.session_for(&peer).is_none() {
-                        defmt::info!("axudp: XID received, answering DM (v2.0 fallback)");
+                        defmt::info!("node: XID received, answering DM (v2.0 fallback)");
                         let sink = WireSink::new(my_call, peer, alloc::vec::Vec::new());
                         let dm = sink.build_frame(&FrameSpec::Unnumbered {
                             kind: UnnumberedKind::Dm,
@@ -775,7 +687,7 @@ pub async fn task(
                             pf: (frame.control & 0x10) != 0,
                             expedited: false,
                         });
-                        send_all(&socket, link, alloc::vec![dm.encode()]).await;
+                        send_all(link, alloc::vec![dm.encode()]).await;
                         continue;
                     }
 
@@ -783,23 +695,16 @@ pub async fn task(
                         continue;
                     };
                     let Some(i) = peer_slot(&mut peers, peer, my_call, link) else {
-                        defmt::warn!("axudp: peer table full, dropping session frame");
+                        defmt::warn!("node: peer table full, dropping session frame");
                         continue;
                     };
-                    // NB: the link endpoint is PINNED at slot creation (inbound:
-                    // the SABM's source; outbound: the heard-table/beacon entry)
-                    // and deliberately NOT floated per-datagram: BPQ AXIP nodes
-                    // can emit a link's frames from a different source socket
-                    // than the one we address (observed live with two LinBPQ
-                    // instances on one host: the bridge target's CTEXT arrived
-                    // from its sibling's port, and floating the endpoint sent
-                    // every reply to the wrong node).
+                    // The link's port is pinned at slot creation (inbound: the
+                    // port the SABM arrived on; outbound: where the target was
+                    // heard, or the first usable port).
                     drive(
                         &mut sessions,
                         &mut peers,
-                        &socket,
                         &heard,
-                        beacon_ep,
                         my_call,
                         &mut L4 {
                             connector: &mut connector,
@@ -816,9 +721,9 @@ pub async fn task(
 
                     // If that inbound frame was an INP3 L3RTT *probe*, the engine has
                     // queued our reflection; ship it NOW (same event-loop turn), not on
-                    // the next 10 s beacon tick: the peer times our reflection to measure
+                    // the next 10 s housekeeping tick: the peer times our reflection to measure
                     // its SNTT to us, so a tick-deferred reflection would inflate it by up
-                    // to BEACON_INTERVAL_SECS. (Originated probes + RIFs stay on the tick;
+                    // to HOUSEKEEPING_TICK_SECS. (Originated probes + RIFs stay on the tick;
                     // only the reflection is latency-critical.) The inbound `drive` has
                     // returned, so `inp3`/`peers`/`sessions` are free to reborrow here.
                     let reflections = match inp3.as_mut() {
@@ -830,9 +735,7 @@ pub async fn task(
                             drive(
                                 &mut sessions,
                                 &mut peers,
-                                &socket,
                                 &heard,
-                                beacon_ep,
                                 my_call,
                                 &mut L4 {
                                     connector: &mut connector,
@@ -866,6 +769,8 @@ enum RelayEvent {
     UserData([u8; 128], usize),
     /// The telnet user went away — disconnect the relay link.
     Hangup,
+    /// Some held-back peer bytes reached the telnet user; nothing else to do.
+    Flushed,
 }
 
 /// Drive one event into `peers[start]`'s session, then apply every cross-peer
@@ -874,9 +779,7 @@ enum RelayEvent {
 async fn drive(
     sessions: &mut session::Sessions,
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
-    socket: &UdpSocket<'_>,
-    heard: &[Option<(Callsign, Link)>; 8],
-    beacon_ep: Option<IpEndpoint>,
+    heard: &[Option<(Callsign, Port)>; 8],
     my_call: Callsign,
     l4: &mut L4<'_>,
     start: usize,
@@ -891,7 +794,7 @@ async fn drive(
     while let Some((i, ev)) = queue.pop_front() {
         guard += 1;
         if guard > 32 {
-            defmt::warn!("axudp: drive guard tripped, dropping remaining work");
+            defmt::warn!("node: drive guard tripped, dropping remaining work");
             break;
         }
         let Some(ps) = peers[i].as_mut() else {
@@ -902,8 +805,8 @@ async fn drive(
             t.neighbour(&ps.peer).is_some() || t.destination(&ps.peer).is_some()
         };
         let (frames, followups) = post_one(sessions, ps, ev, console_id, prompt, peer_is_node);
-        let ep = ps.endpoint;
-        send_all(socket, ep, frames).await;
+        let ep = ps.port;
+        send_all(ep, frames).await;
         if REBOOT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
             // Console REBOOT: give the wire a beat to drain, then reset.
             Timer::after_millis(250).await;
@@ -919,7 +822,6 @@ async fn drive(
                 } => match start_outbound(
                     peers,
                     heard,
-                    beacon_ep,
                     target,
                     // The node's own call — the convention real nodes use for
                     // outgoing links. NOT a per-user callsign: LinBPQ's AXIP
@@ -1057,8 +959,8 @@ struct L4<'a> {
 ///
 /// **Scope: AWARENESS ONLY** (as the C#/TS): the node learns + tells the time-space
 /// (probe / ingest / advertise / reset); `set_prefer_inp3_routes(false)` keeps quality
-/// forwarding unchanged, so the demo shows the time-route being LEARNED, not yet routed
-/// by. Driven by the firmware's beacon tick (no ambient timer — the core has none),
+/// forwarding unchanged, so time-routes are learned, not yet routed
+/// by. Driven by the firmware's housekeeping tick (no ambient timer; the core has none),
 /// exactly as the connector's circuit manager is.
 struct Inp3Host {
     engine: Inp3Engine,
@@ -1091,11 +993,11 @@ struct Inp3Round {
 }
 
 impl Inp3Host {
-    /// Construct the host with the demo cadences, the node call pinned as the engine's
+    /// Construct the host with the configured cadences, the node call pinned as the engine's
     /// local node (the L3 origin stamped into probes + the reflection self-test
     /// identity — the C# pins it at AttachPort; we pin it here since `my_call` is
     /// known). Options are validated for parity with the C#/TS constructors; on the
-    /// impossible event they don't validate we fall back to the canonical demo set
+    /// impossible event they don't validate we fall back to the canonical defaults
     /// rather than panic (a no_std host never unwraps on a config path).
     fn new(my_call: Callsign) -> Self {
         let options = NetRomInp3Options {
@@ -1106,13 +1008,13 @@ impl Inp3Host {
             positive_debounce_ms: INP3_POSITIVE_DEBOUNCE_MS,
             ..NetRomInp3Options::DEFAULT
         };
-        // Validate for symmetry with the C#/TS resolver; if (impossibly) the demo
+        // Validate for symmetry with the C#/TS resolver; if (impossibly) the configured
         // constants ever fall out of range, log and fall back rather than panic.
         let options = match options.validate() {
             Ok(()) => options,
             Err(reason) => {
                 defmt::warn!(
-                    "axudp: INP3 demo options invalid ({=str}) — using defaults",
+                    "node: INP3 options invalid ({=str}), using defaults",
                     reason
                 );
                 NetRomInp3Options {
@@ -1170,7 +1072,7 @@ impl Inp3Host {
                 netrom.ingest_rif(from, my_call, sntt, &rif, self.options.hop_limit as u32);
                 let mut name = [0u8; 16];
                 defmt::info!(
-                    "axudp: INP3 RIF ingested from {=str} ({=usize} RIP(s), {=u32} destinations known)",
+                    "node: INP3 RIF ingested from {=str} ({=usize} RIP(s), {=u32} destinations known)",
                     call_str(&from, &mut name),
                     rif.rips.len(),
                     netrom.destination_count() as u32
@@ -1247,9 +1149,8 @@ impl Inp3Host {
         // Drain neighbour-down events. The C# wires these to table.MarkNeighbourDown +
         // a DISC/re-establish; the firmware's `netrom` handle exposes no public
         // mark-neighbour-down / table-mut seam reachable from here (it lives on the
-        // routing table, not NetRomService, and "edit only axudp.rs" precludes adding
-        // one), so — per the brief — we log them and skip the teardown rather than
-        // invent one. The engine has already removed the neighbour's INP3 state.
+        // routing table, not NetRomService), so we log them and skip the teardown
+        // rather than invent one. The engine has already removed the neighbour's INP3 state.
         let downs = self.engine.take_neighbour_down();
 
         Inp3Round { l3rtt, rifs, downs }
@@ -1260,7 +1161,7 @@ impl Inp3Host {
     /// both INLINE right after an inbound L3RTT (so a reflection ships within the same
     /// event-loop turn — the peer times our reflection, so deferring it to the next
     /// `tick_round` would inflate its measured SNTT to us by up to one
-    /// `BEACON_INTERVAL_SECS`) and from `tick_round` itself (for originated probes).
+    /// `HOUSEKEEPING_TICK_SECS`) and from `tick_round` itself (for originated probes).
     /// Idempotent: a no-op `Vec` when the outbox is empty.
     fn take_outbound_l3rtt(&mut self) -> Vec<(Callsign, Vec<u8>)> {
         self.engine
@@ -1286,7 +1187,7 @@ fn service_l4(
     for conn in l4.connector.take_incoming_connections() {
         let mut name = [0u8; 16];
         defmt::info!(
-            "axudp: NET/ROM circuit up from {=str} — attaching console",
+            "node: NET/ROM circuit up from {=str}, attaching console",
             call_str(&conn.peer, &mut name)
         );
         if let Some(slot) = l4.circuits.iter_mut().find(|c| c.is_none()) {
@@ -1297,7 +1198,7 @@ fn service_l4(
             let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
             l4.connector.write(table, &conn, &banner, now_ms());
         } else {
-            defmt::warn!("axudp: circuit table full, disconnecting");
+            defmt::warn!("node: circuit table full, disconnecting");
             l4.connector.disconnect(table, &conn, now_ms());
         }
     }
@@ -1351,7 +1252,7 @@ fn service_l4(
                 }
             }
             CircuitEvent::Closed(_reason) => {
-                defmt::info!("axudp: NET/ROM circuit closed");
+                defmt::info!("node: NET/ROM circuit closed");
                 for slot in l4.circuits.iter_mut() {
                     if matches!(slot, Some(c) if c.conn.key == key) {
                         *slot = None;
@@ -1367,7 +1268,7 @@ fn service_l4(
         } else {
             let mut name = [0u8; 16];
             defmt::warn!(
-                "axudp: no L2 session to interlink neighbour {=str}, dropping datagram",
+                "node: no L2 session to interlink neighbour {=str}, dropping datagram",
                 call_str(&send.neighbour, &mut name)
             );
         }
@@ -1375,7 +1276,7 @@ fn service_l4(
 }
 
 /// Proactively (re)establish an L2 link to every known NET/ROM neighbour we
-/// have a heard endpoint for and no live session with. Each link is an
+/// have heard on a port and no live session with. Each link is an
 /// [`Role::Interlink`]; the connector ships its L4 datagrams over them. A
 /// neighbour with no session was either never up or was torn down — either way
 /// we re-SABM it here (the periodic cadence is the reconnect backoff).
@@ -1383,9 +1284,7 @@ fn service_l4(
 async fn ensure_interlinks(
     sessions: &mut session::Sessions,
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
-    socket: &UdpSocket<'_>,
-    heard: &[Option<(Callsign, Link)>; 8],
-    beacon_ep: Option<IpEndpoint>,
+    heard: &[Option<(Callsign, Port)>; 8],
     my_call: Callsign,
     netrom: &mut session::NetRom,
     connector: &mut NetRomConnector,
@@ -1405,21 +1304,19 @@ async fn ensure_interlinks(
             continue; // ourselves, or already linked
         }
         if heard_lookup(heard, &nbr).is_none() {
-            continue; // no endpoint to reach it — wait until we hear it
+            continue; // not heard yet: wait until we hear it on a port
         }
         // Err from start_outbound (busy/no-slot) is fine; try again next pass.
-        if let Ok(i) = start_outbound(peers, heard, beacon_ep, nbr, my_call, Role::Interlink) {
+        if let Ok(i) = start_outbound(peers, heard, nbr, my_call, Role::Interlink) {
             let mut name = [0u8; 16];
             defmt::info!(
-                "axudp: bringing up interlink to {=str}",
+                "node: bringing up interlink to {=str}",
                 call_str(&nbr, &mut name)
             );
             drive(
                 sessions,
                 peers,
-                socket,
                 heard,
-                beacon_ep,
                 my_call,
                 &mut L4 {
                     connector,
@@ -1438,11 +1335,10 @@ async fn ensure_interlinks(
 }
 
 /// Create the peer slot + role for an outbound connect to `target`, resolving
-/// its link: where it was last heard, else the radio port, else the AXUDP peer.
+/// its port: where it was last heard, else the first usable port.
 fn start_outbound(
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
-    heard: &[Option<(Callsign, Link)>; 8],
-    beacon_ep: Option<IpEndpoint>,
+    heard: &[Option<(Callsign, Port)>; 8],
     target: Callsign,
     local: Callsign,
     role: Role,
@@ -1450,15 +1346,10 @@ fn start_outbound(
     if find_peer(peers, &target).is_some() {
         return Err("target is busy (session already up)");
     }
-    // Where to dial: the port the target was last heard on; otherwise the air,
-    // when the radio port is up (a station need not have been heard to be
-    // called over RF); otherwise the configured AXUDP peer.
-    let rf = rf::usable().then_some(Link::Rf);
-    let Some(ep) = heard_lookup(heard, &target)
-        .or(rf)
-        .or(beacon_ep.map(Link::Udp))
-    else {
-        return Err("target not heard, and no radio port or AXUDP peer to try");
+    // Where to dial: the port the target was last heard on; otherwise the first
+    // usable port (a station need not have been heard to be called over the air).
+    let Some(ep) = heard_lookup(heard, &target).or_else(ports::first_usable) else {
+        return Err("no radio port is up");
     };
     let Some(i) = peer_slot(peers, target, local, ep) else {
         return Err("no free session slot");
@@ -1466,7 +1357,7 @@ fn start_outbound(
     let mut name = [0u8; 16];
     let mut lname = [0u8; 16];
     defmt::info!(
-        "axudp: outbound connect to {=str} (as {=str}) at {:?}",
+        "node: outbound connect to {=str} (as {=str}) at {:?}",
         call_str(&target, &mut name),
         call_str(&local, &mut lname),
         ep
@@ -1499,7 +1390,7 @@ fn peer_slot(
     peers: &mut [Option<PeerState>],
     peer: Callsign,
     local: Callsign,
-    endpoint: Link,
+    port: Port,
 ) -> Option<usize> {
     if let Some(i) = find_peer(peers, &peer) {
         return Some(i);
@@ -1509,7 +1400,7 @@ fn peer_slot(
         peer,
         local,
         timers: session::EmbassyTimers::new(),
-        endpoint,
+        port,
         role: Role::None,
     });
     Some(free)
@@ -1525,25 +1416,16 @@ fn reap(sessions: &mut session::Sessions, peers: &mut [Option<PeerState>], i: us
     }
 }
 
-/// Send each wire frame over the peer's link: to an AXUDP endpoint with the FCS
-/// appended, or to the radio port (the serial task KISS-frames it).
-async fn send_all(socket: &UdpSocket<'_>, link: Link, frames: Vec<Vec<u8>>) {
+/// Queue each wire frame for transmission on `port`.
+async fn send_all(port: Port, frames: Vec<Vec<u8>>) {
     for wire in frames {
-        match link {
-            Link::Udp(ep) => {
-                let dgram = axudp::append_fcs(wire);
-                if let Err(e) = socket.send_to(&dgram, ep).await {
-                    defmt::warn!("axudp: session tx error {:?}", e);
-                }
-            }
-            Link::Rf => rf::send(wire).await,
-        }
+        ports::send(port, wire).await;
     }
 }
 
-/// Record `call → endpoint` in the heard table (update in place, else first
+/// Record `call -> port` in the heard table (update in place, else first
 /// free slot, else overwrite the oldest by rotation).
-fn heard_update(heard: &mut [Option<(Callsign, Link)>; 8], call: Callsign, ep: Link) {
+fn heard_update(heard: &mut [Option<(Callsign, Port)>; 8], call: Callsign, ep: Port) {
     if let Some(e) = heard.iter_mut().flatten().find(|(c, _)| *c == call) {
         e.1 = ep;
         return;
@@ -1556,11 +1438,11 @@ fn heard_update(heard: &mut [Option<(Callsign, Link)>; 8], call: Callsign, ep: L
     heard[7] = Some((call, ep));
 }
 
-/// Resolve a callsign to its last-heard endpoint.
+/// Resolve a callsign to the port it was last heard on.
 fn heard_lookup(
-    heard: &[Option<(Callsign, Link)>; 8],
+    heard: &[Option<(Callsign, Port)>; 8],
     call: &Callsign,
-) -> Option<Link> {
+) -> Option<Port> {
     heard
         .iter()
         .flatten()
@@ -1607,13 +1489,13 @@ fn post_one(
                         // will speak PID 0xCF). No console, no banner — a 0xF0
                         // banner at a node's interlink is garbage to it.
                         defmt::info!(
-                            "axudp: interlink L2 up from node {=str}",
+                            "node: interlink L2 up from node {=str}",
                             call_str(&peer, &mut name)
                         );
                         ps.role = Role::Interlink;
                     } else {
                         defmt::info!(
-                            "axudp: AX.25 session up from {=str} — attaching console",
+                            "node: AX.25 session up from {=str}, attaching console",
                             call_str(&peer, &mut name)
                         );
                         ps.role = Role::Console(LineAssembler::default());
@@ -1629,13 +1511,13 @@ fn post_one(
                 }
                 DataLinkSignal::ConnectConfirm => match ps.role {
                     Role::TelnetRelay => {
-                        defmt::info!("axudp: relay link up");
+                        defmt::info!("node: relay link up");
                         relay::STATUS.signal(RelayStatus::Connected);
                     }
                     Role::Bridge { .. } => {
                         let mut name = [0u8; 16];
                         defmt::info!(
-                            "axudp: bridge link to {=str} is up",
+                            "node: bridge link to {=str} is up",
                             call_str(&peer, &mut name)
                         );
                         // The target's own banner flows over the bridge next.
@@ -1643,15 +1525,26 @@ fn post_one(
                     Role::Interlink => {
                         let mut name = [0u8; 16];
                         defmt::info!(
-                            "axudp: interlink to {=str} established",
+                            "node: interlink to {=str} established",
                             call_str(&peer, &mut name)
                         );
                     }
                     _ => {}
                 },
                 DataLinkSignal::DataIndication(pid, info) if pid == PID_NETROM => {
-                    // An interlink datagram (NET/ROM L3/L4) — never console
-                    // text. Routed to the connector by drive().
+                    // An interlink datagram (NET/ROM L3/L4), never console
+                    // text. Routed to the connector by drive(). A console user
+                    // never sends PID 0xCF: a node that connected before we
+                    // knew it was one (we had not heard its NODES yet) got a
+                    // console; it is an interlink.
+                    if matches!(ps.role, Role::Console(_)) {
+                        let mut name = [0u8; 16];
+                        defmt::info!(
+                            "node: {=str} speaks NET/ROM, treating its link as an interlink",
+                            call_str(&peer, &mut name)
+                        );
+                        ps.role = Role::Interlink;
+                    }
                     followups.push(FollowUp::NetRom {
                         neighbour: peer,
                         datagram: info,
@@ -1724,17 +1617,13 @@ fn post_one(
                             data: info,
                         });
                     }
-                    Role::TelnetRelay => {
-                        if relay::AX_TO_USER.try_write(&info).is_err() {
-                            defmt::warn!("axudp: relay pipe full, dropping {=usize}B", info.len());
-                        }
-                    }
+                    Role::TelnetRelay => relay::to_user(&info),
                     Role::None | Role::Interlink => {}
                 },
                 DataLinkSignal::DisconnectIndication | DataLinkSignal::DisconnectConfirm => {
                     let mut name = [0u8; 16];
                     defmt::info!(
-                        "axudp: AX.25 session with {=str} closed",
+                        "node: AX.25 session with {=str} closed",
                         call_str(&peer, &mut name)
                     );
                     match core::mem::replace(&mut ps.role, Role::None) {
@@ -1747,7 +1636,7 @@ fn post_one(
                 }
                 DataLinkSignal::UnitDataIndication(..) => {}
                 DataLinkSignal::ErrorIndication(code) => {
-                    defmt::warn!("axudp: DL error indication {=str}", code);
+                    defmt::warn!("node: DL error indication {=str}", code);
                 }
             }
         }

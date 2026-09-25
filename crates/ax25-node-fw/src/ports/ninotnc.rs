@@ -1,34 +1,36 @@
-#![allow(dead_code)] // spawned now; some core modem setters (ackmode) stay unused until a session supervisor drives outbound
+#![allow(dead_code)] // some core modem setters (ackmode) are not used by this driver
 
-//! Capability 3 — KISS-over-serial to a NinoTNC.
+//! Port 0: the NinoTNC on the serial link, the node's radio.
 //!
 //! Ports `Packet.Kiss.Serial.KissSerialModem` + the NinoTNC overlay onto an
 //! `embassy_rp` UART. The KISS framing/codec, the [`SerialKissModem`] seam, the
 //! ACKMODE/SETHW/parameter helpers, and the NinoTNC mode/TX-Test extensions are all
-//! in [`ax25_node_core::kiss`] (host-tested) — this task only supplies the *byte
+//! in [`ax25_node_core::kiss`] (host-tested); this task supplies the *byte
 //! source*: a [`ByteStream`] over the UART, which [`SerialKissModem`] drives exactly
 //! as the C# modem drives its `SerialPort`.
 //!
-//! ## Hardware note (research §5.3 / capability 3 caveat)
+//! ## Hardware
 //!
 //! The RP2040 cannot be a USB *host* and a USB-serial device simultaneously, so we
-//! do NOT talk to the NinoTNC's USB chip. Instead we wire the Pico's UART directly
-//! to the NinoTNC's UART pins (bypassing its USB-serial bridge) — TX→RX, RX→TX, GND,
-//! at the NinoTNC's KISS baud ([`ax25_node_core::kiss::ninotnc::DEFAULT_BAUD`] =
-//! 57 600 8N1). **UART1 on GP20 (TX) / GP21 (RX)** — the NinoTNC link pins on the
-//! NinoBLE Rev5 carrier board (docs/HARDWARE-NINOBLE.md), our reference hardware.
+//! do NOT talk to the NinoTNC's USB chip. Instead the Pico's UART is wired directly
+//! to the NinoTNC's UART pins (J5, bypassing its USB-serial bridge): TX to RX, RX
+//! to TX, GND, at the NinoTNC's KISS baud
+//! ([`ax25_node_core::kiss::ninotnc::DEFAULT_BAUD`] = 57 600 8N1). **UART1 on GP20
+//! (TX) / GP21 (RX)**, the NinoTNC link pins on the NinoBLE Rev5 carrier board
+//! (docs/HARDWARE-NINOBLE.md), our reference hardware.
 //!
-//! ## The setup surface
+//! ## What this driver does
 //!
-//! This task is the only thing that talks to the TNC. At start it sends the
-//! KISS parameters and operating mode saved on the node (the `/tnc` web page or
-//! the console keys `TNC_MODE` / `TXDELAY` / `PERSIST` / `SLOTTIME` / `TXTAIL` /
-//! `DUPLEX`), verifying the mode by GETALL readback. After that it takes
-//! commands from the web page through [`crate::tnc::CMD`], and logs every frame
-//! and TNC report to the monitor ([`crate::tnc::MONITOR`]).
-//!
-//! There is no periodic beacon on this port: a real radio is attached, and the
-//! page's test-frame button covers the bring-up need the old 10 s beacon served.
+//! It is the only thing that talks to the TNC. At start it asks for the TNC's
+//! report (GETALL) and uses the TNC only once it reports supported firmware
+//! (3.44 / 4.44 or later): then it sends the KISS parameters and operating mode
+//! saved on the node (the `/tnc` web page or the console keys `TNC_MODE` /
+//! `TXDELAY` / `PERSIST` / `SLOTTIME` / `TXTAIL` / `DUPLEX`; the mode verified by
+//! GETALL readback) and opens the port to traffic ([`crate::ports`]): heard
+//! AX.25 frames go to the node task, and the node task's frames go on the air.
+//! It takes setup commands from the web page ([`crate::tnc::CMD`]), updates the
+//! TNC's firmware through its bootloader, and logs every frame and TNC report to
+//! the monitor ([`crate::tnc::MONITOR`]).
 
 use ax25_node_core::ax25::{Callsign, PID_NO_LAYER3};
 use ax25_node_core::kiss::ninotnc::flash::{
@@ -54,11 +56,11 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use static_cell::StaticCell;
 
-use crate::config::KissSerialConfig;
+use crate::config::NinoTncConfig;
 use crate::config_store::TncSettings;
 use crate::tnc::{self, FlashStatus, TncCommand};
 use crate::tnc_image::{self, LineReader};
-use crate::transports::{call_str, rf, ui_frame};
+use crate::ports::{self, call_str, ui_frame, Port};
 
 bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
@@ -100,11 +102,11 @@ pub async fn task(
     uart: Peri<'static, UART1>,
     tx_pin: Peri<'static, PIN_20>,
     rx_pin: Peri<'static, PIN_21>,
-    cfg: KissSerialConfig,
+    cfg: NinoTncConfig,
     my_call: Callsign,
 ) {
     defmt::info!(
-        "kiss-serial: UART1 GP20/21 @ {} baud (NinoTNC direct UART)",
+        "ninotnc: UART1 GP20/21 @ {} baud (NinoTNC direct UART)",
         cfg.baud
     );
 
@@ -130,7 +132,7 @@ pub async fn task(
     send_get_all(&mut modem).await;
 
     // The pump: wake on an inbound KISS frame, a command from the web page, the
-    // mode change's next deadline, a frame from the session task to transmit, or
+    // mode change's next deadline, a frame from the node task to transmit, or
     // the retry timer for an unanswered GETALL. `read_frame` is cancel-safe (its
     // only await is the UART read; the decode state lives in the modem), so
     // losing the race drops no bytes.
@@ -149,7 +151,7 @@ pub async fn task(
             modem.read_frame(),
             tnc::CMD.receive(),
             timer,
-            rf::TX.receive(),
+            ports::take_tx(Port::NINOTNC),
         )
         .await
         {
@@ -172,7 +174,7 @@ pub async fn task(
                 // read error or zero-read we yield and retry rather than spin.
                 Ok(None) => Timer::after_millis(10).await,
                 Err(e) => {
-                    defmt::warn!("kiss-serial read error: {}", defmt::Debug2Format(&e));
+                    defmt::warn!("ninotnc: read error: {}", defmt::Debug2Format(&e));
                     Timer::after_millis(100).await;
                 }
             },
@@ -203,7 +205,7 @@ pub async fn task(
                 }
                 TncCommand::Refresh => send_get_all(&mut modem).await,
                 TncCommand::UpdateFirmware => {
-                    rf::set_usable(false);
+                    ports::set_usable(Port::NINOTNC, false);
                     let updated = run_update(&mut modem, &mut mode_job).await;
                     if updated {
                         // Start again from the top: the next report says which
@@ -211,7 +213,7 @@ pub async fn task(
                         link = LinkState::default();
                         send_get_all(&mut modem).await;
                     }
-                    rf::set_usable(link.supported);
+                    ports::set_usable(Port::NINOTNC, link.supported);
                 }
             },
             Either4::Third(()) => {
@@ -231,10 +233,10 @@ pub async fn task(
                 }
             }
             Either4::Fourth(wire) => {
-                // A frame from the session task. `rf::send` already checked the
+                // A frame from the node task. `ports::send` already checked the
                 // port was usable when it queued; check again in case that
                 // changed since.
-                if rf::usable() {
+                if ports::usable(Port::NINOTNC) {
                     send_wire(&mut modem, &wire).await;
                 }
             }
@@ -280,7 +282,7 @@ impl LinkState {
         };
         let was = self.supported;
         self.supported = version.is_supported();
-        rf::set_usable(self.supported);
+        ports::set_usable(Port::NINOTNC, self.supported);
         if !self.supported && self.warned != Some(version) {
             self.warned = Some(version);
             tnc::log_with(Direction::Info, |w| {
@@ -299,7 +301,7 @@ use it (no settings, no traffic) until it is updated on this page.",
     }
 }
 
-/// Handle one inbound KISS frame: the monitor, the hand-off to the session task,
+/// Handle one inbound KISS frame: the monitor, the hand-off to the node task,
 /// and the shared TNC state. Returns the TNC's status when the frame was a
 /// report (a GETALL reply, the periodic beacon, or the TX-test diagnostic).
 fn handle_inbound(frame: &ax25_node_core::kiss::Frame) -> Option<NinoTncStatusFrame> {
@@ -307,10 +309,10 @@ fn handle_inbound(frame: &ax25_node_core::kiss::Frame) -> Option<NinoTncStatusFr
         NinoTncInboundEvent::Generic(InboundEvent::Ax25 { ax25, .. }) => {
             tnc::with_state(|s| s.rx_frames = s.rx_frames.wrapping_add(1));
             tnc::log_with(Direction::Rx, |w| write_frame(&ax25, w));
-            // To the session task: sessions, the console, NET/ROM (including the
+            // To the node task: sessions, the console, NET/ROM (including the
             // read-only NODES tap, which sees every frame before address
             // filtering). Dropped while the TNC is not usable.
-            rf::deliver(ax25);
+            ports::deliver(Port::NINOTNC, ax25);
             None
         }
         NinoTncInboundEvent::TxTestDiagnostic { raw, diagnostic } => {
@@ -396,7 +398,7 @@ async fn send_wire(modem: &mut Modem, wire: &[u8]) {
             }
         }
         Err(e) => {
-            defmt::warn!("kiss-serial: send failed: {}", defmt::Debug2Format(&e));
+            defmt::warn!("ninotnc: send failed: {}", defmt::Debug2Format(&e));
             tnc::log(Direction::Info, "Send to the TNC failed (serial write error)");
         }
     }
@@ -412,7 +414,7 @@ async fn send_control(
     match modem.send_kiss(command, payload).await {
         Ok(()) => tnc::log_with(Direction::Info, describe),
         Err(e) => {
-            defmt::warn!("kiss-serial: command failed: {}", defmt::Debug2Format(&e));
+            defmt::warn!("ninotnc: command failed: {}", defmt::Debug2Format(&e));
             tnc::log(Direction::Info, "Send to the TNC failed (serial write error)");
         }
     }

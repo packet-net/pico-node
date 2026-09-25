@@ -51,9 +51,9 @@ const TAG_GRID: u8 = 3;
 const TAG_HOSTNAME: u8 = 4;
 const TAG_WIFI_SSID: u8 = 5;
 const TAG_WIFI_PASS: u8 = 6;
-const TAG_BEACON_TARGET: u8 = 7;
+// 7 and 9: retired with AXUDP (beacon target, listen port). Never reuse; a
+// stored record that still has them is read fine (unknown tags are skipped).
 const TAG_KISS_TCP_TARGET: u8 = 8;
-const TAG_AXUDP_PORT: u8 = 9;
 const TAG_TELNET_PORT: u8 = 10;
 const TAG_NODES_INTERVAL: u8 = 11;
 const TAG_ORIGINATE: u8 = 12;
@@ -81,9 +81,7 @@ pub struct StoredConfig {
     pub hostname: Option<heapless::String<24>>,
     pub wifi_ssid: Option<heapless::String<32>>,
     pub wifi_pass: Option<heapless::String<64>>,
-    pub beacon_target: Option<heapless::String<24>>,
     pub kiss_tcp_target: Option<heapless::String<24>>,
-    pub axudp_port: Option<u16>,
     pub telnet_port: Option<u16>,
     pub nodes_interval_secs: Option<u32>,
     pub originate: Option<bool>,
@@ -139,11 +137,7 @@ impl StoredConfig {
         put_str_field!(TAG_HOSTNAME, self.hostname);
         put_str_field!(TAG_WIFI_SSID, self.wifi_ssid);
         put_str_field!(TAG_WIFI_PASS, self.wifi_pass);
-        put_str_field!(TAG_BEACON_TARGET, self.beacon_target);
         put_str_field!(TAG_KISS_TCP_TARGET, self.kiss_tcp_target);
-        if let Some(v) = self.axudp_port {
-            put(TAG_AXUDP_PORT, &v.to_le_bytes());
-        }
         if let Some(v) = self.telnet_port {
             put(TAG_TELNET_PORT, &v.to_le_bytes());
         }
@@ -201,11 +195,7 @@ impl StoredConfig {
                 TAG_HOSTNAME => out.hostname = s(data),
                 TAG_WIFI_SSID => out.wifi_ssid = s(data),
                 TAG_WIFI_PASS => out.wifi_pass = s(data),
-                TAG_BEACON_TARGET => out.beacon_target = s(data),
                 TAG_KISS_TCP_TARGET => out.kiss_tcp_target = s(data),
-                TAG_AXUDP_PORT if len == 2 => {
-                    out.axudp_port = Some(u16::from_le_bytes([data[0], data[1]]))
-                }
                 TAG_TELNET_PORT if len == 2 => {
                     out.telnet_port = Some(u16::from_le_bytes([data[0], data[1]]))
                 }
@@ -501,22 +491,17 @@ fn render_show(p: &StoredConfig) -> String {
             None => String::from("(default: factory/build-env)"),
         }
     );
-    out += &format!("  BEACON_TARGET  {}\n", s_or(&p.beacon_target, "build-env"));
     out += &format!(
         "  KISS_TCP       {}\n",
         s_or(&p.kiss_tcp_target, "build-env")
     );
-    out += &match p.axudp_port {
-        Some(v) => format!("  AXUDP_PORT     {v}\n"),
-        None => String::from("  AXUDP_PORT     (default: 10093)\n"),
-    };
     out += &match p.telnet_port {
         Some(v) => format!("  TELNET_PORT    {v}\n"),
         None => String::from("  TELNET_PORT    (default: 8023)\n"),
     };
     out += &match p.nodes_interval_secs {
         Some(v) => format!("  NODES_INTERVAL {v}\n"),
-        None => String::from("  NODES_INTERVAL (default: 300)\n"),
+        None => String::from("  NODES_INTERVAL (default: 3600)\n"),
     };
     out += &match p.originate {
         Some(v) => format!("  ORIGINATE      {v}\n"),
@@ -686,15 +671,7 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
         "HOSTNAME" => put(&mut p.hostname, value, "HOSTNAME"),
         "WIFI_SSID" => put(&mut p.wifi_ssid, value, "WIFI_SSID"),
         "WIFI_PASS" => put(&mut p.wifi_pass, value, "WIFI_PASS"),
-        "BEACON_TARGET" => put(&mut p.beacon_target, value, "BEACON_TARGET"),
         "KISS_TCP" => put(&mut p.kiss_tcp_target, value, "KISS_TCP"),
-        "AXUDP_PORT" => match value.parse::<u16>() {
-            Ok(v) => {
-                p.axudp_port = Some(v);
-                String::from("AXUDP_PORT staged. SAVE to persist.")
-            }
-            Err(_) => String::from("not a port number"),
-        },
         "TELNET_PORT" => match value.parse::<u16>() {
             Ok(v) => {
                 p.telnet_port = Some(v);

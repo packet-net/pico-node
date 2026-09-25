@@ -13,7 +13,7 @@
 //! because carrier-sense went dark (mirrors `CarrierSenseGate`'s `ChannelBusy !=
 //! true` fast path). The [`super::manager::SessionManager`] holds *no* source by
 //! default, which is the always-clear degenerate gate — so a node on a full-duplex
-//! AXUDP / KISS-TCP wire keys up immediately, exactly as before. The seam touches
+//! wire (KISS-TCP to net-sim) keys up immediately, exactly as before. The seam touches
 //! only the *physical* keyup grant; it never alters an SDL transition.
 //!
 //! ## `no_std` note

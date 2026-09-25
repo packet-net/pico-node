@@ -26,8 +26,8 @@ the NinoBLE Rev5 firmware (`firmware/config.h`, `main_aprs.c`, `oled.c`,
 
 | Function | RP2040 GPIO | Peripheral | pico-node use |
 |---|---|---|---|
-| NinoTNC UART **TX** | **GP20** | UART1 TX | `transports::kiss_serial` (57600 8N1, KISS) |
-| NinoTNC UART **RX** | **GP21** | UART1 RX | `transports::kiss_serial` |
+| NinoTNC UART **TX** | **GP20** | UART1 TX | `ports::ninotnc` (57600 8N1, KISS) |
+| NinoTNC UART **RX** | **GP21** | UART1 RX | `ports::ninotnc` |
 | OLED **SDA** | **GP4** | I2C0 SDA | `oled` status display (SSD1306 @ 0x3C) |
 | OLED **SCL** | **GP5** | I2C0 SCL | `oled` |
 | Passthrough switch | **GP6** | GPIO in | (optional) boot-time NinoTNC-flash passthrough |
@@ -39,7 +39,7 @@ No conflicts: the CYW43 PIO-SPI pins (23/24/25/29) and the above are disjoint.
 
 ## What changes in pico-node
 
-1. **`kiss_serial` → UART1 on GP20/GP21** (was the planning default UART0 GP0/GP1).
+1. **The NinoTNC port (`ports::ninotnc`, formerly `kiss_serial`) on UART1 GP20/GP21** (was the planning default UART0 GP0/GP1).
    This is the pin-compat change; the KISS codec + NinoTNC mode catalog are
    already host-tested.
 2. **`oled` status module** — SSD1306 over I2C0 GP4/GP5, mirroring the NinoBLE
@@ -51,13 +51,14 @@ No conflicts: the CYW43 PIO-SPI pins (23/24/25/29) and the above are disjoint.
 
 ## Verification status
 
-The pin map + `kiss_serial` UART selection are **code-complete and build-clean**
-but **not yet hardware-verified** — the NinoBLE board + a NinoTNC + a radio are
-not attached to the current dev rig (the bare Pico W on the bench has no NinoTNC
-or OLED). Closing HW-BRINGUP Gate 6 (KISS-over-serial to a real NinoTNC) and
-lighting the OLED both wait on wiring Tom's board to a probe-equipped machine.
-The OLED init mirrors the NinoBLE firmware's known-good sequence for this exact
-panel, so first-light risk is low.
+**The NinoTNC link is verified on air (2026-09-25):** a Pico W on the NinoTNC's
+J5 (USB chip out of circuit) set the TNC's mode by SETHW and read it back,
+updated the TNC from firmware 3.39 to 3.44 through its bootloader, and carried
+a connected-mode session with LinBPQ (M0LTE via QtTermTCP): UA, the console
+banner, and multi-frame replies. See docs/PLAN.md §11 for the runs.
+
+The OLED path is still unverified on this board; its init mirrors the NinoBLE
+firmware's known-good sequence for this exact panel.
 
 ## Setting up the NinoTNC from the web page
 
@@ -65,7 +66,7 @@ Browse to the node and follow **NinoTNC setup and monitor** (or go straight to `
 
 **Firmware 3.44 / 4.44 or later is required.** At start the node asks the TNC for its report (GETALL, repeated every 10 s until it answers) and uses the TNC only once it has reported supported firmware: then it sends the saved settings and opens the radio port. An older TNC gets no settings and no traffic; the page shows a banner and only the firmware update.
 
-The radio port is a full node port: connected-mode sessions (SABM/UA, the node console, `C` onward to any port), XID answered with DM so v2.2 callers fall back to SABM, NET/ROM (NODES heard and originated, L4 circuits, interlinks), all shared with the AXUDP port and one routing table.
+The radio port is a full node port: connected-mode sessions (SABM/UA, the node console, `C` onward to any port), XID answered with DM so v2.2 callers fall back to SABM, NET/ROM (NODES heard and originated, L4 circuits, interlinks), with one routing table for the node.
 
 - **Operating mode.** Set all four MODE DIP switches on the NinoTNC to 1 (on), pick the mode and press **Set mode**. The node sends KISS SETHW, waits 1.5 s, asks the TNC which mode it is running, and retries up to three times, so the line under the button ends with either "confirmed by the TNC" or a plain reason (for example the DIP switch position it read). The node remembers the mode and sends it at every start without writing the TNC's own memory; tick **Also store it in the TNC's own memory** only if the TNC should keep it when used without the node.
 - **KISS parameters.** TXDELAY, PERSIST, SLOTTIME, TXTAIL and duplex. TXDELAY is only used when the TNC's TX DELAY knob is fully anticlockwise (zero); otherwise the knob sets it. Values are saved on the node and sent at every start. The console keys `TNC_MODE`, `TXDELAY`, `PERSIST`, `SLOTTIME`, `TXTAIL` and `DUPLEX` set the same things (`SET TXDELAY none` goes back to the TNC's own value).

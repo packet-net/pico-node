@@ -19,6 +19,8 @@ This plan was produced **before the hardware arrives** (Pico W + official Raspbe
 
 ## 1. The parity goal (what we are mirroring)
 
+> **2026-09-25: radio-first.** The four-capability shape below is the original plan. The node is now radio-first: the NinoTNC radio port is its link, KISS-over-TCP is an optional second radio port, telnet and the web panel are administration only, and AXUDP (capability 1) has been removed. The current shape is in §2 and the §11 entry of that date.
+
 A Rust firmware for the Pico W providing the four capabilities of the C# node host:
 
 | # | Capability | C# source it mirrors | This workspace |
@@ -34,6 +36,24 @@ A Rust firmware for the Pico W providing the four capabilities of the C# node ho
 ---
 
 ## 2. Architecture summary
+
+**Current (2026-09-25, radio-first):**
+
+```
+  UART1 (GP20/21) -- ports::ninotnc  (port 0: NinoTNC; TNC setup, monitor, TNC firmware update)
+  TCP (optional)  -- ports::kiss_tcp (port 1: net-sim / remote KISS TNC)
+                          |  ports::RX (heard frames, tagged by port)
+                          v  ports::send / take_tx (frames to transmit, per port)
+                     node  (one task: SDL sessions, AX.25 console, `C` onward,
+                            NET/ROM: one routing table, NODES, L4, interlinks, INP3)
+                          ^
+                          |  admin::relay (telnet `C <call>`)
+  WiFi (admin only) -- ota::http_task (web panel: config, /tnc page, node OTA)
+                    -- admin::telnet (sysop console)   -- mdns, mqtt
+  UART0 (GP0/1)   -- tait (Tait CCDI radio control)
+```
+
+The original planning diagram follows.
 
 ```
                  ┌───────────────────────────────────────────────────────┐
@@ -393,3 +413,9 @@ None of these blocked the **87 passing host tests** or the `no_std` build — th
 - **2026-09-25 - Stream writes framed to N1.** Third bench run: M0LTE connected over RF (UA and the banner arrived), but the reply to `?` (400+ bytes) went out as ONE I-frame; LinBPQ (PACLEN 256) never accepted it, the node polled and retransmitted it until N2 and sent DM. The node posted each console reply as a single DL-DATA request and the session layer has no v2.2 segmenter, so an over-N1 write became an oversize frame (AXUDP peers had been tolerating it). `SessionManager::post_stream` now frames a byte stream into at-most-N1 I-frames, mirroring packet.net's `Ax25NodeConnection.WriteAsync`; the firmware uses it for console banners and replies, bridged and relayed data. NET/ROM datagrams still post as single SDUs. Two host tests (600 bytes -> three <=256-byte I-frames in order; a short write stays one frame). **Gates: 823 / 853 host tests, clippy clean, fw build + embedded-test ELF.**
 
 - **2026-09-25 - Onward connects over RF; radio monitor on the front page.** `C GB7RDG-2` from an RF console failed "no known endpoint": outbound connects resolved the target only from the 8-entry last-heard table (an AXUDP-era rule: over UDP an address is needed). `start_outbound` now tries the port the target was last heard on, then the radio port when usable (a station need not have been heard to be called over the air), then the AXUDP peer. `ensure_interlinks` still dials only neighbours it has heard, so nothing new is dialled unprompted. The panel's Radio section is now a live monitor (the `/tnc/poll` feed, TNC status line, frame counts), placed first under the node header.
+
+- **2026-09-25 - Radio-first restructure: AXUDP removed.** Tom: the node doesn't need AXUDP; restructure and rename as a radio-first node, keeping telnet and the web interface for admin. *(1) Shape.* `transports/` is gone. `node.rs` (was `transports/axudp.rs`) is the node task: sessions, the AX.25 console, `C` onward, NET/ROM (one routing table, NODES, L4, interlinks, INP3) and the telnet relay, for every radio **port**. `ports/` holds the port plumbing (`Port`, the shared RX channel, a TX queue and usable flag per port) and the drivers: `ports/ninotnc.rs` (port 0, was `transports/kiss_serial.rs`) and `ports/kiss_tcp.rs` (port 1, optional, now a real port with sessions instead of a listen-and-beacon task with its own routing table). `admin/` holds the telnet console and its connect relay; `tait.rs` the Tait CCDI control; `parse_endpoint` / `tcp_write_all` moved to `net.rs`. *(2) Removed.* The UDP socket, the AXUDP beacon, the endpoint table, config keys `AXUDP_PORT` / `BEACON_TARGET` (flash tags 7 and 9 retired, never reused; old records still load), `AXUDP_BEACON_TARGET`, the core `axudp` framing module (8 tests), `tools/axudp-harness.py`, `tools/linbpq-container` (AXIP only). The `axudp` vector set is declared out in `parity-manifest.toml`. *(3) Behaviour.* A station is dialled on the port it was last heard on, else the first usable port; NODES go out on every usable port; routes carry port id `radio` / `kiss-tcp` (flash-replayed routes `radio`). INP3 moved from its seconds-scale lab-demo cadences to packet.net's production defaults (L3RTT 60 s, RIF 300 s, reset 180 s, debounce 5 s), since every probe now goes on air. The console's port list reads `radio: NinoTNC on the serial link` (+ `kiss-tcp: <target>` when configured). **Gates: 815 host tests default / 845 `netrom-compress` (the removed module's 8 tests gone), clippy clean, no_std build, fw clippy/build + embedded-test ELF, layout and parity guards.** Not yet run on the Pico.
+
+- **2026-09-25 - Driven on the bench: telnet relay lost bytes; interlink role; empty build-env targets.** With Tom's go-ahead the radio-first build was uploaded to the bench node (10.45.0.97) and driven from its telnet console against GB7RDG-1 (BPQ chat). *(1) Relay data loss (the "character encoding bug" seen earlier).* The chat help arrived over the air intact (seven ~250-byte I-frames in 4 s) but ~90 bytes vanished mid-line before the telnet user: the node task wrote each frame into the 1 KB relay pipe with `try_write`, whose partial write silently cut the frame once the pipe filled. `admin::relay::to_user` now keeps what does not fit in an ordered backlog that the node task feeds in as the telnet side drains (`flush_some`, cancel-safe), capped at 8 KB with a visible "bytes lost" note beyond that; on disconnect the telnet side drains before "*** Disconnected". Re-run: the help arrives complete, and UTF-8 (`£ café ü`) round-trips byte for byte through chat echo. The one control byte seen (0x08 x2 in the chat user list) is in BPQ's own data (a location typed with backspaces). AX.25 flow control (RNR on a high backlog) needs a local-busy event the session layer lacks: follow-up. *(2) Interlink role.* GB7RDG connected in before the pico had heard its NODES, so its link got a console and banner; the first PID-0xCF frame on a console session now switches it to an interlink. *(3)* `KISS_TCP_TARGET` / `MQTT_HOST` set to "" (the release packaging does this) now mean unset; the console listed an empty `kiss-tcp:` port. *(4) Observed on the real TNC:* the start-up order works (GETALL, then settings, mode 5 confirmed); stale AXUDP-era routes (M0LTE-7/8/9) restored from flash are advertised until they age out.
+
+- **2026-09-25 - Interlink observed on air; NODES interval defaults to an hour.** On the bench node: GB7RDG's NODES (238 bytes) taught the pico 11 destinations; GB7RDG itself holds an L2 link to the pico (it connects in after hearing the pico's NODES) and polls it every ~4.5 min; after a pico restart the pico dialled GB7RDG itself (routes restored from flash, SABM 33 s after first hearing GB7RDG on air, UA at once) and the link stayed up past 19 minutes, with keep-alive polls answered and GB7RDG's NET/ROM traffic over it. The pico sends INP3 probes only after a neighbour has sent it NET/ROM (as packet.net does), and GB7RDG did not reflect them. **Found:** with the lab-demo NODES interval (300 s, also the obsolescence sweep cadence) the pico aged GB7RDG's routes (refreshed every ~13 min) below OBSMIN between broadcasts, so its own NODES flapped between 238 bytes and header-only. The default is now 3600 s, packet.net's NODESINTERVAL; `NODES_INTERVAL` / `NODES_INTERVAL_SECS` still override.

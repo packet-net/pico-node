@@ -2,7 +2,7 @@
 //!
 //! The portable, hardware-independent core of the RP2040 / Pico W AX.25 packet
 //! node. It mirrors, in Rust, the proven module structure of the C# node host in
-//! `m0lte/packet.net` (`Packet.Kiss`, `Packet.Axudp`, `Packet.Ax25`,
+//! `m0lte/packet.net` (`Packet.Kiss`, `Packet.Ax25`,
 //! `Packet.Node.Core.Console`) so the two stacks stay conceptually aligned.
 //!
 //! ## no_std posture
@@ -17,7 +17,6 @@
 //!
 //! - [`crc`] — CRC-16/X.25 (the AX.25 FCS), ported from `Packet.Core.Crc16Ccitt`.
 //! - [`kiss`] — KISS SLIP framing: encoder + streaming decoder (`Packet.Kiss`).
-//! - [`axudp`] — AXUDP framing helpers (the UDP payload *is* the AX.25 body) with optional CRC FCS, ported from `Packet.Axudp.AxudpSocket`.
 //! - [`ax25`] — AX.25 address + frame codec essentials (`Packet.Ax25.Ax25Frame`, `Packet.Core.Ax25Address`, `Packet.Core.Callsign`).
 //! - [`console`] — the node command-prompt layer: line assembler, command parser, and the transport-agnostic prompt loop (`Packet.Node.Core.Console`).
 //! - [`sdl`] — the connected-mode AX.25 link-layer runtime: the SDL state machine driven off the generated `m0lte/ax25sdl` typed tables (the Rust port of packet.net's `Ax25Session`).
@@ -36,7 +35,6 @@
 extern crate alloc;
 
 pub mod ax25;
-pub mod axudp;
 pub mod console;
 pub mod crc;
 pub mod kiss;

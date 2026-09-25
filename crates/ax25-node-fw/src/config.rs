@@ -9,9 +9,8 @@
 //!
 //! STUB — fields + shape only; the persistent loader is a follow-up.
 
-// GATE 1 (HW-BRINGUP.md §4): the wifi/axudp/kiss/telnet fields' only consumers
-// (net.rs + transports) are gated out until Gates 2–6; keep the full config shape
-// without dead-code noise meanwhile. Remove this allow when the transports return.
+// Some fields are consumed only by optional tasks (Tait, MQTT) or only on some
+// builds; keep the whole shape without dead-code noise.
 #![allow(dead_code)]
 
 use ax25_node_core::ax25::Callsign;
@@ -24,9 +23,8 @@ pub struct NodeConfig {
     /// label — how the node is found on the WLAN without knowing its IP.
     pub hostname: &'static str,
     pub wifi: WifiConfig,
-    pub axudp: AxudpConfig,
+    pub ninotnc: NinoTncConfig,
     pub kiss_tcp: KissTcpConfig,
-    pub kiss_serial: KissSerialConfig,
     pub tait: TaitConfig,
     pub telnet: TelnetConfig,
     pub netrom: NetRomConfig,
@@ -66,28 +64,18 @@ pub struct WifiConfig {
     pub ap_passphrase: &'static str,
 }
 
-/// AXUDP node↔node (capability 1).
-#[derive(Clone)]
-pub struct AxudpConfig {
-    pub listen_port: u16,
-    /// Optional `"a.b.c.d:port"` endpoint to beacon UI frames at (the Gate-3
-    /// host harness). From the build env (`AXUDP_BEACON_TARGET`) — a LAN
-    /// detail, never a committed default (HW-BRINGUP §5).
-    pub beacon_target: Option<&'static str>,
-}
-
-/// KISS-over-TCP to net-sim (capability 2).
+/// Port 1: KISS-over-TCP (net-sim, or a TNC behind a KISS-TCP server).
 #[derive(Clone)]
 pub struct KissTcpConfig {
     /// Optional `"a.b.c.d:port"` KISS-TCP endpoint to connect to. From the
     /// build env (`KISS_TCP_TARGET`) — a LAN detail, never a committed default
-    /// (HW-BRINGUP §5). Absent ⇒ the transport is disabled.
+    /// (HW-BRINGUP §5). Absent: the node has no such port.
     pub target: Option<&'static str>,
 }
 
-/// KISS-over-UART to a NinoTNC (capability 3).
+/// Port 0: the NinoTNC on the serial link.
 #[derive(Clone)]
-pub struct KissSerialConfig {
+pub struct NinoTncConfig {
     pub baud: u32,
     /// Optional NinoTNC operating mode to set at boot via KISS SETHW (RAM-only —
     /// spares flash). `None` (the default) leaves the modem's own configured mode
@@ -126,8 +114,12 @@ pub struct TelnetConfig {
 pub struct NetRomConfig {
     /// Originate NODES broadcasts (the C# `netRom.broadcast` opt-in).
     pub originate: bool,
-    /// Seconds between NODES broadcasts. BPQ convention is minutes; the lab
-    /// runs short. Overridable at build time via `NODES_INTERVAL_SECS`.
+    /// Seconds between NODES broadcasts, which is also the obsolescence sweep
+    /// cadence (BPQ NODESINTERVAL). Default 3600 (hourly), packet.net's default:
+    /// routes age one step per interval, so a short interval ages routes learned
+    /// from slower-broadcasting neighbours below the advertise threshold between
+    /// their broadcasts (seen on air at 300 s). Overridable at build time via
+    /// `NODES_INTERVAL_SECS` and in config (`NODES_INTERVAL`).
     pub nodes_interval_secs: u32,
 }
 
@@ -157,14 +149,12 @@ pub fn load() -> NodeConfig {
             password: option_env!("WIFI_PASSWORD").unwrap_or(""),
             ap_passphrase: option_env!("AP_PASSPHRASE").unwrap_or("packetradio"),
         },
-        axudp: AxudpConfig {
-            listen_port: 10093,
-            beacon_target: option_env!("AXUDP_BEACON_TARGET"),
-        },
         kiss_tcp: KissTcpConfig {
-            target: option_env!("KISS_TCP_TARGET"),
+            // The release build sets these to "" (no LAN details baked in):
+            // empty means unset.
+            target: option_env!("KISS_TCP_TARGET").filter(|s| !s.is_empty()),
         },
-        kiss_serial: KissSerialConfig {
+        ninotnc: NinoTncConfig {
             baud: 57600,
             startup_mode: option_env!("NINOTNC_MODE").and_then(|s| s.parse::<u8>().ok()),
             tnc: crate::config_store::TncSettings::default(),
@@ -180,9 +170,9 @@ pub fn load() -> NodeConfig {
         telnet: TelnetConfig { port: 8023 },
         netrom: NetRomConfig {
             originate: true,
-            nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
+            nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 3600),
         },
-        mqtt_host: option_env!("MQTT_HOST"),
+        mqtt_host: option_env!("MQTT_HOST").filter(|s| !s.is_empty()),
         force_ap: false,
     }
 }
@@ -215,14 +205,8 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     if let Some(v) = &st.wifi_pass {
         cfg.wifi.password = leak(v);
     }
-    if let Some(v) = &st.beacon_target {
-        cfg.axudp.beacon_target = Some(leak(v));
-    }
     if let Some(v) = &st.kiss_tcp_target {
         cfg.kiss_tcp.target = Some(leak(v));
-    }
-    if let Some(v) = st.axudp_port {
-        cfg.axudp.listen_port = v;
     }
     if let Some(v) = st.telnet_port {
         cfg.telnet.port = v;
@@ -239,7 +223,7 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
     if let Some(v) = st.force_ap {
         cfg.force_ap = v;
     }
-    cfg.kiss_serial.tnc = st.tnc;
+    cfg.ninotnc.tnc = st.tnc;
 }
 
 /// Parse an optional build-env decimal, falling back on absence or garbage.

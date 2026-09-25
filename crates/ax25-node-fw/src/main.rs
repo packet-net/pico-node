@@ -1,19 +1,24 @@
-//! RP2040 / Pico W AX.25 packet-node firmware — Embassy entry point.
+//! RP2040 / Pico W AX.25 packet-node firmware: a radio-first node, Embassy
+//! entry point.
 //!
 //! This is the thin "wiring" crate: it owns the silicon and the radios and hands
-//! all protocol work to [`ax25_node_core`]. The structure mirrors the C# node
-//! host (`Packet.Node.Core`): a set of transports feeding one AX.25 listener +
-//! session layer, plus a telnet console, all coordinated by a small supervisor.
+//! all protocol work to [`ax25_node_core`]. The node's job is on the air: radio
+//! ports feed one node task (sessions, the console, NET/ROM). WiFi is for
+//! administration only: the web panel and the telnet console.
 //!
-//! ## Tasks (the multi-source event pump — research note §7 "async fits this")
+//! ## Tasks
 //!
-//! - `cyw43_task`          — drives the CYW43439 WiFi chip (PIO-SPI), always-on.
-//! - `net_task`            — runs the `embassy-net` stack (DHCP, sockets).
-//! - [`transports::axudp`] — AXUDP: AX.25-over-UDP to peer nodes (capability 1).
-//! - [`transports::kiss_tcp`] — KISS-over-TCP to net-sim (capability 2).
-//! - [`transports::kiss_serial`] — KISS-over-UART to a NinoTNC (capability 3).
-//! - [`transports::telnet`]   — telnet command console (capability 4).
-//! - [`session`]              — the SDL link-layer runtime per peer (the port).
+//! - `cyw43_task` / `net_task` -- the CYW43439 WiFi chip and the `embassy-net`
+//!   stack (admin network: DHCP or the setup AP).
+//! - [`node`] -- the node: sessions, the AX.25 console, NET/ROM, interlinks, for
+//!   every radio port.
+//! - [`ports::ninotnc`] -- port 0, the NinoTNC on UART1 (GP20/GP21): KISS, TNC
+//!   setup, monitor, TNC firmware update.
+//! - [`ports::kiss_tcp`] -- port 1, an optional KISS-over-TCP modem (net-sim).
+//! - [`tait`] -- Tait radio control over CCDI on UART0 (GP0/GP1).
+//! - [`admin::telnet`] -- the telnet console; `ota::http_task` -- the web panel
+//!   (config, NinoTNC page, node firmware upload).
+//! - [`session`] -- the SDL link-layer runtime wrapper the node task uses.
 //!
 //! ## Build / flash / log
 //!
@@ -38,6 +43,8 @@ extern crate alloc;
 // embedded toolchain + deps are in place. The real firmware only builds for
 // `target_os = "none"` (thumbv6m-none-eabi).
 #[cfg(target_os = "none")]
+mod admin;
+#[cfg(target_os = "none")]
 mod config;
 #[cfg(target_os = "none")]
 mod config_store;
@@ -52,19 +59,23 @@ mod netrom_store;
 #[cfg(target_os = "none")]
 mod netrom_view;
 #[cfg(target_os = "none")]
+mod node;
+#[cfg(target_os = "none")]
 mod oled;
 #[cfg(target_os = "none")]
 mod ota;
+#[cfg(target_os = "none")]
+mod ports;
 #[cfg(target_os = "none")]
 mod provisioning;
 #[cfg(target_os = "none")]
 mod session;
 #[cfg(target_os = "none")]
+mod tait;
+#[cfg(target_os = "none")]
 mod tnc;
 #[cfg(target_os = "none")]
 mod tnc_image;
-#[cfg(target_os = "none")]
-mod transports;
 mod webui;
 
 // The global allocator. `ax25-node-core` uses `alloc` (the session queues, the
@@ -100,7 +111,10 @@ mod firmware {
     use crate::oled;
     use crate::ota;
     use crate::provisioning;
-    use crate::transports;
+    use crate::admin;
+    use crate::node;
+    use crate::ports;
+    use crate::tait;
     use crate::{HEAP, HEAP_SIZE};
 
     #[embassy_executor::main]
@@ -319,57 +333,71 @@ mod firmware {
             )));
         }
 
-        // The node console identity + prompt — shared by every console-bearing
-        // transport (telnet now, AX.25 sessions on the AXUDP port too).
+        // The node console identity + prompt: shared by the AX.25 console (the
+        // node task) and the telnet console.
+        let mut port_lines = alloc::vec![String::from("radio: NinoTNC on the serial link")];
+        if let Some(target) = cfg.kiss_tcp.target {
+            port_lines.push(alloc::format!("kiss-tcp: {target}"));
+        }
         let console_id = ax25_node_core::console::service::Identity {
             node_name: String::from(cfg.identity.alias),
             callsign: String::from(call_text),
             grid: Some(String::from(cfg.identity.grid)),
-            ports: alloc::vec![
-                alloc::format!("axudp [up] udp/0.0.0.0:{}", cfg.axudp.listen_port),
-                String::from("rf [NinoTNC on the serial link]"),
-            ],
+            ports: port_lines,
             // Filled live per-command by the console tasks from `netrom_view`
-            // (the routing table lives in the axudp task, not the console tasks).
+            // (the routing table lives in the node task).
             routes: alloc::vec![],
         };
         // Prompt suffix "> " (the {call}> form), aligned with pdn's node prompt.
         let mut prompt = String::from(call_text);
         prompt.push_str("> ");
 
-        // --- GATE 3 (HW-BRINGUP.md §4): AXUDP over WiFi (capability 1), now with
-        // the connected-mode session layer + AX.25 console attached. ---
-        spawner.spawn(defmt::unwrap!(transports::axudp::task(
-            stack,
-            cfg.axudp.clone(),
+        // --- The node: sessions, console, NET/ROM for every radio port. ---
+        spawner.spawn(defmt::unwrap!(node::task(
             cfg.netrom.clone(),
             cfg.identity.callsign,
             console_id.clone(),
             prompt.clone(),
         )));
 
-        // --- GATE 4 (HW-BRINGUP.md §4): telnet console (capability 4) ---
-        spawner.spawn(defmt::unwrap!(transports::telnet::task(
+        // --- Port 0: the NinoTNC on UART1 GP20(TX)/GP21(RX), the NinoBLE Rev5
+        // link pins. Always spawned; it carries no traffic until the TNC reports
+        // supported firmware. ---
+        spawner.spawn(defmt::unwrap!(ports::ninotnc::task(
+            p.UART1,
+            p.PIN_20,
+            p.PIN_21,
+            cfg.ninotnc.clone(),
+            cfg.identity.callsign,
+        )));
+
+        // --- Port 1: KISS-over-TCP (net-sim), only when KISS_TCP_TARGET is set
+        // in the build env. ---
+        spawner.spawn(defmt::unwrap!(ports::kiss_tcp::task(
+            stack,
+            cfg.kiss_tcp.clone(),
+        )));
+
+        // --- Tait CCDI radio control on UART0 GP0(TX)/GP1(RX). Drives the core
+        // CCDI driver (RSSI / PTT / channel / carrier-sense). Always spawns; it
+        // self-quiets if no Tait radio answers. Not yet run against a radio. ---
+        spawner.spawn(defmt::unwrap!(tait::task(
+            p.UART0,
+            p.PIN_0,
+            p.PIN_1,
+            cfg.tait.clone(),
+        )));
+
+        // --- Admin: the telnet console (the web panel is spawned earlier, before
+        // the callsign gate, so it runs in both AP and STA mode). ---
+        spawner.spawn(defmt::unwrap!(admin::telnet::task(
             stack,
             cfg.telnet.clone(),
             console_id,
             prompt,
         )));
 
-        // (The web server — config panel + OTA firmware upload — is spawned
-        // earlier, before the config-only gate, so it runs in both AP and STA.)
-
-        // --- GATE 5 (HW-BRINGUP.md §4): KISS-over-TCP (capability 2) ---
-        // Disabled unless KISS_TCP_TARGET is set in the build env (§5).
-        spawner.spawn(defmt::unwrap!(transports::kiss_tcp::task(
-            stack,
-            cfg.kiss_tcp.clone(),
-            cfg.netrom.clone(),
-            cfg.identity.callsign,
-            cfg.identity.alias,
-        )));
-
-        // --- mDNS: make the node discoverable as <hostname>.local + _telnet._tcp ---
+        // --- mDNS: <hostname>.local + _telnet._tcp for the admin interfaces ---
         spawner.spawn(defmt::unwrap!(mdns::task(
             stack,
             mdns::MdnsConfig {
@@ -377,34 +405,6 @@ mod firmware {
                 telnet_port: cfg.telnet.port,
             },
         )));
-
-        // --- GATE 6 (HW-BRINGUP.md §4): KISS-over-UART to a NinoTNC (capability 3).
-        // UART1 on GP20(TX)/GP21(RX), the NinoBLE Rev5 link pins. The task always
-        // spawns (there is no build-env target for a physical UART); it reads
-        // nothing until a NinoTNC is wired, but the read-only NET/ROM tap, NODES
-        // origination, obsolescence sweep and beacon all run. COMPILE-VALIDATED
-        // ONLY — the live exchange needs the NinoTNC on the bench (no hardware here).
-        spawner.spawn(defmt::unwrap!(transports::kiss_serial::task(
-            p.UART1,
-            p.PIN_20,
-            p.PIN_21,
-            cfg.kiss_serial.clone(),
-            cfg.identity.callsign,
-        )));
-
-        // --- Tait CCDI radio control on a SECOND UART: UART0 GP0(TX)/GP1(RX),
-        // distinct from the NinoTNC KISS link on UART1. Drives the core CCDI driver
-        // (RSSI / PTT / channel / carrier-sense). Always spawns (no build-env target
-        // for a physical UART); it self-quiets if no Tait radio answers. COMPILE-
-        // VALIDATED ONLY — the live exchange needs a Tait radio on GP0/GP1. ---
-        spawner.spawn(defmt::unwrap!(transports::tait_ccdi::task(
-            p.UART0,
-            p.PIN_0,
-            p.PIN_1,
-            cfg.tait.clone(),
-        )));
-
-        // The session supervisor (shared Sessions across transports) is the next seam.
 
         let mut ticker = Ticker::every(Duration::from_secs(10));
         loop {

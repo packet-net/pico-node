@@ -7,7 +7,7 @@
 //! strict command builders (RSSI / PTT / channel / progress-enable) and the
 //! transact/demux engine are all in [`ax25_node_core::radio::tait`] (host-tested) —
 //! this task only supplies the *byte source* (a [`ByteStream`] over a second UART)
-//! and the periodic drive loop, exactly as [`super::kiss_serial`] does for the
+//! and the periodic drive loop, exactly as [`crate::ports::ninotnc`] does for the
 //! NinoTNC KISS link.
 //!
 //! ## What a Tait radio gives us that a bare TNC cannot
@@ -47,7 +47,7 @@ use embassy_time::{Duration, Ticker};
 use static_cell::StaticCell;
 
 use crate::config::TaitConfig;
-use crate::transports::kiss_serial::UartByteStream;
+use crate::ports::ninotnc::UartByteStream;
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;

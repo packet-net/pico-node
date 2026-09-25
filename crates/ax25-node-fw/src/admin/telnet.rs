@@ -13,7 +13,7 @@
 //! socket I/O wrapped around them. One connection at a time (a packet node's
 //! console is not a web server); further dial-ins queue at the TCP backlog.
 //!
-//! `Connect` is real: `C <call>` hands the target to the AXUDP session owner
+//! `Connect` is real: `C <call>` hands the target to the node task
 //! over the [`super::relay`] statics, then this task parks its prompt loop and
 //! relays raw bytes both ways (translating the AX.25 CR line convention to the
 //! telnet CRLF one) until either side disconnects — the
@@ -29,11 +29,11 @@ use alloc::vec::Vec;
 use embassy_futures::select::{select3, Either3};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
-use embassy_time::Duration;
+use embassy_time::{Duration, Instant, Timer};
 
 use crate::config::TelnetConfig;
-use crate::transports::relay::{self, RelayStatus};
-use crate::transports::tcp_write_all as write_all;
+use crate::admin::relay::{self, RelayStatus};
+use crate::net::tcp_write_all as write_all;
 
 /// Idle timeout for a console connection; a dead peer frees the slot.
 const IDLE_TIMEOUT_SECS: u64 = 300;
@@ -89,7 +89,7 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
         for line in asm.push(&buf[..n]) {
             let cmd = parse_bytes(&line);
             // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes` — the
-            // routing table lives in the AXUDP task, so read its cross-task snapshot.
+            // routing table lives in the node task, so read its cross-task snapshot.
             let id = id.with_routes(crate::netrom_view::snapshot());
             let resp = dispatch(&cmd, &id, KIND);
             if !write_all(socket, &resp.body).await {
@@ -137,6 +137,19 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
     }
 }
 
+/// Write AX.25 peer bytes to the telnet user: the bare CR line end becomes CRLF.
+async fn write_from_ax(socket: &mut TcpSocket<'_>, bytes: &[u8]) -> bool {
+    let mut out = Vec::with_capacity(bytes.len() + 16);
+    for &b in bytes {
+        if b == b'\r' {
+            out.extend_from_slice(b"\r\n");
+        } else if b != b'\n' {
+            out.push(b);
+        }
+    }
+    write_all(socket, &out).await
+}
+
 /// Pipe bytes between the telnet socket and the active AX.25 relay until the
 /// link ends. Returns `false` if the *telnet user* went away (caller drops the
 /// connection); `true` when the AX.25 side ended and the prompt loop resumes.
@@ -162,19 +175,24 @@ async fn relay_loop(socket: &mut TcpSocket<'_>) -> bool {
                 return write_all(socket, &msg).await;
             }
             Either3::First(RelayStatus::Disconnected) => {
+                // Deliver what the peer sent before the link ended (the node task
+                // keeps feeding its backlog in), then the notice. Bounded.
+                let until = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match relay::AX_TO_USER.try_read(&mut ax_buf) {
+                        Ok(n) => {
+                            if !write_from_ax(socket, &ax_buf[..n]).await {
+                                return false;
+                            }
+                        }
+                        Err(_) if relay::backlog_len() == 0 || Instant::now() >= until => break,
+                        Err(_) => Timer::after_millis(20).await,
+                    }
+                }
                 return write_all(socket, b"*** Disconnected\r\n").await;
             }
             Either3::Second(n) => {
-                // AX.25 → telnet: bare CR becomes CRLF.
-                let mut out = Vec::with_capacity(n + 16);
-                for &b in &ax_buf[..n] {
-                    if b == b'\r' {
-                        out.extend_from_slice(b"\r\n");
-                    } else if b != b'\n' {
-                        out.push(b);
-                    }
-                }
-                if !write_all(socket, &out).await {
+                if !write_from_ax(socket, &ax_buf[..n]).await {
                     relay::USER_HANGUP.signal(());
                     return false;
                 }

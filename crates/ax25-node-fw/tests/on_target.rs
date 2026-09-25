@@ -145,7 +145,7 @@ mod tests {
         svc.ingest_broadcast(
             neighbour,
             my_call,
-            PortId::from_str_lossy("axudp"),
+            PortId::from_str_lossy("radio"),
             &bc,
             1000,
         );

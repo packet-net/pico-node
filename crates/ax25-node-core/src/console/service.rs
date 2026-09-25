@@ -24,7 +24,7 @@ pub struct Identity {
     pub callsign: String,
     /// Optional Maidenhead grid.
     pub grid: Option<String>,
-    /// Port descriptions for the `Nodes` command, e.g. `["axudp [up] udp/0.0.0.0:10093"]`.
+    /// Port descriptions for the `Nodes` command, e.g. `["radio: NinoTNC on the serial link"]`.
     pub ports: Vec<String>,
     /// Learned NET/ROM route lines for the `Nodes` command, each already rendered
     /// (e.g. `"GB7BBB:BBB via GB7BBB q=192 obs=6 [inp3 1734ms/1h]"`). Empty when the
@@ -305,7 +305,7 @@ mod tests {
             node_name: String::from("LONDON"),
             callsign: String::from("M0LTE-1"),
             grid: Some(String::from("IO91wm")),
-            ports: alloc::vec![String::from("axudp [up] udp/0.0.0.0:10093")],
+            ports: alloc::vec![String::from("radio: NinoTNC on the serial link")],
             routes: alloc::vec![],
         }
     }
@@ -371,7 +371,7 @@ mod tests {
         let r = dispatch(&Command::Nodes, &id(), TransportKind::Telnet);
         let txt = String::from_utf8(r.body).unwrap();
         assert!(txt.contains("LONDON"));
-        assert!(txt.contains("axudp [up]"));
+        assert!(txt.contains("radio: NinoTNC"));
     }
 
     #[test]

@@ -34,7 +34,6 @@ fn main() {
         "WIFI_SSID",
         "WIFI_PASSWORD",
         "AP_PASSPHRASE",
-        "AXUDP_BEACON_TARGET",
         "KISS_TCP_TARGET",
         "NODES_INTERVAL_SECS",
         "MQTT_HOST",

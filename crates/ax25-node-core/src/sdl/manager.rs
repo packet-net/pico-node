@@ -416,7 +416,7 @@ impl<const N: usize> SessionManager<N> {
         slot.sink.extended = slot.session.context.is_extended;
         slot.session.post_event(event, timers, &mut slot.sink);
 
-        // Grant LM-SEIZE when the channel is clear. On a full-duplex wire (AXUDP,
+        // Grant LM-SEIZE when the channel is clear. On a full-duplex wire (for example
         // KISS-TCP) — or with no carrier-sense source — `carrier_clear` is always
         // true, so the channel is treated as always free (the historical behaviour).
         // The confirm drives the figc4 `AckPending` path that emits the delayed RR

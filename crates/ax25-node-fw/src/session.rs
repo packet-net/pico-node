@@ -11,19 +11,15 @@
 //! [`ax25_node_core::sdl::classify_incoming`] to get the [`Event`], and posts it to
 //! the manager keyed by the peer callsign; the manager routes it to that peer's
 //! session, runs the state machine, and returns the wire frames to send back. DL
-//! signals raised upward (connect/data/disconnect indications) are drained for the
-//! telnet console / app.
+//! signals raised upward (connect/data/disconnect indications) are serviced by
+//! the node task.
 //!
-//! Concurrency note: this wrapper is intended to be owned by a single supervising
-//! task (or guarded by an `embassy_sync` mutex) so the `&mut SessionManager` borrow
-//! the manager's `post` needs is serialised across transports. The exact sharing
-//! (one owning task with an event channel vs. a shared mutex) is finalised at
-//! WiFi bring-up; the manager + timer logic below is hardware-independent and is
-//! host-tested in `ax25_node_core::sdl::manager`.
+//! Ownership: the node task ([`crate::node`]) owns the one [`Sessions`] and the
+//! one [`NetRom`] for every radio port, so the `&mut` borrows are trivially
+//! serialised; the port drivers only move frames. The manager + timer logic is
+//! hardware-independent and host-tested in `ax25_node_core::sdl::manager`.
 
-// GATE 3 (HW-BRINGUP.md §4): only the NET/ROM tap (new_netrom/observe_inbound)
-// is consumed so far; the SessionManager + timer machinery below is the seam the
-// session supervisor wires up when connected mode lands. Remove then.
+// Some helpers here are kept for the on-target test and future callers.
 #![allow(dead_code)]
 
 use ax25_node_core::ax25::{Callsign, Frame};
@@ -37,7 +33,7 @@ use embassy_time::{Duration, Instant};
 pub const MAX_SESSIONS: usize = 4;
 
 /// The node's per-peer session collection. Construct once at boot with the node's
-/// own callsign; share it (single task or `embassy_sync` mutex) across transports.
+/// own callsign; owned by the node task.
 pub type Sessions = SessionManager<MAX_SESSIONS>;
 
 /// Build the session manager for this node's local callsign.
@@ -46,9 +42,8 @@ pub fn new_sessions(local: Callsign) -> Sessions {
 }
 
 /// The node's read-only NET/ROM observer (the Rust port of the C# `NetRomService`).
-/// Construct once at boot; share it (single task or `embassy_sync` mutex) across
-/// transports exactly like [`Sessions`]. It is *only* fed the read-only tap below —
-/// it owns no socket and emits nothing on the air.
+/// Construct once at boot; owned by the node task like [`Sessions`]. It is *only*
+/// fed the read-only tap below; it owns no socket and emits nothing on the air.
 pub type NetRom = NetRomService;
 
 /// Build the NET/ROM service (enabled, canonical defaults). Disable per config by
@@ -204,5 +199,5 @@ pub fn expiry_event(id: TimerId) -> Option<Event> {
 }
 
 // (The former `timer_task` stub is gone: timers are driven by the transport
-// that owns the sessions — see `transports::axudp`'s per-peer `EmbassyTimers`
+// that owns the sessions: see `crate::node`'s per-peer `EmbassyTimers`
 // and its deadline arm in the main select loop.)

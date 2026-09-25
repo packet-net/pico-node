@@ -33,7 +33,7 @@
 //! defaults to. On the Pico W we do **not** drive the NinoTNC over USB — the RP2040
 //! cannot be a USB host and a USB-serial device at once — so we wire the Pico's UART
 //! directly to the NinoTNC's UART pins at this baud (see [`crate::kiss::serial`] and
-//! the firmware `transports::kiss_serial`).
+//! the firmware's `ports::ninotnc`).
 //!
 //! ## Parity scope (divergences from `Packet.Kiss.NinoTnc`, all out of node scope)
 //!
@@ -41,9 +41,11 @@
 //!   (Linux `/dev/serial/by-id`, the Windows registry, USB VID/PID `04D8:00DD`). The
 //!   Pico's UART is a fixed peripheral with no enumeration, so this has no embedded
 //!   analogue and is intentionally omitted.
-//! - **Firmware OTA** (`Firmware/GitHub*Catalogue`, `*Flasher`): GitHub release
-//!   discovery + ICSP flashing — host tooling, no place on the node. Omitted; only
-//!   the firmware *version* + *chip variant* value types are ported ([`firmware`]).
+//! - **Firmware catalogue** (`Firmware/GitHub*Catalogue`): GitHub release
+//!   discovery is host tooling (the node has no internet path of its own), so it
+//!   is omitted; the operator uploads the hex file. The bootloader flasher itself
+//!   *is* ported ([`flash`]), with the image validation, so the node updates the
+//!   TNC over its UART.
 //! - **The async modem driver** (`NinoTncSerialPort`: the read pump, the event
 //!   handlers): the *protocol* it speaks is ported (KISS codec +
 //!   [`crate::kiss::ackmode`] — including the portable ACKMODE TX-completion

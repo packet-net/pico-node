@@ -23,7 +23,7 @@ use embassy_time::{Duration, Instant, Timer};
 
 use alloc::string::String;
 
-use crate::transports::parse_endpoint;
+use crate::net::parse_endpoint;
 
 /// A line of node log text destined for MQTT. Bounded length keeps it cheap.
 pub type LogLine = heapless::String<96>;
