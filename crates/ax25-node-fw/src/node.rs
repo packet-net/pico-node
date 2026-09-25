@@ -1532,8 +1532,19 @@ fn post_one(
                     _ => {}
                 },
                 DataLinkSignal::DataIndication(pid, info) if pid == PID_NETROM => {
-                    // An interlink datagram (NET/ROM L3/L4) — never console
-                    // text. Routed to the connector by drive().
+                    // An interlink datagram (NET/ROM L3/L4), never console
+                    // text. Routed to the connector by drive(). A console user
+                    // never sends PID 0xCF: a node that connected before we
+                    // knew it was one (we had not heard its NODES yet) got a
+                    // console; it is an interlink.
+                    if matches!(ps.role, Role::Console(_)) {
+                        let mut name = [0u8; 16];
+                        defmt::info!(
+                            "node: {=str} speaks NET/ROM, treating its link as an interlink",
+                            call_str(&peer, &mut name)
+                        );
+                        ps.role = Role::Interlink;
+                    }
                     followups.push(FollowUp::NetRom {
                         neighbour: peer,
                         datagram: info,

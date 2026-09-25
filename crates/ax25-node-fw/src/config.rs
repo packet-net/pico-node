@@ -146,7 +146,9 @@ pub fn load() -> NodeConfig {
             ap_passphrase: option_env!("AP_PASSPHRASE").unwrap_or("packetradio"),
         },
         kiss_tcp: KissTcpConfig {
-            target: option_env!("KISS_TCP_TARGET"),
+            // The release build sets these to "" (no LAN details baked in):
+            // empty means unset.
+            target: option_env!("KISS_TCP_TARGET").filter(|s| !s.is_empty()),
         },
         ninotnc: NinoTncConfig {
             baud: 57600,
@@ -166,7 +168,7 @@ pub fn load() -> NodeConfig {
             originate: true,
             nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 300),
         },
-        mqtt_host: option_env!("MQTT_HOST"),
+        mqtt_host: option_env!("MQTT_HOST").filter(|s| !s.is_empty()),
         force_ap: false,
     }
 }
