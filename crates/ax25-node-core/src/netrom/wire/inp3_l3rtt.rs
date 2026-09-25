@@ -35,7 +35,7 @@
 //!   on the M0+, this type stores the two decoded headers + an **owned**
 //!   `alloc::vec::Vec<u8>` payload, and rebuilds a borrowing [`NetRomPacket`] on
 //!   demand via [`Inp3L3RttFrame::packet`]. `to_bytes` returns an owned `Vec<u8>`
-//!   like the C# `byte[]` (matching the `axudp` module's `Vec` idiom).
+//!   like the C# `byte[]` (the crate's usual `Vec` idiom).
 //! - **`build` returns `Option`, not a throwing constructor.** The C# `Build`
 //!   throws `ArgumentOutOfRangeException` for an out-of-range `ipAccept`; the core
 //!   never panics on a bad caller arg in a codec path, so [`Inp3L3RttFrame::build`]

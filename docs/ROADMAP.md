@@ -126,7 +126,7 @@ NODESPACLEN was investigated and **deliberately left out** — a BPQ-ism (not in
 
 | feature | status | class | fit | rec | decision |
 |---|---|---|---|---|---|
-| KISS-over-TCP (net-sim) · AXUDP · telnet console | PARTIAL (codecs done, transports stubbed) | 🔧 | good | In (existing caps 1/2/4) | Needs more breakdown · AXUDP/telnet already whole; KISS-TCP origination+sweep wired #60 |
+| KISS-over-TCP (net-sim) · telnet console | DONE | 🔧 | good | In | KISS-TCP is port 1 of the radio-first node (sessions via the node task); telnet is admin. **AXUDP removed 2026-09-25** (radio-first). |
 | **AGWPE server** (TCP) | NONE | 🔧 (wire protocol) | ok | Decide | Defer |
 | **RHPv2** (XRouter protocol) | NONE | 🔧 | RAM-heavy | Later | Defer |
 | **MQTT frame emitter** (kissproxy-compatible tracing) | NONE | 🔧 | ok | Decide | Defer (telemetry MQTT already present; per-frame emitter deferred) |
@@ -152,7 +152,7 @@ Two caveats that keep a "skipped" 🔒 item honest:
 - **Negotiation boundary — skipping a feature ≠ skipping the obligation to say so correctly.** mod-128 (via XID), v2.2 CONNECT (via SABME), capabilities (via XID) all *negotiate*. If pico-node doesn't do mod-128 it must still **advertise mod-8 only and negotiate a mod-128 peer *down* correctly**; if it doesn't do SREJ it must **not claim it in XID**. So a skipped feature leaves a small, real parity surface — the *degradation* behaviour — which pico-node **does** implement and **does** opt into. The manifest is therefore finer-grained than feature-on/off: e.g. `ax25_mod128` carries a `negotiate-down-from-mod128` capability. Golden-vector sets should include those degradation vectors.
 - **Interop obligation is separate from parity.** Even a fully-declared skip must still *interop* — a BPQ/XRouter peer that offers mod-128 or SREJ must get a clean, spec-legal refusal/fallback, not a hang. That's covered by the shared AXUDP interop harness (LinBPQ/XRouter/direwolf), which pico-node runs once hardware is up, independently of the vector CI.
 
-**Where this landed:** the capability manifest + documented exceptions are live as of the 2026-07-12 wave, and pico-node already shares AX.25 (mod-8 + mod-128), KISS, AXUDP, NET/ROM (quality/NODES/L4), SREJ, and XID vector sets. The manifest grows with each pick in tables A/B/C/D/E; you never have to implement a 🔒 item just to keep CI green.
+**Where this landed:** the capability manifest + documented exceptions are live as of the 2026-07-12 wave, and pico-node already shares AX.25 (mod-8 + mod-128), KISS, NET/ROM (quality/NODES/L4), SREJ, and XID vector sets (AXUDP too until it was removed on 2026-09-25; the set is now declared out). The manifest grows with each pick in tables A/B/C/D/E; you never have to implement a 🔒 item just to keep CI green.
 
 ---
 

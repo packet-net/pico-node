@@ -1,5 +1,7 @@
 # Pico W hardware bring-up — runbook for the session driving the rig
 
+> **Historical record.** This runbook drove the June 2026 bring-up. Since then the node became radio-first: AXUDP (Gate 3 below) was removed on 2026-09-25 and the NinoTNC radio port (Gate 6) is the node's link. Read [`../README.md`](../README.md) for what the node is now; the gates below are kept as they were run.
+
 *Written 2026-06-07, the day the hardware arrived. This is the hand-off document for a fresh Claude Code session running on the machine the Pico W + Raspberry Pi Debug Probe are physically connected to (the original dev box cannot host them). It operationalises [`PLAN.md`](PLAN.md) §9 ("when the hardware arrives") into concrete steps with verification gates. Read PLAN.md §0–§2 for the project context first; this document assumes it.*
 
 ---

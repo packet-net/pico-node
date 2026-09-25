@@ -1,7 +1,7 @@
 //! The console→AX.25 outbound-connect relay — the `ConsoleRelay.PipeAsync`
 //! analogue. A console user types `C <call>`; the console transport parks its
 //! prompt loop and pipes raw bytes to/from an outbound AX.25 session that the
-//! AXUDP task (the session owner) establishes on its behalf.
+//! node task (the session owner) establishes on its behalf, over the air.
 //!
 //! Plumbing: a request channel (console → session owner), two byte pipes (one
 //! per direction), a hangup signal (console user went away) and a status

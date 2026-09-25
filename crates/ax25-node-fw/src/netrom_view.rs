@@ -1,11 +1,10 @@
 //! Cross-task snapshot of the learned NET/ROM routes for the `Nodes` console
 //! command.
 //!
-//! The NET/ROM service (and its routing table) lives in the AXUDP task; the
-//! console-bearing transports (telnet, and the AX.25-session console) run in their
-//! own Embassy tasks and only hold a clone of the boot-time [`Identity`]. This
-//! static is the seam between them — the AXUDP task refreshes it on each beacon
-//! tick (`set_routes(netrom.route_lines())`), and a console task reads it into the
+//! The NET/ROM service (and its routing table) lives in the node task
+//! ([`crate::node`]); the telnet console runs in its own Embassy task and only
+//! holds a clone of the boot-time [`Identity`]. This static is the seam between
+//! them: the node task refreshes it on each housekeeping tick (`set_routes(netrom.route_lines())`), and a console task reads it into the
 //! `Identity.routes` it dispatches a `Nodes` command with. Same pattern as
 //! [`crate::oled::STATUS`] / [`crate::mqtt::STATUS`], which already carry the
 //! cross-task NET/ROM neighbour/destination counts.
@@ -24,7 +23,8 @@ static ROUTES: Mutex<CriticalSectionRawMutex, RefCell<Vec<String>>> =
     Mutex::new(RefCell::new(Vec::new()));
 
 /// Replace the shared route snapshot. Called from the task that owns the routing
-/// table (AXUDP) — cheap; the line count is small (≤ the destination cap).
+/// table (the node task); cheap, the line count is small (at most the
+/// destination cap).
 pub fn set_routes(routes: Vec<String>) {
     ROUTES.lock(|c| *c.borrow_mut() = routes);
 }

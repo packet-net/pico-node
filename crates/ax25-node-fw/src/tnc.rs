@@ -2,7 +2,7 @@
 //! task: a command queue (web -> serial), the TNC status the page shows, and the
 //! traffic monitor.
 //!
-//! The serial task ([`crate::transports::kiss_serial`]) owns the UART and is the
+//! The serial task ([`crate::ports::ninotnc`]) owns the UART and is the
 //! only thing that talks to the TNC. The web server never touches the link; it
 //! queues a [`TncCommand`] and the page then watches [`STATE`] and [`MONITOR`]
 //! through `GET /tnc/poll`.

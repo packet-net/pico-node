@@ -13,7 +13,7 @@
 //! socket I/O wrapped around them. One connection at a time (a packet node's
 //! console is not a web server); further dial-ins queue at the TCP backlog.
 //!
-//! `Connect` is real: `C <call>` hands the target to the AXUDP session owner
+//! `Connect` is real: `C <call>` hands the target to the node task
 //! over the [`super::relay`] statics, then this task parks its prompt loop and
 //! relays raw bytes both ways (translating the AX.25 CR line convention to the
 //! telnet CRLF one) until either side disconnects — the
@@ -32,8 +32,8 @@ use embassy_net::Stack;
 use embassy_time::Duration;
 
 use crate::config::TelnetConfig;
-use crate::transports::relay::{self, RelayStatus};
-use crate::transports::tcp_write_all as write_all;
+use crate::admin::relay::{self, RelayStatus};
+use crate::net::tcp_write_all as write_all;
 
 /// Idle timeout for a console connection; a dead peer frees the slot.
 const IDLE_TIMEOUT_SECS: u64 = 300;
@@ -89,7 +89,7 @@ async fn serve(socket: &mut TcpSocket<'_>, id: &Identity, prompt: &str) {
         for line in asm.push(&buf[..n]) {
             let cmd = parse_bytes(&line);
             // Fill the live NET/ROM routes (incl. INP3 metric) for `Nodes` — the
-            // routing table lives in the AXUDP task, so read its cross-task snapshot.
+            // routing table lives in the node task, so read its cross-task snapshot.
             let id = id.with_routes(crate::netrom_view::snapshot());
             let resp = dispatch(&cmd, &id, KIND);
             if !write_all(socket, &resp.body).await {

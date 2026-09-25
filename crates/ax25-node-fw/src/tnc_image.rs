@@ -1,5 +1,5 @@
 //! A NinoTNC firmware image held in the APPDATA flash region, between the
-//! upload (`POST /tnc/firmware`) and the flash (`kiss_serial`).
+//! upload (`POST /tnc/firmware`) and the flash (`ports::ninotnc`).
 //!
 //! The upload is validated and packed by
 //! [`ax25_node_core::kiss::ninotnc::flash::HexStager`] (about 374 KB for

@@ -231,7 +231,7 @@ impl NetRomService {
 
     /// Ingest a parsed broadcast directly (the wire-level path, for callers that
     /// already have a [`NodesBroadcast`] and the originator/port out of band — e.g.
-    /// an AXUDP or KISS-TCP transport). Observation-only.
+    /// a KISS port driver). Observation-only.
     pub fn ingest_broadcast(
         &mut self,
         originator: Callsign,

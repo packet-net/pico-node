@@ -2,7 +2,7 @@
 //!
 //! Ports the bytes-only parts of `Packet.Core.Callsign`, `Packet.Core.Ax25Address`,
 //! and `Packet.Ax25.Ax25Frame` from `m0lte/packet.net`. This is the layer the
-//! AXUDP and KISS transports hand frames to, and the layer that will sit beneath
+//! KISS port drivers hand frames to, and the layer that sits beneath
 //! the SDL link-layer runtime (see [`crate::sdl`]).
 //!
 //! Scope note (mirrors the C# Phase-1 codec): destination + source + digipeater

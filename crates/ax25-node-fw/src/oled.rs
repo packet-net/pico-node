@@ -46,7 +46,7 @@ pub struct Status {
     pub destinations: u16,
 }
 
-/// Shared status the OLED renders. The owner (`main`/transports) updates it; the
+/// Shared status the OLED renders. The owner (`main` / the node task) updates it; the
 /// OLED task reads it. `embassy_sync` blocking mutex — updates are tiny.
 pub static STATUS: embassy_sync::blocking_mutex::Mutex<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
@@ -62,7 +62,7 @@ pub fn set(status: Status) {
     STATUS.lock(|c| *c.borrow_mut() = status);
 }
 
-/// Update just the NET/ROM counts (the transports call this as the table
+/// Update just the NET/ROM counts (the node task calls this as the table
 /// changes, without disturbing the identity/mode set once at boot).
 pub fn set_counts(neighbours: u16, destinations: u16) {
     STATUS.lock(|c| {

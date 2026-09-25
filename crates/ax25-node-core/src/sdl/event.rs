@@ -125,7 +125,7 @@ pub enum Event {
 
     // ─── Link multiplexer ───────────────────────────────────────────────
     /// LM-SEIZE confirm — the link multiplexer granted the channel the SDL
-    /// asked for via `LMSeizeRequest`. On a full-duplex transport (AXUDP,
+    /// asked for via `LMSeizeRequest`. On a full-duplex wire (for example
     /// KISS-TCP) the channel is always free, so the session driver confirms
     /// immediately; the figc4 `AckPending` transition then emits the delayed
     /// RR acknowledgement.

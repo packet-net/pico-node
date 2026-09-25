@@ -73,11 +73,11 @@ embassy-boot-rp = { version = "0.10", default-features = false, features = ["def
 cyw43     = { version = "0.7", default-features = false, features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10", default-features = false, features = ["defmt"] }
 
-# --- no-alloc async TCP/IP stack (UDP for AXUDP, TCP for KISS + telnet) ---
+# --- no-alloc async TCP/IP stack (UDP for DHCP/DNS/mDNS, TCP for the web panel, telnet, KISS-TCP) ---
 embassy-net = { version = "0.9", default-features = false, features = ["defmt", "udp", "tcp", "dhcpv4", "dhcpv4-hostname", "proto-ipv4", "medium-ethernet", "multicast"] }
 
 # Async byte-I/O traits — `embassy_rp::uart::BufferedUart` implements these; the
-# KISS-over-serial transport's `ByteStream` impl (transports::kiss_serial) drives the
+# NinoTNC port's `ByteStream` impl (ports::ninotnc) drives the
 # NinoTNC UART through them. (Re-exported by embassy-rp, pinned explicitly for the
 # direct `Read`/`Write` use.)
 embedded-io-async = { version = "0.7", default-features = false }

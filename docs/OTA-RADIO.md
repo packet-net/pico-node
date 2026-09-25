@@ -24,8 +24,8 @@ We already have, in firmware:
 
 - **NET/ROM L4 circuits** — `C M9YYY-9` lands at the node console over a reliable,
   in-order, windowed connection (a byte stream).
-- **`kiss_serial`** — the Pico↔NinoTNC↔radio path (built, type-checked, spawned
-  when a NinoTNC is wired).
+- **`ports::ninotnc`**: the Pico to NinoTNC to radio path (the node's radio port,
+  verified on air 2026-09-25).
 - **`ota::stream_to_dfu`** — takes a byte stream + length and writes it into DFU,
   then verifies + marks for swap.
 

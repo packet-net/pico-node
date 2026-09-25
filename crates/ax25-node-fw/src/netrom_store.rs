@@ -274,7 +274,9 @@ pub fn load(flash: &mut ConfigFlash, netrom: &mut NetRom, my_call: Callsign) -> 
     // neighbour (sender = neighbour + its alias, entries = its destinations),
     // and ingest — exactly the on-air learning path. now=0: the obsolescence
     // resets to OBSINIT and confirms on the next live broadcast.
-    let port_id = PortId::from_str_lossy("axudp");
+    // The radio port's id (`ports::Port::NINOTNC`; spelled out here because
+    // the on-target test includes this file without the ports module).
+    let port_id = PortId::from_str_lossy("radio");
     let mut done = heapless::Vec::<Callsign, 32>::new();
     let mut replayed = 0usize;
 

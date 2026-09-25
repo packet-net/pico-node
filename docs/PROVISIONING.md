@@ -14,7 +14,7 @@ One **same-for-everyone firmware image** (releases become directly flashable):
    `pico-node-XXXX` (chip-id suffix until a callsign is set, callsign after).
 2. Connecting to that AP triggers a **captive-portal flow** (phone/laptop pops
    the portal automatically): set callsign + SSID, alias, grid, modem/port
-   options (AXUDP peers, KISS targets, NODES origination), and *optionally*
+   options (KISS targets, NODES origination), and *optionally*
    join a WiFi network (scan + pick + passphrase).
 3. Config is **persisted to flash**. Subsequent boots join the configured WiFi
    directly (STA mode).
@@ -62,7 +62,7 @@ boot ── read config ── STA configured? ── yes ── join WiFi ─�
 ```
 
 - Remote mode = AP up + all transports that don't need STA (KISS serial, RF
-  via TNC, NET/ROM over those) fully operational. AXUDP/KISS-TCP/telnet bind
+  via TNC, NET/ROM over those) fully operational. KISS-TCP/telnet bind
   on the AP subnet too — a laptop joined to the node's AP can use everything.
 - LAN mode = STA joined; portal served on the LAN (and config still editable
   via the telnet console. As built, the console is unauthenticated - the
@@ -80,8 +80,8 @@ boot ── read config ── STA configured? ── yes ── join WiFi ─�
 > kept for the field inventory it lists.
 
 `struct StoredConfig { version, crc }` over: callsign+ssid, alias, grid,
-node hostname; wifi: Option<{ssid, psk}>; mode hints; axudp {port, peers[]},
-kiss_tcp Option<target>, kiss_serial {baud}, telnet {port}; netrom
+node hostname; wifi: Option<{ssid, psk}>; mode hints;
+kiss_tcp Option<target>, ninotnc {baud, mode, KISS params}, telnet {port}; netrom
 {enabled, origination params}; ap {passphrase (default well-known), channel}.
 Serialization: `postcard` (no_std, tiny) + CRC32 + length, version-gated for
 migrations.

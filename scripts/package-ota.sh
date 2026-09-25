@@ -46,7 +46,7 @@ BLOBS_ADDR=0x10108000
 # var, so empty-present wins). AP_PASSPHRASE keeps its compiled default.
 export NODE_CALLSIGN="" NODE_ALIAS="" NODE_GRID=""
 export WIFI_SSID="" WIFI_PASSWORD=""
-export AXUDP_BEACON_TARGET="" KISS_TCP_TARGET="" MQTT_HOST="" NODES_INTERVAL_SECS=""
+export KISS_TCP_TARGET="" MQTT_HOST="" NODES_INTERVAL_SECS=""
 unset OTA_FORCE_BRICK
 
 echo "==> building bootloader"

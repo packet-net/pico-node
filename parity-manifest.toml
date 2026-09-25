@@ -66,8 +66,8 @@ in           = true
 capabilities = ["kiss"]
 
 [vector_sets.axudp]
-in           = true
-capabilities = ["axudp"]
+in     = false
+reason = "AXUDP removed 2026-09-25: pico-node is a radio-first node (radio ports only; WiFi is admin-only)."
 
 [vector_sets.netrom_quality]
 in           = true
