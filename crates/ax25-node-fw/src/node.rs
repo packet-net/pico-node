@@ -912,7 +912,9 @@ fn apply_followup(
     match f {
         FollowUp::StartBridge { console, target } => {
             // The originating user a circuit carries: the console user's call,
-            // or for a user who arrived by circuit, the node it came from.
+            // or for a user who arrived by circuit, the user that circuit was
+            // opened for (not the node it came through), so the far end sees
+            // who is really connecting.
             let user = match console {
                 Leg::Peer(call) => call,
                 Leg::Circuit(key) => l4
@@ -920,7 +922,7 @@ fn apply_followup(
                     .iter()
                     .flatten()
                     .find(|c| c.conn.key == key)
-                    .map(|c| c.conn.peer)
+                    .map(|c| c.conn.user)
                     .unwrap_or(my_call),
             };
             let routed = open_circuit(
