@@ -8,6 +8,7 @@
 pub mod axudp;
 pub mod kiss_tcp;
 pub mod relay;
+pub mod rf;
 pub mod telnet;
 // kiss_serial (NinoTNC over UART1 GP20/21 — NinoBLE Rev5; HARDWARE-NINOBLE.md).
 // Spawned; the read pump + NODES origination run, but the live exchange is
@@ -25,6 +26,14 @@ use alloc::vec::Vec;
 
 use embassy_net::tcp::TcpSocket;
 use embassy_net::IpEndpoint;
+
+/// Where a connected-mode peer is reached: an AXUDP endpoint, or the radio
+/// port (the NinoTNC on the serial link; see [`rf`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, defmt::Format)]
+pub enum Link {
+    Udp(IpEndpoint),
+    Rf,
+}
 
 /// Render a callsign into a small stack buffer for defmt logging.
 pub fn call_str<'b>(call: &Callsign, buf: &'b mut [u8; 16]) -> &'b str {

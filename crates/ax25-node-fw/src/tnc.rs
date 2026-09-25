@@ -71,8 +71,9 @@ pub struct TncState {
     /// AX.25 frames heard / sent since boot.
     pub rx_frames: u32,
     pub tx_frames: u32,
-    /// The TNC's last diagnostic or status report.
+    /// The TNC's last diagnostic or status report, and when it arrived.
     pub status: Option<NinoTncStatusFrame>,
+    pub status_at_ms: u64,
     /// The current or most recent mode change.
     pub mode_job: Option<ModeSetter>,
     /// The current or most recent TNC firmware update.
@@ -88,6 +89,7 @@ pub static STATE: Mutex<CriticalSectionRawMutex, RefCell<TncState>> =
         rx_frames: 0,
         tx_frames: 0,
         status: None,
+        status_at_ms: 0,
         mode_job: None,
         flash: FlashStatus::Idle,
         staged: None,
@@ -133,6 +135,26 @@ pub fn submit(cmd: TncCommand) -> Result<(), &'static str> {
     }
     CMD.try_send(cmd)
         .map_err(|_| "The TNC link is busy; try again in a moment.")
+}
+
+/// Refuse settings and transmissions until the TNC has reported firmware the
+/// node supports (3.44 / 4.44 or later).
+fn require_supported() -> Result<(), alloc::string::String> {
+    let version = with_state(|s| s.status.and_then(|st| st.firmware_version));
+    match version {
+        Some(v) if v.is_supported() => Ok(()),
+        Some(v) => Err(alloc::format!(
+            "The TNC runs firmware {}.{}; pico-node needs {}.{} or later. Update the TNC \
+firmware first.",
+            v.major,
+            v.minor,
+            v.major,
+            ax25_node_core::kiss::ninotnc::firmware::MIN_SUPPORTED_MINOR
+        )),
+        None => Err("The TNC has not reported its firmware yet. Check the serial wiring and \
+that the TNC is powered."
+            .into()),
+    }
 }
 
 /// Whether a TNC firmware update is in progress.
@@ -301,17 +323,12 @@ fn write_status_json(w: &mut BufWriter<'_>, now: u64) -> fmt::Result {
                 (None, Some(b)) => json_str(w, |j| write!(j, "unknown (0x{b:02X})"))?,
                 (None, None) => w.write_str("null")?,
             }
-            w.write_str(",\"sethw\":")?;
+            w.write_str(",\"ok\":")?;
             match st.firmware_version {
-                Some(v) => write!(
-                    w,
-                    "{},\"old\":{},\"major\":{}",
-                    v.supports_sethw_mode(),
-                    v.older_than_catalog(),
-                    v.major
-                )?,
-                None => w.write_str("null,\"old\":null,\"major\":null")?,
+                Some(v) => write!(w, "{},\"major\":{}", v.is_supported(), v.major)?,
+                None => w.write_str("null,\"major\":null")?,
             }
+            write!(w, ",\"at\":{}", with_state(|s| s.status_at_ms))?;
             w.write_str(",\"uptime\":")?;
             match st.uptime_ms {
                 Some(u) => write!(w, "{}", u / 1000)?,
@@ -388,6 +405,7 @@ pub fn form_value(body: &[u8], key: &str) -> Option<alloc::string::String> {
 /// Handle `POST /tnc/mode` (`mode`, optional `flash=on`). Saves the mode on the
 /// node (re-applied at every boot, RAM-only) and queues the change.
 pub fn post_mode(body: &[u8]) -> Result<&'static str, alloc::string::String> {
+    require_supported()?;
     let mode = form_value(body, "mode").unwrap_or_default();
     let flash = form_value(body, "flash").is_some_and(|v| v == "on");
     crate::config_store::set_tnc_and_save(&[("TNC_MODE", mode.as_str())])?;
@@ -401,6 +419,7 @@ pub fn post_mode(body: &[u8]) -> Result<&'static str, alloc::string::String> {
 
 /// Handle `POST /tnc/params`. Blank fields keep their current value.
 pub fn post_params(body: &[u8]) -> Result<&'static str, alloc::string::String> {
+    require_supported()?;
     let mut owned: heapless::Vec<(&'static str, alloc::string::String), 5> = heapless::Vec::new();
     for (form, key) in [
         ("txdelay", "TXDELAY"),
@@ -424,6 +443,7 @@ pub fn post_params(body: &[u8]) -> Result<&'static str, alloc::string::String> {
 
 /// Handle `POST /tnc/test` (`dest`, `text`).
 pub fn post_test(body: &[u8]) -> Result<&'static str, alloc::string::String> {
+    require_supported()?;
     let dest = form_value(body, "dest").unwrap_or_default();
     let dest = Callsign::parse(dest.trim()).ok_or("Destination is not a valid callsign.")?;
     let text = form_value(body, "text").unwrap_or_default();

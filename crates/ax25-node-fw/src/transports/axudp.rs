@@ -37,7 +37,7 @@
 //! `&mut` story trivial; when a second connected-mode transport arrives the
 //! manager moves behind the supervisor seam `session.rs` documents.
 
-use ax25_node_core::ax25::{Callsign, PID_NETROM, PID_NO_LAYER3};
+use ax25_node_core::ax25::{Callsign, Frame, PID_NETROM, PID_NO_LAYER3};
 use ax25_node_core::axudp;
 use ax25_node_core::console::command::parse_bytes;
 use ax25_node_core::console::service::{banner_and_prompt, dispatch, Identity};
@@ -65,12 +65,13 @@ use alloc::vec::Vec;
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpEndpoint, Stack};
+// IpEndpoint remains for the beacon target and the NODES fan-out list.
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
 use crate::config::{AxudpConfig, NetRomConfig};
 use crate::session;
 use crate::transports::relay::{self, RelayStatus};
-use crate::transports::{call_str, parse_endpoint, ui_frame};
+use crate::transports::{call_str, parse_endpoint, rf, ui_frame, Link};
 
 /// Seconds between beacon UI frames when a beacon target is configured.
 const BEACON_INTERVAL_SECS: u64 = 10;
@@ -139,7 +140,8 @@ struct PeerState {
     /// against LinBPQ).
     local: Callsign,
     timers: session::EmbassyTimers,
-    endpoint: IpEndpoint,
+    /// Where the peer is reached: an AXUDP endpoint or the radio port.
+    endpoint: Link,
     role: Role,
 }
 
@@ -192,6 +194,7 @@ pub async fn task(
     // equivalent): fed every decoded inbound frame BEFORE address filtering.
     let mut netrom = session::new_netrom();
     let port_id = PortId::from_str_lossy("axudp");
+    let rf_port_id = PortId::from_str_lossy("rf");
 
     // Repopulate the routing table from flash (survives power failure — like
     // BPQ's BPQNODES.dat). Replays persisted routes through the live ingest
@@ -273,7 +276,7 @@ pub async fn task(
 
     // Callsign → last-heard UDP endpoint (the outbound-connect route table;
     // LinBPQ's periodic ID/NODES broadcasts keep it warm).
-    let mut heard: [Option<(Callsign, IpEndpoint)>; 8] = [None; 8];
+    let mut heard: [Option<(Callsign, Link)>; 8] = [None; 8];
 
     let mut dgram_buf = [0u8; 2048];
     let mut ticker = Ticker::every(Duration::from_secs(BEACON_INTERVAL_SECS));
@@ -312,15 +315,22 @@ pub async fn task(
             }
         };
 
-        match select4(
-            ticker.next(),
-            socket.recv_from(&mut dgram_buf),
-            timer_wait,
-            relay_fut,
+        // The radio port's heard frames arrive from the serial task (rf::RX);
+        // a frame from either port is handled by the same code below.
+        let woke = select(
+            select4(
+                ticker.next(),
+                socket.recv_from(&mut dgram_buf),
+                timer_wait,
+                relay_fut,
+            ),
+            rf::RX.receive(),
         )
-        .await
-        {
-            Either4::First(()) => {
+        .await;
+        let mut received: Option<(Frame, Link)> = None;
+        match woke {
+            Either::Second(frame) => received = Some((frame, Link::Rf)),
+            Either::First(Either4::First(())) => {
                 if let Some(ep) = beacon_ep {
                     let beacon = ui_frame(
                         my_call,
@@ -520,7 +530,10 @@ pub async fn task(
                     for ep in beacon_ep
                         .iter()
                         .copied()
-                        .chain(heard.iter().flatten().map(|(_, ep)| *ep))
+                        .chain(heard.iter().flatten().filter_map(|(_, l)| match l {
+                            Link::Udp(ep) => Some(*ep),
+                            Link::Rf => None,
+                        }))
                     {
                         if !targets[..n_targets].iter().flatten().any(|t| *t == ep) {
                             targets[n_targets] = Some(ep);
@@ -536,6 +549,8 @@ pub async fn task(
                                 defmt::warn!("axudp: NODES send error {:?}", e);
                             }
                         }
+                        // And on the air, once, when the radio port is usable.
+                        rf::send(frame.encode()).await;
                     }
                     defmt::info!(
                         "axudp: NODES broadcast sent ({=usize} frame(s) to {=usize} endpoint(s))",
@@ -544,157 +559,22 @@ pub async fn task(
                     );
                 }
             }
-            Either4::Second(Ok((n, meta))) => {
+            Either::First(Either4::Second(Ok((n, meta)))) => {
                 let rx = axudp::decode_datagram(&dgram_buf[..n]);
-                let Some(frame) = rx.frame else {
-                    defmt::warn!(
+                match rx.frame {
+                    Some(frame) => received = Some((frame, Link::Udp(meta.endpoint))),
+                    None => defmt::warn!(
                         "axudp: {=usize} bytes from {:?} rejected (fcs_valid={=bool})",
                         n,
                         meta.endpoint,
                         rx.fcs_valid
-                    );
-                    continue;
-                };
-
-                // READ-ONLY NET/ROM TAP — every frame, BEFORE the address filter,
-                // so NODES broadcasts (addressed to "NODES", not us) are heard.
-                let outcome = session::observe_inbound(&mut netrom, &frame, my_call, port_id);
-                if let ObserveOutcome::Ingested { .. } = outcome {
-                    defmt::info!(
-                        "axudp: NODES broadcast ingested ({=u32} destinations known)",
-                        netrom.destination_count() as u32
-                    );
-                    crate::mqtt::log("NODES broadcast ingested");
-                }
-
-                defmt::info!(
-                    "axudp: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B from {:?}",
-                    call_str(&frame.source.callsign, &mut src_buf),
-                    call_str(&frame.destination.callsign, &mut dst_buf),
-                    frame.control,
-                    frame.info.len(),
-                    meta.endpoint
-                );
-                if frame.is_ui() && !frame.info.is_empty() {
-                    if let Ok(text) = core::str::from_utf8(&frame.info) {
-                        defmt::info!("axudp: rx UI text: {=str}", text);
-                    }
-                }
-
-                heard_update(&mut heard, frame.source.callsign, meta.endpoint);
-
-                // Address filter → the connected-mode session layer. A frame is
-                // ours if addressed to the node call (new/inbound links) or to
-                // the per-link local of an existing session (cross-SSID bridge
-                // links don't use the node call).
-                let dest = frame.destination.callsign;
-                let for_us = dest == my_call
-                    || peers
-                        .iter()
-                        .flatten()
-                        .any(|ps| ps.peer == frame.source.callsign && ps.local == dest);
-                if for_us && !frame.is_ui() {
-                    let peer = frame.source.callsign;
-
-                    // v2.2 XID negotiation arrives BEFORE SABM and isn't an SDL
-                    // event (classify_incoming returns None — the tables carry
-                    // only the initiator MDL). Detect it by control byte (0xAF
-                    // + optional P/F) and answer like a v2.0 station: DM, so the
-                    // peer (BPQ does) falls back to a plain SABM. Only when no
-                    // session is up — a mid-session XID is ignored like any
-                    // other unclassified frame.
-                    const XID: u8 = 0xAF;
-                    if frame.control & !0x10 == XID && sessions.session_for(&peer).is_none() {
-                        defmt::info!("axudp: XID received — answering DM (v2.0 fallback)");
-                        let sink = WireSink::new(my_call, peer, alloc::vec::Vec::new());
-                        let dm = sink.build_frame(&FrameSpec::Unnumbered {
-                            kind: UnnumberedKind::Dm,
-                            is_command: false,
-                            pf: (frame.control & 0x10) != 0,
-                            expedited: false,
-                        });
-                        let dgram = axudp::encode_datagram(&dm);
-                        if let Err(e) = socket.send_to(&dgram, meta.endpoint).await {
-                            defmt::warn!("axudp: DM send error {:?}", e);
-                        }
-                        continue;
-                    }
-
-                    let Some(event) = classify_incoming(&frame) else {
-                        continue;
-                    };
-                    let Some(i) = peer_slot(&mut peers, peer, my_call, meta.endpoint) else {
-                        defmt::warn!("axudp: peer table full, dropping session frame");
-                        continue;
-                    };
-                    // NB: the link endpoint is PINNED at slot creation (inbound:
-                    // the SABM's source; outbound: the heard-table/beacon entry)
-                    // and deliberately NOT floated per-datagram — BPQ AXIP nodes
-                    // can emit a link's frames from a different source socket
-                    // than the one we address (observed live with two LinBPQ
-                    // instances on one host: the bridge target's CTEXT arrived
-                    // from its sibling's port, and floating the endpoint sent
-                    // every reply to the wrong node).
-                    drive(
-                        &mut sessions,
-                        &mut peers,
-                        &socket,
-                        &heard,
-                        beacon_ep,
-                        my_call,
-                        &mut L4 {
-                            connector: &mut connector,
-                            netrom: &mut netrom,
-                            circuits: &mut circuits,
-                            inp3: inp3.as_mut(),
-                        },
-                        i,
-                        event,
-                        &console_id,
-                        &prompt,
-                    )
-                    .await;
-
-                    // If that inbound frame was an INP3 L3RTT *probe*, the engine has
-                    // queued our reflection — ship it NOW (same event-loop turn), not on
-                    // the next 10 s beacon tick: the peer times our reflection to measure
-                    // its SNTT to us, so a tick-deferred reflection would inflate it by up
-                    // to BEACON_INTERVAL_SECS. (Originated probes + RIFs stay on the tick;
-                    // only the reflection is latency-critical.) The inbound `drive` has
-                    // returned, so `inp3`/`peers`/`sessions` are free to reborrow here.
-                    let reflections = match inp3.as_mut() {
-                        Some(host) => host.take_outbound_l3rtt(),
-                        None => Vec::new(),
-                    };
-                    for (nbr, bytes) in reflections {
-                        if let Some(j) = find_peer(&peers, &nbr) {
-                            drive(
-                                &mut sessions,
-                                &mut peers,
-                                &socket,
-                                &heard,
-                                beacon_ep,
-                                my_call,
-                                &mut L4 {
-                                    connector: &mut connector,
-                                    netrom: &mut netrom,
-                                    circuits: &mut circuits,
-                                    inp3: inp3.as_mut(),
-                                },
-                                j,
-                                Event::DlDataRequest(PID_NETROM, bytes),
-                                &console_id,
-                                &prompt,
-                            )
-                            .await;
-                        }
-                    }
+                    ),
                 }
             }
-            Either4::Second(Err(e)) => {
+            Either::First(Either4::Second(Err(e))) => {
                 defmt::warn!("axudp: recv error {:?}", e);
             }
-            Either4::Third(()) => {
+            Either::First(Either4::Third(())) => {
                 // One or more peer timers hit their deadline: post the expiry
                 // events into the owning sessions and flush what they emit.
                 let now = Instant::now();
@@ -746,7 +626,7 @@ pub async fn task(
                     }
                 }
             }
-            Either4::Fourth(ev) => match ev {
+            Either::First(Either4::Fourth(ev)) => match ev {
                 RelayEvent::Connect(target) => {
                     match start_outbound(
                         &mut peers,
@@ -829,6 +709,146 @@ pub async fn task(
                 }
             },
         }
+
+        let Some((frame, link)) = received else {
+            continue;
+        };
+
+                // READ-ONLY NET/ROM TAP: every frame, BEFORE the address filter,
+                // so NODES broadcasts (addressed to "NODES", not us) are heard.
+                let port = match link {
+                    Link::Udp(_) => port_id,
+                    Link::Rf => rf_port_id,
+                };
+                let outcome = session::observe_inbound(&mut netrom, &frame, my_call, port);
+                if let ObserveOutcome::Ingested { .. } = outcome {
+                    defmt::info!(
+                        "axudp: NODES broadcast ingested ({=u32} destinations known)",
+                        netrom.destination_count() as u32
+                    );
+                    crate::mqtt::log("NODES broadcast ingested");
+                }
+
+                defmt::info!(
+                    "axudp: rx {=str} -> {=str} ctl={=u8:#04x} info={=usize}B from {:?}",
+                    call_str(&frame.source.callsign, &mut src_buf),
+                    call_str(&frame.destination.callsign, &mut dst_buf),
+                    frame.control,
+                    frame.info.len(),
+                    link
+                );
+                if frame.is_ui() && !frame.info.is_empty() {
+                    if let Ok(text) = core::str::from_utf8(&frame.info) {
+                        defmt::info!("axudp: rx UI text: {=str}", text);
+                    }
+                }
+
+                heard_update(&mut heard, frame.source.callsign, link);
+
+                // Address filter → the connected-mode session layer. A frame is
+                // ours if addressed to the node call (new/inbound links) or to
+                // the per-link local of an existing session (cross-SSID bridge
+                // links don't use the node call).
+                let dest = frame.destination.callsign;
+                let for_us = dest == my_call
+                    || peers
+                        .iter()
+                        .flatten()
+                        .any(|ps| ps.peer == frame.source.callsign && ps.local == dest);
+                if for_us && !frame.is_ui() {
+                    let peer = frame.source.callsign;
+
+                    // v2.2 XID negotiation arrives BEFORE SABM and isn't an SDL
+                    // event (classify_incoming returns None; the tables carry
+                    // only the initiator MDL). Detect it by control byte (0xAF
+                    // + optional P/F) and answer like a v2.0 station: DM, so the
+                    // peer (BPQ does) falls back to a plain SABM. Only when no
+                    // session is up; a mid-session XID is ignored like any
+                    // other unclassified frame.
+                    const XID: u8 = 0xAF;
+                    if frame.control & !0x10 == XID && sessions.session_for(&peer).is_none() {
+                        defmt::info!("axudp: XID received, answering DM (v2.0 fallback)");
+                        let sink = WireSink::new(my_call, peer, alloc::vec::Vec::new());
+                        let dm = sink.build_frame(&FrameSpec::Unnumbered {
+                            kind: UnnumberedKind::Dm,
+                            is_command: false,
+                            pf: (frame.control & 0x10) != 0,
+                            expedited: false,
+                        });
+                        send_all(&socket, link, alloc::vec![dm.encode()]).await;
+                        continue;
+                    }
+
+                    let Some(event) = classify_incoming(&frame) else {
+                        continue;
+                    };
+                    let Some(i) = peer_slot(&mut peers, peer, my_call, link) else {
+                        defmt::warn!("axudp: peer table full, dropping session frame");
+                        continue;
+                    };
+                    // NB: the link endpoint is PINNED at slot creation (inbound:
+                    // the SABM's source; outbound: the heard-table/beacon entry)
+                    // and deliberately NOT floated per-datagram: BPQ AXIP nodes
+                    // can emit a link's frames from a different source socket
+                    // than the one we address (observed live with two LinBPQ
+                    // instances on one host: the bridge target's CTEXT arrived
+                    // from its sibling's port, and floating the endpoint sent
+                    // every reply to the wrong node).
+                    drive(
+                        &mut sessions,
+                        &mut peers,
+                        &socket,
+                        &heard,
+                        beacon_ep,
+                        my_call,
+                        &mut L4 {
+                            connector: &mut connector,
+                            netrom: &mut netrom,
+                            circuits: &mut circuits,
+                            inp3: inp3.as_mut(),
+                        },
+                        i,
+                        event,
+                        &console_id,
+                        &prompt,
+                    )
+                    .await;
+
+                    // If that inbound frame was an INP3 L3RTT *probe*, the engine has
+                    // queued our reflection; ship it NOW (same event-loop turn), not on
+                    // the next 10 s beacon tick: the peer times our reflection to measure
+                    // its SNTT to us, so a tick-deferred reflection would inflate it by up
+                    // to BEACON_INTERVAL_SECS. (Originated probes + RIFs stay on the tick;
+                    // only the reflection is latency-critical.) The inbound `drive` has
+                    // returned, so `inp3`/`peers`/`sessions` are free to reborrow here.
+                    let reflections = match inp3.as_mut() {
+                        Some(host) => host.take_outbound_l3rtt(),
+                        None => Vec::new(),
+                    };
+                    for (nbr, bytes) in reflections {
+                        if let Some(j) = find_peer(&peers, &nbr) {
+                            drive(
+                                &mut sessions,
+                                &mut peers,
+                                &socket,
+                                &heard,
+                                beacon_ep,
+                                my_call,
+                                &mut L4 {
+                                    connector: &mut connector,
+                                    netrom: &mut netrom,
+                                    circuits: &mut circuits,
+                                    inp3: inp3.as_mut(),
+                                },
+                                j,
+                                Event::DlDataRequest(PID_NETROM, bytes),
+                                &console_id,
+                                &prompt,
+                            )
+                            .await;
+                        }
+                    }
+                }
     }
 }
 
@@ -855,7 +875,7 @@ async fn drive(
     sessions: &mut session::Sessions,
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
     socket: &UdpSocket<'_>,
-    heard: &[Option<(Callsign, IpEndpoint)>; 8],
+    heard: &[Option<(Callsign, Link)>; 8],
     beacon_ep: Option<IpEndpoint>,
     my_call: Callsign,
     l4: &mut L4<'_>,
@@ -1364,7 +1384,7 @@ async fn ensure_interlinks(
     sessions: &mut session::Sessions,
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
     socket: &UdpSocket<'_>,
-    heard: &[Option<(Callsign, IpEndpoint)>; 8],
+    heard: &[Option<(Callsign, Link)>; 8],
     beacon_ep: Option<IpEndpoint>,
     my_call: Callsign,
     netrom: &mut session::NetRom,
@@ -1421,7 +1441,7 @@ async fn ensure_interlinks(
 /// its endpoint from the heard-table (beacon target as fallback).
 fn start_outbound(
     peers: &mut [Option<PeerState>; session::MAX_SESSIONS],
-    heard: &[Option<(Callsign, IpEndpoint)>; 8],
+    heard: &[Option<(Callsign, Link)>; 8],
     beacon_ep: Option<IpEndpoint>,
     target: Callsign,
     local: Callsign,
@@ -1430,7 +1450,7 @@ fn start_outbound(
     if find_peer(peers, &target).is_some() {
         return Err("target is busy (session already up)");
     }
-    let Some(ep) = heard_lookup(heard, &target).or(beacon_ep) else {
+    let Some(ep) = heard_lookup(heard, &target).or(beacon_ep.map(Link::Udp)) else {
         return Err("no known endpoint for target");
     };
     let Some(i) = peer_slot(peers, target, local, ep) else {
@@ -1472,7 +1492,7 @@ fn peer_slot(
     peers: &mut [Option<PeerState>],
     peer: Callsign,
     local: Callsign,
-    endpoint: IpEndpoint,
+    endpoint: Link,
 ) -> Option<usize> {
     if let Some(i) = find_peer(peers, &peer) {
         return Some(i);
@@ -1498,19 +1518,25 @@ fn reap(sessions: &mut session::Sessions, peers: &mut [Option<PeerState>], i: us
     }
 }
 
-/// Send each wire frame to `ep` with the AXUDP FCS appended.
-async fn send_all(socket: &UdpSocket<'_>, ep: IpEndpoint, frames: Vec<Vec<u8>>) {
+/// Send each wire frame over the peer's link: to an AXUDP endpoint with the FCS
+/// appended, or to the radio port (the serial task KISS-frames it).
+async fn send_all(socket: &UdpSocket<'_>, link: Link, frames: Vec<Vec<u8>>) {
     for wire in frames {
-        let dgram = axudp::append_fcs(wire);
-        if let Err(e) = socket.send_to(&dgram, ep).await {
-            defmt::warn!("axudp: session tx error {:?}", e);
+        match link {
+            Link::Udp(ep) => {
+                let dgram = axudp::append_fcs(wire);
+                if let Err(e) = socket.send_to(&dgram, ep).await {
+                    defmt::warn!("axudp: session tx error {:?}", e);
+                }
+            }
+            Link::Rf => rf::send(wire).await,
         }
     }
 }
 
 /// Record `call → endpoint` in the heard table (update in place, else first
 /// free slot, else overwrite the oldest by rotation).
-fn heard_update(heard: &mut [Option<(Callsign, IpEndpoint)>; 8], call: Callsign, ep: IpEndpoint) {
+fn heard_update(heard: &mut [Option<(Callsign, Link)>; 8], call: Callsign, ep: Link) {
     if let Some(e) = heard.iter_mut().flatten().find(|(c, _)| *c == call) {
         e.1 = ep;
         return;
@@ -1525,9 +1551,9 @@ fn heard_update(heard: &mut [Option<(Callsign, IpEndpoint)>; 8], call: Callsign,
 
 /// Resolve a callsign to its last-heard endpoint.
 fn heard_lookup(
-    heard: &[Option<(Callsign, IpEndpoint)>; 8],
+    heard: &[Option<(Callsign, Link)>; 8],
     call: &Callsign,
-) -> Option<IpEndpoint> {
+) -> Option<Link> {
     heard
         .iter()
         .flatten()

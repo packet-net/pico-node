@@ -42,10 +42,6 @@ use ax25_node_core::kiss::ninotnc::{
 use ax25_node_core::kiss::serial::ByteStream;
 use ax25_node_core::kiss::{classify::InboundEvent, Command, SerialKissModem};
 use ax25_node_core::monitor::{write_frame, Direction};
-use ax25_node_core::netrom::wire::Alias;
-use ax25_node_core::netrom::{
-    NetRomOriginator, NetRomOriginatorOptions, ObserveOutcome, PortId,
-};
 
 use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_rp::bind_interrupts;
@@ -54,20 +50,15 @@ use embassy_rp::uart::{
     BufferedInterruptHandler, BufferedUart, Config as UartConfig, Error as UartError,
 };
 use embassy_rp::Peri;
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use static_cell::StaticCell;
 
-use crate::config::{KissSerialConfig, NetRomConfig};
+use crate::config::KissSerialConfig;
 use crate::config_store::TncSettings;
-use crate::session;
 use crate::tnc::{self, FlashStatus, TncCommand};
 use crate::tnc_image::{self, LineReader};
-use crate::transports::{call_str, ui_frame};
-
-/// Seconds between housekeeping ticks (NODES origination and the obsolescence
-/// sweep each check their own interval on every tick).
-const HOUSEKEEPING_TICK_SECS: u64 = 10;
+use crate::transports::{call_str, rf, ui_frame};
 
 bind_interrupts!(struct Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
@@ -110,9 +101,7 @@ pub async fn task(
     tx_pin: Peri<'static, PIN_20>,
     rx_pin: Peri<'static, PIN_21>,
     cfg: KissSerialConfig,
-    netrom_cfg: NetRomConfig,
     my_call: Callsign,
-    node_alias: &'static str,
 ) {
     defmt::info!(
         "kiss-serial: UART1 GP20/21 @ {} baud (NinoTNC direct UART)",
@@ -127,48 +116,30 @@ pub async fn task(
         write!(w, "Serial link to the TNC started, {baud} baud")
     });
 
-    // Bring the TNC to the settings saved on the node: KISS parameters first,
-    // then the mode (verified by readback). With no saved mode, still ask for a
-    // GETALL so the page can show what the TNC is running. The build-env
+    // The node's saved settings (the /tnc page / console keys). The build-env
     // NINOTNC_MODE is the fallback when no mode is saved.
     let mut settings = cfg.tnc;
     if settings.mode.is_none() {
         settings.mode = cfg.startup_mode.filter(|m| *m <= 15);
     }
+    let mut link = LinkState::default();
     let mut mode_job: Option<ModeSetter> = None;
-    apply_saved(&mut modem, &settings, &mut mode_job).await;
 
-    // Read-only NET/ROM tap + NODES origination + obsolescence sweep — the same
-    // wiring the KISS-TCP transport uses, now over real RF (Gap A + Gap B). Each
-    // transport owns its own routing table (the single-transport-ownership model;
-    // the shared session/routing supervisor seam is deferred).
-    let mut netrom = session::new_netrom();
-    let port_id = PortId::from_str_lossy("kiss-serial");
-    let originator = NetRomOriginator::new(NetRomOriginatorOptions {
-        enabled: netrom_cfg.originate,
-        alias: Some(Alias::from_str_lossy(node_alias)),
-        node_call: Some(my_call),
-        obsolete_minimum: None,
-    });
-    let nodes_interval = Duration::from_secs(netrom_cfg.nodes_interval_secs as u64);
-    let mut next_nodes_at = Instant::now(); // announce on the first tick
-    let mut next_sweep_at = Instant::now() + nodes_interval;
-    if netrom_cfg.originate {
-        defmt::info!(
-            "kiss-serial: NODES origination on, every {=u32}s",
-            netrom_cfg.nodes_interval_secs
-        );
-    }
+    // Nothing is sent to the TNC, and the radio port stays closed, until it has
+    // said which firmware it runs: see `LinkState::on_report`.
+    send_get_all(&mut modem).await;
 
-    let mut ticker = Ticker::every(Duration::from_secs(HOUSEKEEPING_TICK_SECS));
-
-    // The pump: wake on an inbound KISS frame, the housekeeping tick, a command
-    // from the web page, or the mode change's next deadline. `read_frame` is
-    // cancel-safe (its only await is the UART read; the decode state lives in
-    // the modem), so losing the race drops no bytes.
+    // The pump: wake on an inbound KISS frame, a command from the web page, the
+    // mode change's next deadline, a frame from the session task to transmit, or
+    // the retry timer for an unanswered GETALL. `read_frame` is cancel-safe (its
+    // only await is the UART read; the decode state lives in the modem), so
+    // losing the race drops no bytes.
     loop {
-        let deadline = mode_job.as_ref().and_then(|j| j.deadline_ms());
-        let job_timer = async move {
+        let deadline = mode_job
+            .as_ref()
+            .and_then(|j| j.deadline_ms())
+            .or(link.retry_at_ms);
+        let timer = async move {
             match deadline {
                 Some(d) => Timer::at(Instant::from_millis(d)).await,
                 None => core::future::pending::<()>().await,
@@ -176,9 +147,9 @@ pub async fn task(
         };
         match select4(
             modem.read_frame(),
-            ticker.next(),
             tnc::CMD.receive(),
-            job_timer,
+            timer,
+            rf::TX.receive(),
         )
         .await
         {
@@ -186,10 +157,15 @@ pub async fn task(
                 Ok(Some(frame)) => {
                     let now = tnc::now_ms();
                     tnc::with_state(|s| s.last_heard_ms = Some(now));
-                    let heard = handle_inbound(&frame, &mut netrom, my_call, port_id);
-                    if let (Some(status), Some(job)) = (heard, mode_job.as_mut()) {
+                    let Some(status) = handle_inbound(&frame) else {
+                        continue;
+                    };
+                    if let Some(job) = mode_job.as_mut() {
                         let step = job.on_status(&status, now);
                         advance_mode(&mut modem, &mut mode_job, step, &settings).await;
+                    }
+                    if link.on_report(&status) {
+                        apply_saved(&mut modem, &settings, &mut mode_job).await;
                     }
                 }
                 // EOF / link-down: a buffered UART doesn't really "close", but on a
@@ -200,99 +176,141 @@ pub async fn task(
                     Timer::after_millis(100).await;
                 }
             },
-            Either4::Second(()) => {
-                // Obsolescence sweep — age/purge once per NODES interval, before
-                // origination (the C# `NetRomService.OnInterval` order).
-                if Instant::now() >= next_sweep_at {
-                    next_sweep_at = Instant::now() + nodes_interval;
-                    let purged = netrom.sweep();
-                    if purged > 0 {
-                        defmt::info!(
-                            "kiss-serial: obsolescence sweep purged {=usize} stale route(s)",
-                            purged
-                        );
-                    }
-                }
-
-                // NODES origination — build our broadcasts from the live table, wrap
-                // each as a UI frame (dest NODES, PID 0xCF), and send it to the UART.
-                if netrom_cfg.originate && Instant::now() >= next_nodes_at {
-                    next_nodes_at = Instant::now() + nodes_interval;
-                    let payloads = originator.broadcast_nodes(netrom.table());
-                    let dest = NetRomOriginator::nodes_destination();
-                    let mut sent = 0usize;
-                    for payload in &payloads {
-                        let frame = ui_frame(my_call, dest, NetRomOriginator::PID, payload);
-                        if send_ax25(&mut modem, &frame).await {
-                            sent += 1;
-                        }
-                    }
-                    defmt::info!(
-                        "kiss-serial: NODES broadcast sent ({=usize} frame(s))",
-                        sent
-                    );
-                }
-            }
-            Either4::Third(cmd) => match cmd {
+            Either4::Second(cmd) => match cmd {
                 TncCommand::SetMode {
                     mode,
                     persist_to_flash,
                 } => {
                     settings.mode = Some(mode);
-                    start_mode(&mut modem, &mut mode_job, mode, persist_to_flash).await;
+                    if link.supported {
+                        start_mode(&mut modem, &mut mode_job, mode, persist_to_flash).await;
+                    }
                 }
                 TncCommand::SetParams(p) => {
                     settings = TncSettings {
                         mode: settings.mode,
                         ..p
                     };
-                    send_params(&mut modem, &settings).await;
+                    if link.supported {
+                        send_params(&mut modem, &settings).await;
+                    }
                 }
                 TncCommand::SendTest { dest, text } => {
-                    let frame = ui_frame(my_call, dest, PID_NO_LAYER3, text.as_bytes());
-                    send_ax25(&mut modem, &frame).await;
+                    if link.supported {
+                        let frame = ui_frame(my_call, dest, PID_NO_LAYER3, text.as_bytes());
+                        send_wire(&mut modem, &frame.encode()).await;
+                    }
                 }
                 TncCommand::Refresh => send_get_all(&mut modem).await,
                 TncCommand::UpdateFirmware => {
-                    run_update(&mut modem, &settings, &mut mode_job).await;
+                    rf::set_usable(false);
+                    let updated = run_update(&mut modem, &mut mode_job).await;
+                    if updated {
+                        // Start again from the top: the next report says which
+                        // firmware it runs, and the settings follow.
+                        link = LinkState::default();
+                        send_get_all(&mut modem).await;
+                    }
+                    rf::set_usable(link.supported);
                 }
             },
-            Either4::Fourth(()) => {
+            Either4::Third(()) => {
+                let now = tnc::now_ms();
                 if let Some(job) = mode_job.as_mut() {
-                    let step = job.on_time(tnc::now_ms());
-                    advance_mode(&mut modem, &mut mode_job, step, &settings).await;
+                    if job.deadline_ms().is_some_and(|d| now >= d) {
+                        let step = job.on_time(now);
+                        advance_mode(&mut modem, &mut mode_job, step, &settings).await;
+                    }
+                }
+                if link.retry_at_ms.is_some_and(|d| now >= d) {
+                    link.retry_at_ms = None;
+                    if !link.heard_report {
+                        send_get_all(&mut modem).await;
+                        link.retry_at_ms = Some(now + REPORT_RETRY_MS);
+                    }
+                }
+            }
+            Either4::Fourth(wire) => {
+                // A frame from the session task. `rf::send` already checked the
+                // port was usable when it queued; check again in case that
+                // changed since.
+                if rf::usable() {
+                    send_wire(&mut modem, &wire).await;
                 }
             }
         }
     }
 }
 
-/// Handle one inbound KISS frame: the NET/ROM tap, the monitor, and the shared
-/// TNC state. Returns the TNC's status when the frame was a report (a GETALL
-/// reply, the periodic beacon, or the TX-test diagnostic), for the mode-change
-/// readback.
-fn handle_inbound(
-    frame: &ax25_node_core::kiss::Frame,
-    netrom: &mut session::NetRom,
-    my_call: Callsign,
-    port_id: PortId,
-) -> Option<NinoTncStatusFrame> {
+/// How often to repeat GETALL while the TNC has not reported (e.g. wiring not
+/// yet right, or the TNC still booting).
+const REPORT_RETRY_MS: u64 = 10_000;
+
+/// Whether the TNC may be used, from its reports.
+struct LinkState {
+    /// Firmware 3.44 / 4.44 or later reported: settings applied, radio port open.
+    supported: bool,
+    /// Any report heard since start (or since a firmware update).
+    heard_report: bool,
+    /// The firmware last warned about, so an unsupported TNC's periodic beacon
+    /// does not repeat the warning.
+    warned: Option<ninotnc::FirmwareVersion>,
+    /// When to ask again if no report has come.
+    retry_at_ms: Option<u64>,
+}
+
+impl Default for LinkState {
+    fn default() -> Self {
+        Self {
+            supported: false,
+            heard_report: false,
+            warned: None,
+            retry_at_ms: Some(tnc::now_ms() + REPORT_RETRY_MS),
+        }
+    }
+}
+
+impl LinkState {
+    /// Take in a report. Returns `true` when the TNC has just become usable, so
+    /// the caller applies the saved settings.
+    fn on_report(&mut self, status: &NinoTncStatusFrame) -> bool {
+        self.heard_report = true;
+        let Some(version) = status.firmware_version else {
+            return false; // a report without a version changes nothing
+        };
+        let was = self.supported;
+        self.supported = version.is_supported();
+        rf::set_usable(self.supported);
+        if !self.supported && self.warned != Some(version) {
+            self.warned = Some(version);
+            tnc::log_with(Direction::Info, |w| {
+                write!(
+                    w,
+                    "The TNC runs firmware {}.{}; pico-node needs {}.{} or later, so it will not \
+use it (no settings, no traffic) until it is updated on this page.",
+                    version.major,
+                    version.minor,
+                    version.major,
+                    ninotnc::firmware::MIN_SUPPORTED_MINOR
+                )
+            });
+        }
+        self.supported && !was
+    }
+}
+
+/// Handle one inbound KISS frame: the monitor, the hand-off to the session task,
+/// and the shared TNC state. Returns the TNC's status when the frame was a
+/// report (a GETALL reply, the periodic beacon, or the TX-test diagnostic).
+fn handle_inbound(frame: &ax25_node_core::kiss::Frame) -> Option<NinoTncStatusFrame> {
     match ninotnc::classify(frame) {
         NinoTncInboundEvent::Generic(InboundEvent::Ax25 { ax25, .. }) => {
-            // READ-ONLY NET/ROM TAP: every frame, BEFORE any address filter, so
-            // NODES broadcasts (dest "NODES", not us) are heard. The same
-            // FrameTraced-equivalent point as axudp / kiss_tcp.
-            let outcome = session::observe_inbound(netrom, &ax25, my_call, port_id);
-            if let ObserveOutcome::Ingested { .. } = outcome {
-                defmt::info!(
-                    "kiss-serial: NODES broadcast ingested ({=u32} destinations known)",
-                    netrom.destination_count() as u32
-                );
-            }
             tnc::with_state(|s| s.rx_frames = s.rx_frames.wrapping_add(1));
             tnc::log_with(Direction::Rx, |w| write_frame(&ax25, w));
-            // Address-filtered connected-mode session routing is the
-            // session-supervisor seam (the same deferred point kiss_tcp leaves).
+            // To the session task: sessions, the console, NET/ROM (including the
+            // read-only NODES tap, which sees every frame before address
+            // filtering). Dropped while the TNC is not usable.
+            rf::deliver(ax25);
             None
         }
         NinoTncInboundEvent::TxTestDiagnostic { raw, diagnostic } => {
@@ -346,7 +364,10 @@ fn handle_inbound(
 
 /// Store a TNC report for the page and log a one-line summary of it.
 fn record_status(what: &str, status: &NinoTncStatusFrame) {
-    tnc::with_state(|s| s.status = Some(*status));
+    tnc::with_state(|s| {
+        s.status = Some(*status);
+        s.status_at_ms = tnc::now_ms();
+    });
     tnc::log_with(Direction::Info, |w| {
         write!(w, "{what}: firmware {}", status.firmware_version_raw.as_str())?;
         if let Some(d) = status.dip_switches {
@@ -364,18 +385,19 @@ fn record_status(what: &str, status: &NinoTncStatusFrame) {
     });
 }
 
-/// Send an AX.25 frame and log it. Returns whether it reached the UART.
-async fn send_ax25(modem: &mut Modem, frame: &ax25_node_core::ax25::Frame) -> bool {
-    match modem.send_frame(&frame.encode()).await {
+/// Put an encoded AX.25 frame (no FCS) on the air and log it.
+async fn send_wire(modem: &mut Modem, wire: &[u8]) {
+    match modem.send_frame(wire).await {
         Ok(()) => {
             tnc::with_state(|s| s.tx_frames = s.tx_frames.wrapping_add(1));
-            tnc::log_with(Direction::Tx, |w| write_frame(frame, w));
-            true
+            match ax25_node_core::ax25::Frame::decode(wire) {
+                Ok(f) => tnc::log_with(Direction::Tx, |w| write_frame(&f, w)),
+                Err(_) => tnc::log_with(Direction::Tx, |w| write!(w, "{} bytes", wire.len())),
+            }
         }
         Err(e) => {
             defmt::warn!("kiss-serial: send failed: {}", defmt::Debug2Format(&e));
             tnc::log(Direction::Info, "Send to the TNC failed (serial write error)");
-            false
         }
     }
 }
@@ -433,13 +455,12 @@ async fn send_params(modem: &mut Modem, t: &TncSettings) {
 }
 
 /// Send the node's saved settings to the TNC: KISS parameters, then the mode
-/// (verified by readback). With no saved mode, a GETALL so the page can show
-/// what the TNC is running. Used at start and after a TNC firmware update.
+/// (verified by readback). Called once the TNC has reported supported
+/// firmware: at start, and again after a TNC firmware update.
 async fn apply_saved(modem: &mut Modem, settings: &TncSettings, mode_job: &mut Option<ModeSetter>) {
     send_params(modem, settings).await;
-    match settings.mode {
-        Some(mode) => start_mode(modem, mode_job, mode, false).await,
-        None => send_get_all(modem).await,
+    if let Some(mode) = settings.mode {
+        start_mode(modem, mode_job, mode, false).await;
     }
 }
 
@@ -530,29 +551,32 @@ fn report_outcome(setter: &ModeSetter) {
 
 /// Write the firmware image stored on the node to the TNC through its
 /// bootloader (the flashtnc procedure, [`BootloaderFlasher`]). Takes over the
-/// serial line for the few minutes it runs; afterwards re-sends the node's saved
-/// settings to the restarted TNC.
-async fn run_update(modem: &mut Modem, settings: &TncSettings, mode_job: &mut Option<ModeSetter>) {
+/// serial line for the few minutes it runs. Returns whether the TNC was
+/// updated (the caller then starts over: report first, then settings).
+async fn run_update(modem: &mut Modem, mode_job: &mut Option<ModeSetter>) -> bool {
     fn refuse(why: &'static str) {
         tnc::with_state(|s| s.flash = FlashStatus::Refused(why));
         tnc::log(Direction::Info, why);
     }
     let Some(image) = tnc::staged_image() else {
-        return refuse("No firmware file is stored on the node; upload one first.");
+        refuse("No firmware file is stored on the node; upload one first.");
+        return false;
     };
     if !tnc_image::verify(&image) {
-        return refuse("The stored firmware file is damaged; upload it again.");
+        refuse("The stored firmware file is damaged; upload it again.");
+        return false;
     }
     // The bootloader check is the authority, but a TNC that has told us its
     // chip lets us refuse the wrong file before touching it at all.
     let reported = tnc::with_state(|s| s.status.and_then(|st| st.firmware_version));
     if let Some(chip) = reported.map(|v| v.chip_variant()) {
         if chip != ChipVariant::Unknown && chip != image.target {
-            return refuse(if chip == ChipVariant::Dspic33Ep512 {
+            refuse(if chip == ChipVariant::Dspic33Ep512 {
                 "This TNC runs firmware 4.x (dsPIC33EP512GP): upload the v4 file, not v3."
             } else {
                 "This TNC runs firmware 3.x (dsPIC33EP256GP): upload the v3 file, not v4."
             });
+            return false;
         }
     }
 
@@ -612,16 +636,20 @@ async fn run_update(modem: &mut Modem, settings: &TncSettings, mode_job: &mut Op
         FlashOutcome::Done { .. } => {
             // First boot of new firmware: a bootloader self-update (~2 s), then KISS.
             Timer::after_secs(5).await;
-            tnc::log(Direction::Info, "Sending the node's saved settings to the updated TNC");
-            apply_saved(modem, settings, mode_job).await;
+            tnc::log(
+                Direction::Info,
+                "Asking the updated TNC for its report; the node's saved settings follow",
+            );
+            true
         }
         o if o.nothing_written() => {
             Timer::after_secs(2).await;
             send_get_all(modem).await;
+            false
         }
         // Mid-write failure: the TNC sits in its bootloader until an update
         // completes, so there is nothing to talk KISS to.
-        _ => {}
+        _ => false,
     }
 }
 

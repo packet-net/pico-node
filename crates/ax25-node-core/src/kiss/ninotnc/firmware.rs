@@ -23,13 +23,12 @@ pub enum ChipVariant {
     Dspic33Ep512,
 }
 
-/// The first firmware minor version (3.41 / 4.41) that selects its operating
-/// mode from KISS SETHW when the MODE DIPs are 1111.
-pub const MIN_SETHW_MINOR: u16 = 41;
-
-/// The firmware minor version (3.44 / 4.44) the mode catalog's firmware-byte
-/// table was taken from, and the current release at the time of writing.
-pub const CATALOG_MINOR: u16 = 44;
+/// The oldest NinoTNC firmware pico-node works with: 3.44 / 4.44, the release
+/// the mode catalog's firmware-byte table was taken from. Older firmware lacks
+/// SETHW mode selection (added in 41) and reports mode bytes this table does
+/// not know, so rather than enabling features piecemeal by version the node
+/// refuses to use an older TNC at all, beyond updating its firmware.
+pub const MIN_SUPPORTED_MINOR: u16 = 44;
 
 /// A NinoTNC firmware version in Nino's two-component form, e.g. `3.44` or `4.44`.
 /// The major component encodes the chip variant (`3` = dsPIC33EP256GP, `4` =
@@ -59,18 +58,10 @@ impl FirmwareVersion {
         }
     }
 
-    /// Whether this firmware accepts KISS SETHW to choose the operating mode
-    /// (with the MODE DIPs at 1111). Added in 3/4.41 (20 Aug 2024, flashtnc
-    /// release notes); earlier firmware ignores SETHW.
-    pub fn supports_sethw_mode(self) -> bool {
-        self.chip_variant() != ChipVariant::Unknown && self.minor >= MIN_SETHW_MINOR
-    }
-
-    /// Whether this is older than the firmware the mode catalog was taken from
-    /// ([`CATALOG_MINOR`]). The running-mode byte a TNC reports is internal to
-    /// its firmware version, so on other versions it may not decode.
-    pub fn older_than_catalog(self) -> bool {
-        self.minor < CATALOG_MINOR
+    /// Whether pico-node will use a TNC running this firmware (3.44 / 4.44 or
+    /// later; see [`MIN_SUPPORTED_MINOR`]).
+    pub fn is_supported(self) -> bool {
+        self.chip_variant() != ChipVariant::Unknown && self.minor >= MIN_SUPPORTED_MINOR
     }
 
     /// Parse a firmware version string. Accepts `"3.44"`, `"4.44"`, and the legacy
@@ -141,15 +132,14 @@ mod tests {
     }
 
     #[test]
-    fn sethw_mode_arrived_in_x_41() {
+    fn only_x_44_and_later_is_supported() {
         let v = |s| FirmwareVersion::parse(s).unwrap();
-        assert!(!v("3.39").supports_sethw_mode());
-        assert!(!v("3.40").supports_sethw_mode());
-        assert!(v("3.41").supports_sethw_mode());
-        assert!(v("4.44").supports_sethw_mode());
-        assert!(!v("2.71").supports_sethw_mode(), "pre-2.90 numbering has no SETHW");
-        assert!(v("3.39").older_than_catalog());
-        assert!(!v("3.44").older_than_catalog());
+        assert!(!v("3.39").is_supported());
+        assert!(!v("3.43").is_supported());
+        assert!(v("3.44").is_supported());
+        assert!(v("4.44").is_supported());
+        assert!(v("3.45").is_supported());
+        assert!(!v("2.71").is_supported(), "pre-2.90 numbering: unknown chip");
     }
 
     #[test]

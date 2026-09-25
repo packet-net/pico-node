@@ -24,15 +24,16 @@
 //! select exactly the requested mode, the running-mode check matches first and the
 //! outcome is [`ModeSetOutcome::Applied`].)
 //!
-//! Likewise, a readback from firmware older than 3/4.41 (which predates SETHW
-//! mode selection) ends it with [`ModeSetOutcome::FirmwareTooOld`]; and
-//! [`refuse_before_sending`] lets a caller that already knows the firmware skip
-//! the SETHW altogether. First seen on a bench NinoTNC running 3.39.
+//! Likewise, a readback from firmware older than pico-node supports (3/4.44;
+//! [`super::firmware::MIN_SUPPORTED_MINOR`]) ends it with
+//! [`ModeSetOutcome::FirmwareTooOld`], and [`refuse_before_sending`] lets a
+//! caller that already knows the firmware skip the SETHW altogether. First seen
+//! on a bench NinoTNC running 3.39, which predates SETHW mode selection (41).
 
 use core::fmt;
 
 use super::catalog::{self, NinoTncMode};
-use super::firmware::{FirmwareVersion, MIN_SETHW_MINOR};
+use super::firmware::{FirmwareVersion, MIN_SUPPORTED_MINOR};
 use super::sethw;
 use super::status::NinoTncStatusFrame;
 
@@ -95,7 +96,7 @@ pub enum ModeSetOutcome {
         /// The DIP position the TNC reported (low four bits).
         dip: u8,
     },
-    /// The TNC's firmware predates SETHW mode selection (3/4.41).
+    /// The TNC's firmware is older than pico-node supports (3/4.44).
     FirmwareTooOld {
         /// The requested mode.
         requested: u8,
@@ -253,7 +254,7 @@ impl ModeSetter {
             None => status.firmware_mode_byte,
         };
 
-        // Checked first: on firmware this old the mode-byte table cannot be
+        // Checked first: on unsupported firmware the mode-byte table cannot be
         // trusted either, so a "match" would prove nothing.
         if let Some(refused) = refuse_before_sending(self.mode, status.firmware_version) {
             self.phase = Phase::Done(refused);
@@ -311,11 +312,11 @@ impl ModeSetter {
 }
 
 /// The outcome to report without sending anything, when the TNC's firmware is
-/// known and predates SETHW mode selection. `None` means go ahead (including
+/// known and older than pico-node supports. `None` means go ahead (including
 /// when the firmware is not known yet: the readback will catch it).
 pub fn refuse_before_sending(mode: u8, firmware: Option<FirmwareVersion>) -> Option<ModeSetOutcome> {
     match firmware {
-        Some(version) if !version.supports_sethw_mode() => Some(ModeSetOutcome::FirmwareTooOld {
+        Some(version) if !version.is_supported() => Some(ModeSetOutcome::FirmwareTooOld {
             requested: mode,
             version,
         }),
@@ -327,13 +328,12 @@ pub fn refuse_before_sending(mode: u8, firmware: Option<FirmwareVersion>) -> Opt
 pub fn write_outcome<W: fmt::Write + ?Sized>(outcome: &ModeSetOutcome, w: &mut W) -> fmt::Result {
     match *outcome {
         ModeSetOutcome::FirmwareTooOld { requested, version } => {
-            write!(w, "The TNC cannot set mode ")?;
+            write!(w, "Mode ")?;
             write_mode(requested, w)?;
             write!(
                 w,
-                " from here: its firmware {}.{} is older than {}.{MIN_SETHW_MINOR}, the first to \
-accept a mode over KISS. Update the TNC firmware below, or set the mode with its MODE DIP \
-switches.",
+                " not set: the TNC runs firmware {}.{} and pico-node needs {}.{MIN_SUPPORTED_MINOR} \
+or later. Update the TNC firmware first.",
                 version.major, version.minor, version.major
             )
         }
@@ -585,9 +585,8 @@ all four MODE switches to 1 (on) to set the mode from here."
         assert_eq!(s.attempt(), 1);
         assert_eq!(
             summary(&s),
-            "The TNC cannot set mode 5 (3600 QPSK IL2P+CRC) from here: its firmware 3.39 is \
-older than 3.41, the first to accept a mode over KISS. Update the TNC firmware below, or set \
-the mode with its MODE DIP switches."
+            "Mode 5 (3600 QPSK IL2P+CRC) not set: the TNC runs firmware 3.39 and pico-node \
+needs 3.44 or later. Update the TNC firmware first."
         );
     }
 
@@ -598,7 +597,8 @@ the mode with its MODE DIP switches."
             refuse_before_sending(6, v("3.39")),
             Some(ModeSetOutcome::FirmwareTooOld { requested: 6, .. })
         ));
-        assert_eq!(refuse_before_sending(6, v("3.41")), None);
+        assert!(refuse_before_sending(6, v("3.43")).is_some());
+        assert_eq!(refuse_before_sending(6, v("3.44")), None);
         assert_eq!(refuse_before_sending(6, None), None, "unknown: let the readback decide");
     }
 

@@ -205,8 +205,8 @@ pub fn notice_reconnect(heading: &str, body_html: &str) -> String {
 pub const TNC_TOP: &str = "<div class=spread><h1>NinoTNC</h1>\
 <a class=sub href=/>&larr; node panel</a></div>\
 <p class=sub id=st>Connecting...</p><p class=\"sub mono\" id=lk></p>\
-<div class=row><button class=ghost onclick=\"act('/tnc/refresh')\">Ask the TNC for its status</button></div>\
-<p class=hint id=msg></p>";
+<div class=row><button class=ghost onclick=\"ask()\">Ask the TNC for its status</button></div>\
+<p class=hint id=msg></p><p class=\"hint bad\" id=gate></p>";
 
 /// The three forms (mode, KISS parameters, test frame), pre-filled from the
 /// node's saved settings. `call` is the node's callsign, the test frame's source.
@@ -216,7 +216,8 @@ pub fn tnc_forms(p: &StoredConfig, call: &str) -> String {
 
     let t = &p.tnc;
     let mut f = String::with_capacity(2400);
-    f += "<section><h2>Operating mode</h2><form onsubmit=\"return post(this,'/tnc/mode')\">\
+    // Hidden by the script until the TNC reports supported firmware.
+    f += "<div id=setup hidden><section><h2>Operating mode</h2><form onsubmit=\"return post(this,'/tnc/mode')\">\
 <label>Mode</label><select name=mode>";
     // Mode 15 is the DIP position that hands control to SETHW, not a mode to
     // select, so the list stops at 14.
@@ -226,8 +227,8 @@ pub fn tnc_forms(p: &StoredConfig, call: &str) -> String {
     }
     f += "</select><label class=chk><input type=checkbox name=flash> \
 Also store it in the TNC's own memory</label>\
-<button type=submit class=primary id=setmode>Set mode</button><p class=\"hint res\"></p></form>\
-<p class=\"hint bad\" id=modewarn></p><p class=hint id=job></p>\
+<button type=submit class=primary>Set mode</button><p class=\"hint res\"></p></form>\
+<p class=hint id=job></p>\
 <p class=hint>Needs all four MODE DIP switches on the TNC set to 1 (on). The node \
 sends this mode every time it starts, without writing the TNC's memory unless you \
 tick the box.</p></section>";
@@ -264,7 +265,7 @@ node sends these every time it starts.</p></section>";
 <label>Text</label><input name=text value=\"Test from {call}\" maxlength=128 {GEN_ATTRS}>\
 <button type=submit class=primary>Transmit one frame</button><p class=\"hint res\"></p></form>\
 <p class=hint>Keys the radio once and sends a UI frame from {call}. It should appear \
-as a TX line in the monitor, and the TNC's PTT light should flash.</p></section>"
+as a TX line in the monitor, and the TNC's PTT light should flash.</p></section></div>"
     );
     f
 }
@@ -273,11 +274,10 @@ as a TX line in the monitor, and the TNC's PTT light should flash.</p></section>
 /// the node still has a backlog of lines to send, otherwise once a second.
 pub const TNC_BOTTOM: &str = "<section><h2>TNC firmware</h2>\
 <p class=hint id=fwnow>The TNC has not reported its firmware yet.</p>\
-<p class=hint>Get the file from <a href=https://github.com/ninocarrillo/flashtnc target=_blank \
-rel=noopener>flashtnc on GitHub</a>: <code>N9600A-v3-44.hex</code> for firmware 3.x, \
-<code>N9600A-v4-44.hex</code> for 4.x. The node checks the whole file before storing it.</p>\
-<div class=row><button class=ghost id=gh onclick=gh() hidden>Get it from GitHub</button>\
-<input type=file id=hex accept=.hex><button class=ghost onclick=stage()>Upload to the node</button></div>\
+<p class=hint>Download the file from <a href=https://github.com/ninocarrillo/flashtnc \
+target=_blank rel=noopener>flashtnc on GitHub</a>: <code>N9600A-v3-44.hex</code> for firmware \
+3.x, <code>N9600A-v4-44.hex</code> for 4.x. The node checks the whole file before storing it.</p>\
+<div class=row><input type=file id=hex accept=.hex><button class=ghost onclick=stage()>Upload to the node</button></div>\
 <p class=hint id=img></p>\
 <button class=primary id=upd onclick=upd() disabled>Update the TNC</button>\
 <p class=hint id=flashst></p>\
@@ -290,17 +290,15 @@ mode and KISS parameters again.</p></section>\
 <button class=ghost onclick=\"$('mon').textContent=''\">Clear</button></div>\
 <div id=mon></div></section>\
 <script>\
-var since=0,last={};function $(i){return document.getElementById(i)}\
+var since=0,asked=0,askedAt=0,last={};function $(i){return document.getElementById(i)}\
+function ask(){asked=last.now||1;askedAt=Date.now();act('/tnc/refresh')}\
+function desc(t){return 'firmware '+t.fw+', MODE DIPs '+(t.dip||'?')+', running mode '+(t.mode||'?')}\
 function send(blob,name){$('img').textContent='Uploading '+name+' to the node...';\
 fetch('/tnc/firmware?name='+encodeURIComponent(name),{method:'POST',body:blob})\
 .then(r=>r.text()).then(t=>$('img').textContent=t)\
 .catch(()=>$('img').textContent='Could not reach the node.')}\
 function stage(){var f=$('hex').files[0];if(!f){$('img').textContent='Pick a .hex file first.';return}\
 send(f,f.name)}\
-function gh(){var n='N9600A-v'+last.tnc.major+'-44.hex';$('img').textContent='Fetching '+n+' from GitHub...';\
-fetch('https://raw.githubusercontent.com/ninocarrillo/flashtnc/master/'+n).then(r=>{if(!r.ok)throw 0;return r.blob()})\
-.then(b=>send(b,n)).catch(()=>$('img').textContent='Could not fetch it from GitHub; \
-download it yourself and use Upload.')}\
 function upd(){if(!confirm('Update the TNC firmware now? It takes a few minutes, the TNC is off \
 the air meanwhile, and it must stay powered.'))return;\
 fetch('/tnc/update',{method:'POST'}).then(r=>r.text()).then(t=>$('flashst').textContent=t)\
@@ -316,19 +314,22 @@ end=m.scrollTop+m.clientHeight>=m.scrollHeight-8;e.className=c;e.textContent=t;m
 while(m.childNodes.length>500)m.removeChild(m.firstChild);if(end)m.scrollTop=m.scrollHeight}\
 function show(d){var now=Date.now();\
 if(!d.running)$('st').textContent='The TNC link is not running. Set the node callsign first.';\
-else if(d.tnc)$('st').textContent='Firmware '+d.tnc.fw+', MODE DIPs '+(d.tnc.dip||'?')+\
-', running mode '+(d.tnc.mode||'?');\
+else if(d.tnc){var s=desc(d.tnc);$('st').textContent=s[0].toUpperCase()+s.slice(1)}\
 else $('st').textContent='No report from the TNC yet. Check the serial wiring (TX and RX \
 crossed, ground) and that the TNC is powered.';\
 $('lk').textContent=(d.heard==null?'Nothing heard from the TNC yet':'Last heard from the TNC '+\
 Math.round((d.now-d.heard)/1000)+' s ago')+', '+d.rx+' frames heard, '+d.tx+' sent';\
 var j=$('job');if(d.job){j.textContent=d.job.text;j.className='hint '+(d.job.done?(d.job.ok?'ok':'bad'):'')}\
-last=d;var t=d.tnc,old=t&&t.sethw===false;$('setmode').disabled=old;\
-$('modewarn').textContent=old?'This TNC runs firmware '+t.fw+', which cannot take a mode over KISS \
-(3.41 or later can). Update its firmware below, or set the mode with its MODE DIP switches.':'';\
+last=d;var t=d.tnc,ok=!!(t&&t.ok);$('setup').hidden=!ok;\
+$('gate').textContent=!d.running?'':!t?'Waiting for the TNC to report its firmware. The node uses \
+the TNC only once it has.':!ok?'This TNC runs firmware '+t.fw+'; pico-node needs '+(t.major||3)+\
+'.44 or later. Update it under TNC firmware below. Until then the node sends it no settings and \
+no traffic.':'';\
 $('fwnow').textContent=!t?'The TNC has not reported its firmware yet.':'The TNC runs firmware '+t.fw+\
-(t.old?'. The current release is '+t.major+'.44.':t.old===false?', the current release.':'.');\
-$('gh').hidden=!(t&&(t.major==3||t.major==4));\
+(ok?', which pico-node supports.':'. pico-node needs '+(t.major||3)+'.44 or later.');\
+if(asked){if(t&&t.at>asked){say('The TNC answered: '+desc(t)+'.');asked=0}\
+else if(Date.now()-askedAt>6000){say('No answer from the TNC. Check the serial wiring (TX and RX \
+crossed, ground) and that the TNC is powered.');asked=0}}\
 var fl=d.flash,busy=fl&&fl.running;\
 if(d.img)$('img').textContent='Stored on the node: '+d.img.name+', '+d.img.lines+' lines, for '+d.img.chip+'.';\
 $('upd').disabled=!d.img||busy;\
@@ -345,5 +346,5 @@ poll()</script>";
 
 /// The panel section linking to the TNC page.
 pub const TNC_LINK_SECTION: &str = "<section><h2>Radio</h2>\
-<p class=hint>Set the NinoTNC's mode and KISS parameters, watch traffic, and send a \
-test frame.</p><p><a href=/tnc>NinoTNC setup and monitor &rarr;</a></p></section>";
+<p class=hint>Set the NinoTNC's mode and KISS parameters, watch traffic, send a test \
+frame, and update its firmware.</p><p><a href=/tnc>NinoTNC setup and monitor &rarr;</a></p></section>";

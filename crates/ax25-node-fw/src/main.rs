@@ -325,10 +325,10 @@ mod firmware {
             node_name: String::from(cfg.identity.alias),
             callsign: String::from(call_text),
             grid: Some(String::from(cfg.identity.grid)),
-            ports: alloc::vec![alloc::format!(
-                "axudp [up] udp/0.0.0.0:{}",
-                cfg.axudp.listen_port
-            )],
+            ports: alloc::vec![
+                alloc::format!("axudp [up] udp/0.0.0.0:{}", cfg.axudp.listen_port),
+                String::from("rf [NinoTNC on the serial link]"),
+            ],
             // Filled live per-command by the console tasks from `netrom_view`
             // (the routing table lives in the axudp task, not the console tasks).
             routes: alloc::vec![],
@@ -389,9 +389,7 @@ mod firmware {
             p.PIN_20,
             p.PIN_21,
             cfg.kiss_serial.clone(),
-            cfg.netrom.clone(),
             cfg.identity.callsign,
-            cfg.identity.alias,
         )));
 
         // --- Tait CCDI radio control on a SECOND UART: UART0 GP0(TX)/GP1(RX),
