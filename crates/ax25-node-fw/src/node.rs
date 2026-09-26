@@ -55,7 +55,7 @@ use ax25_node_core::netrom::{
 };
 use ax25_node_core::netrom::ObserveOutcome;
 use ax25_node_core::sdl::{
-    classify_incoming, DataLinkSignal, Event, FrameSpec, UnnumberedKind, WireSink,
+    classify_incoming, DataLinkSignal, Event, FrameSpec, State, TimerId, UnnumberedKind, WireSink,
 };
 
 use alloc::collections::VecDeque;
@@ -143,6 +143,13 @@ struct PeerState {
     /// The port the peer is reached on.
     port: Port,
     role: Role,
+    /// We dialled this link (otherwise the peer connected to us).
+    outbound: bool,
+    /// When the link came up (node uptime ms), for the web panel.
+    up_at: Option<u64>,
+    /// Frames sent on the link, and T1 expiries (retries), for the web panel.
+    frames: u32,
+    retries: u32,
 }
 
 /// One side of a cross-connect: an AX.25 session (by the peer's callsign) or a
@@ -178,6 +185,8 @@ enum CircuitMode {
 struct CircuitSlot {
     conn: NetRomConnection,
     mode: CircuitMode,
+    /// When the circuit came up (node uptime ms), for the web panel.
+    up_at: Option<u64>,
 }
 
 /// Cross-leg work discovered while servicing one session or circuit, applied by
@@ -305,6 +314,9 @@ pub async fn task(
     let mut dst_buf = [0u8; 16];
 
     loop {
+        // Refresh the web panel's connections pane on every wake.
+        publish_conns(&sessions, &mut peers, &mut circuits, &connector, my_call);
+
         // Wake at the earliest armed timer deadline across all peers (if any).
         let next_deadline: Option<Instant> = peers
             .iter()
@@ -536,6 +548,11 @@ pub async fn task(
                     let expired = ps.timers.take_expired(now);
                     for id in expired {
                         defmt::debug!("node: timer expiry ({=u8})", id as u8);
+                        if id == TimerId::T1 {
+                            if let Some(ps) = peers[i].as_mut() {
+                                ps.retries = ps.retries.saturating_add(1);
+                            }
+                        }
                         let Some(event) = session::expiry_event(id) else {
                             // TM201 (the MDL XID retry timer): not a data-link
                             // event - the manager drives the peer's MDL machine,
@@ -820,6 +837,7 @@ async fn drive_all(
             t.neighbour(&ps.peer).is_some() || t.destination(&ps.peer).is_some()
         };
         let (frames, followups) = post_one(sessions, ps, ev, console_id, prompt, peer_is_node);
+        ps.frames = ps.frames.saturating_add(frames.len() as u32);
         let ep = ps.port;
         send_all(ep, frames).await;
         if REBOOT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
@@ -895,7 +913,11 @@ fn open_circuit(l4: &mut L4<'_>, target: Callsign, user: Callsign, mode: Circuit
         "node: onward connect to {=str} through NET/ROM",
         call_str(&target, &mut name)
     );
-    l4.circuits[free] = Some(CircuitSlot { conn, mode });
+    l4.circuits[free] = Some(CircuitSlot {
+        conn,
+        mode,
+        up_at: None,
+    });
     Some(conn.key)
 }
 
@@ -1359,6 +1381,7 @@ fn service_l4(
             *slot = Some(CircuitSlot {
                 conn,
                 mode: CircuitMode::Console(LineAssembler::default()),
+                up_at: None,
             });
             let banner = banner_and_prompt(console_id, prompt, TransportKind::Ax25);
             l4.connector.write(l4.netrom.table(), &conn, &banner, now_ms());
@@ -1574,7 +1597,9 @@ fn start_outbound(
         call_str(&local, &mut lname),
         ep
     );
-    peers[i].as_mut().expect("slot just ensured").role = role;
+    let ps = peers[i].as_mut().expect("slot just ensured");
+    ps.role = role;
+    ps.outbound = true;
     Ok(i)
 }
 
@@ -1597,6 +1622,99 @@ fn find_role(peers: &[Option<PeerState>], pred: impl Fn(&Role) -> bool) -> Optio
         .position(|p| matches!(p, Some(ps) if pred(&ps.role)))
 }
 
+/// Publish the live AX.25 links and NET/ROM circuits for the web panel
+/// ([`crate::conns`]), stamping each one's "up since" the first time it is
+/// seen connected.
+fn publish_conns(
+    sessions: &session::Sessions,
+    peers: &mut [Option<PeerState>],
+    circuits: &mut [Option<CircuitSlot>],
+    connector: &NetRomConnector,
+    my_call: Callsign,
+) {
+    use crate::conns::{Conn, Kind, Phase};
+    use ax25_node_core::netrom::transport::NetRomCircuitState as Cs;
+
+    let now = now_ms();
+    let mut rows: heapless::Vec<Conn, { crate::conns::MAX_CONNS }> = heapless::Vec::new();
+    for ps in peers.iter_mut().flatten() {
+        let Some(s) = sessions.session_for_pair(&ps.local, &ps.peer) else {
+            continue;
+        };
+        let phase = match s.state {
+            State::AwaitingConnection | State::AwaitingV22Connection => Phase::Connecting,
+            State::Connected => Phase::Up,
+            State::TimerRecovery => Phase::Retrying,
+            State::AwaitingRelease | State::Disconnected => Phase::Closing,
+        };
+        if matches!(phase, Phase::Up | Phase::Retrying) && ps.up_at.is_none() {
+            ps.up_at = Some(now);
+        }
+        let kind = match ps.role {
+            Role::None => Kind::Plain,
+            Role::Console(_) => Kind::Console,
+            Role::Bridge { .. } => Kind::Onward,
+            Role::TelnetRelay => Kind::Telnet,
+            Role::Interlink => Kind::Interlink,
+        };
+        let (src, dst) = if ps.outbound {
+            (ps.local, ps.peer)
+        } else {
+            (ps.peer, ps.local)
+        };
+        let _ = rows.push(Conn {
+            src,
+            dst,
+            via: None,
+            circuit: false,
+            kind,
+            port: ps.port.name(),
+            extended: s.context.is_extended,
+            phase,
+            up_at_ms: ps.up_at,
+            frames: ps.frames,
+            retries: ps.retries,
+            rc: s.context.rc,
+            n2: s.context.n2,
+        });
+    }
+    for c in circuits.iter_mut().flatten() {
+        let phase = match connector.circuit_state(c.conn.key) {
+            Some(Cs::Connected) => Phase::Up,
+            Some(Cs::Connecting) => Phase::Connecting,
+            _ => Phase::Closing,
+        };
+        if phase == Phase::Up && c.up_at.is_none() {
+            c.up_at = Some(now);
+        }
+        // Inbound circuits (a user reaching this node's prompt) run from the
+        // user to us; the ones we open run from the user to the far node.
+        let (kind, inbound) = match c.mode {
+            CircuitMode::Console(_) => (Kind::Console, true),
+            CircuitMode::Bridge { initiator, .. } => (Kind::Onward, initiator),
+            CircuitMode::TelnetRelay { .. } => (Kind::Telnet, false),
+        };
+        let dst = if inbound { my_call } else { c.conn.peer };
+        let via = (c.conn.peer != dst).then_some(c.conn.peer);
+        let _ = rows.push(Conn {
+            src: c.conn.user,
+            dst,
+            via,
+            circuit: true,
+            kind,
+            port: "",
+            extended: false,
+            phase,
+            up_at_ms: c.up_at,
+            frames: 0,
+            retries: 0,
+            rc: 0,
+            n2: 0,
+        });
+    }
+    crate::conns::set(rows);
+}
+
 /// Find or create the [`PeerState`] slot for `peer`. Returns its index.
 fn peer_slot(
     peers: &mut [Option<PeerState>],
@@ -1614,6 +1732,10 @@ fn peer_slot(
         timers: session::EmbassyTimers::new(),
         port,
         role: Role::None,
+        outbound: false,
+        up_at: None,
+        frames: 0,
+        retries: 0,
     });
     Some(free)
 }
