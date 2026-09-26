@@ -51,26 +51,7 @@ No conflicts: the CYW43 PIO-SPI pins (23/24/25/29) and the above are disjoint.
 
 ## Station power monitor (INA226, optional)
 
-An INA226 breakout on the same I2C pins as the OLED lets the node report battery voltage and load current as APRS telemetry. Nothing to switch on: the node looks for one at boot and every minute after, at any of its addresses (0x40-0x4F).
-
-Wiring, to the OLED header or straight to the Pico:
-
-| INA226 breakout | Pico W |
-|---|---|
-| VCC | 3V3 (pin 36) |
-| GND | GND |
-| SDA | GP4 (pin 6) |
-| SCL | GP5 (pin 7) |
-
-Put the shunt in the battery positive feed to the whole station: battery + to **IN+**, station + to **IN-**. The voltage reported is what the chip sees on its VBUS pin, which most breakouts tie to IN-, so it is the station-side voltage.
-
-**The shunt.** The common breakouts carry a 0.1 ohm shunt ("R100"). That reads up to 0.8 A and drops 0.1 V per amp, which is fine for the Pico and TNC but not a radio on transmit. For the whole station fit a lower-value shunt sized for the peak current (the INA226 reads up to 81.92 mV across it: 5 milliohms reads to 16 A, 2 milliohms to 41 A) and set **Current shunt (milliohms)** on the web panel, or `SET SHUNT_MOHM` on the console.
-
-What goes on air, on the first usable radio port, to `APZ001` with no digipeater path:
-- every **Power telemetry every (minutes)** (default 10, 0 = off; console `TELEM_INTERVAL`): a telemetry report, channel 1 battery volts in 0.06 V steps (to 15.3 V, enough for 4S LiFePO4), channel 2 load amps in the finest step that covers the shunt's range, at most 0.1 A (0.01 A with the 0.1 ohm shunt; 0.1 A, up to 25.5 A, with a 75 mV / 50 A external shunt). Charging current reads 0.
-- with the first report and then hourly: the telemetry labels (PARM / UNIT / EQNS / BITS, addressed to the node's own call) and, when a grid locator is set, a position report at the centre of the locator with the node symbol, so the station shows on the map.
-
-The web panel shows the latest reading under its header.
+An INA226 on I2C0 (GP4/GP5, shared with the OLED) is picked up automatically and reported as APRS telemetry (`power` module). Wiring, shunt sizing and settings for users: [`POWER-MONITOR.md`](POWER-MONITOR.md). Frames go to `APZ001` with no digipeater path on the first usable radio port: a telemetry report every `TELEM_INTERVAL` minutes (volts in 0.06 V steps; amps in the finest of 0.01-0.1 A steps covering the shunt's full scale), and with the first report then hourly the PARM / UNIT / EQNS / BITS labels to the node's own call plus a position report from the grid locator (symbol `/n`).
 
 ## Verification status
 
