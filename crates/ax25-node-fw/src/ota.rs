@@ -656,7 +656,7 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
         let header = format!(
             "<div class=spread><h1 class=mono>{}</h1>\
 <span class=sub><span class=dot>●</span> online</span></div>{}\
-<p class=\"sub mono\">{}.local · {} · {}</p>",
+<p class=\"sub mono\">{}.local · {} · {}</p>{}",
             esc(call),
             if idline.is_empty() {
                 String::new()
@@ -666,16 +666,18 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
             esc(ctx.hostname),
             esc(&ip),
             esc(BUILD_TAG),
+            power_line(),
         );
         (header, sta_config_form(&p), String::new())
     } else {
         let header = format!(
             "<div class=spread><h1 class=mono>{}</h1>\
 <span class=sub><span class=dot>●</span> AP mode</span></div>\
-<p class=\"sub mono\">Wi-Fi pass: {} · 192.168.4.1 · {}</p>",
+<p class=\"sub mono\">Wi-Fi pass: {} · 192.168.4.1 · {}</p>{}",
             esc(ctx.ap_ssid),
             esc(ctx.ap_pass),
             esc(BUILD_TAG),
+            power_line(),
         );
         (header, ap_identity_section(&p), ap_join_section())
     };
@@ -716,6 +718,21 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
         }
     }
     true
+}
+
+/// The station power line under the panel header, when an INA226 is fitted.
+fn power_line() -> alloc::string::String {
+    match crate::power::latest() {
+        Some(r) => alloc::format!(
+            "<p class=\"sub mono\">Power: {}.{:02} V, {}{}.{:02} A</p>",
+            r.millivolts / 1000,
+            r.millivolts % 1000 / 10,
+            if r.milliamps < 0 { "-" } else { "" },
+            r.milliamps.unsigned_abs() / 1000,
+            r.milliamps.unsigned_abs() % 1000 / 10,
+        ),
+        None => alloc::string::String::new(),
+    }
 }
 
 /// Send the NinoTNC page: the static top and bottom around the pre-filled

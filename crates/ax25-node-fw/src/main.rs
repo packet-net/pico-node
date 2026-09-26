@@ -51,6 +51,8 @@ mod conns;
 #[cfg(target_os = "none")]
 mod config_store;
 #[cfg(target_os = "none")]
+mod i2c_bus;
+#[cfg(target_os = "none")]
 mod mdns;
 #[cfg(target_os = "none")]
 mod net;
@@ -68,6 +70,8 @@ mod oled;
 mod ota;
 #[cfg(target_os = "none")]
 mod ports;
+#[cfg(target_os = "none")]
+mod power;
 #[cfg(target_os = "none")]
 mod provisioning;
 #[cfg(target_os = "none")]
@@ -107,6 +111,7 @@ mod firmware {
 
     use crate::config;
     use crate::config_store;
+    use crate::i2c_bus;
     use crate::mdns;
     use crate::mqtt;
     use crate::net;
@@ -116,6 +121,7 @@ mod firmware {
     use crate::admin;
     use crate::node;
     use crate::ports;
+    use crate::power;
     use crate::tait;
     use crate::{HEAP, HEAP_SIZE};
 
@@ -274,25 +280,29 @@ mod firmware {
             // leaves the AP running; nothing to keep alive explicitly.
         }
 
-        // --- OLED status display (NinoBLE Rev5, I2C0 GP4/GP5; optional —
-        // the task self-disables if no SSD1306 ACKs at 0x3C). ---
+        // --- The I2C0 bus (GP4/GP5): the OLED status display (NinoBLE Rev5)
+        // and the INA226 power monitor, both optional and found at boot. ---
         oled::set(oled::Status {
             sta: sta_ok,
             ..Default::default()
         });
-        // DISABLE_OLED build env skips the OLED task — a diagnostic/escape hatch
-        // for boards where the (blocking-I2C) panel path misbehaves and starves
-        // the executor. Line 1 shows the mDNS name `<hostname>.local`.
-        if option_env!("DISABLE_OLED").is_none() {
-            spawner.spawn(defmt::unwrap!(oled::task(
-                p.I2C0,
-                p.PIN_4,
-                p.PIN_5,
-                stack,
-                cfg.hostname,
-                ap_ssid
-            )));
-        }
+        let power = power::Monitor::new(
+            cfg.power.clone(),
+            cfg.identity
+                .callsign_configured
+                .then_some(cfg.identity.callsign),
+            cfg.identity.grid,
+            cfg.identity.alias,
+        );
+        spawner.spawn(defmt::unwrap!(i2c_bus::task(
+            p.I2C0,
+            p.PIN_4,
+            p.PIN_5,
+            stack,
+            cfg.hostname,
+            ap_ssid,
+            power
+        )));
 
         // --- The node web server (config panel + firmware upload), on :80 in
         // BOTH modes (docs/OTA.md, docs/PROVISIONING.md). Spawned before the

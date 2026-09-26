@@ -28,8 +28,8 @@ the NinoBLE Rev5 firmware (`firmware/config.h`, `main_aprs.c`, `oled.c`,
 |---|---|---|---|
 | NinoTNC UART **TX** | **GP20** | UART1 TX | `ports::ninotnc` (57600 8N1, KISS) |
 | NinoTNC UART **RX** | **GP21** | UART1 RX | `ports::ninotnc` |
-| OLED **SDA** | **GP4** | I2C0 SDA | `oled` status display (SSD1306 @ 0x3C) |
-| OLED **SCL** | **GP5** | I2C0 SCL | `oled` |
+| OLED **SDA** | **GP4** | I2C0 SDA | `oled` status display (SSD1306 @ 0x3C), `power` (INA226 @ 0x40-0x4F) |
+| OLED **SCL** | **GP5** | I2C0 SCL | `oled`, `power` |
 | Passthrough switch | **GP6** | GPIO in | (optional) boot-time NinoTNC-flash passthrough |
 | SD card SCK / MOSI / MISO / CS | GP10 / GP11 / GP12 / GP9 | SPI1 | unused — kept free |
 | Onboard LED | CYW43 WL_GPIO 0 | — | "radio alive" (already used) |
@@ -48,6 +48,29 @@ No conflicts: the CYW43 PIO-SPI pins (23/24/25/29) and the above are disjoint.
    built in but a no-op if no panel responds at 0x3C.
 3. GP6 passthrough is a documented option (not yet wired) — held low at boot it
    would put the UART into transparent bridge mode for NinoTNC firmware updates.
+
+## Station power monitor (INA226, optional)
+
+An INA226 breakout on the same I2C pins as the OLED lets the node report battery voltage and load current as APRS telemetry. Nothing to switch on: the node looks for one at boot and every minute after, at any of its addresses (0x40-0x4F).
+
+Wiring, to the OLED header or straight to the Pico:
+
+| INA226 breakout | Pico W |
+|---|---|
+| VCC | 3V3 (pin 36) |
+| GND | GND |
+| SDA | GP4 (pin 6) |
+| SCL | GP5 (pin 7) |
+
+Put the shunt in the battery positive feed to the whole station: battery + to **IN+**, station + to **IN-**. The voltage reported is what the chip sees on its VBUS pin, which most breakouts tie to IN-, so it is the station-side voltage.
+
+**The shunt.** The common breakouts carry a 0.1 ohm shunt ("R100"). That reads up to 0.8 A and drops 0.1 V per amp, which is fine for the Pico and TNC but not a radio on transmit. For the whole station fit a lower-value shunt sized for the peak current (the INA226 reads up to 81.92 mV across it: 5 milliohms reads to 16 A, 2 milliohms to 41 A) and set **Current shunt (milliohms)** on the web panel, or `SET SHUNT_MOHM` on the console.
+
+What goes on air, on the first usable radio port, to `APZ001` with no digipeater path:
+- every **Power telemetry every (minutes)** (default 10, 0 = off; console `TELEM_INTERVAL`): a telemetry report, channel 1 battery volts in 0.06 V steps (to 15.3 V, enough for 4S LiFePO4), channel 2 load amps in the finest step that covers the shunt's range (0.01 A with the 0.1 ohm shunt). Charging current reads 0.
+- with the first report and then hourly: the telemetry labels (PARM / UNIT / EQNS / BITS, addressed to the node's own call) and, when a grid locator is set, a position report at the centre of the locator with the node symbol, so the station shows on the map.
+
+The web panel shows the latest reading under its header.
 
 ## Verification status
 

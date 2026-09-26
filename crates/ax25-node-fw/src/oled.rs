@@ -1,7 +1,7 @@
 //! OLED status display — the SSD1306 on the NinoBLE Rev5 board (I2C0 GP4/GP5,
 //! address 0x3C). docs/HARDWARE-NINOBLE.md. Optional: the panel is user-
-//! installed, so the task initialises it and, if nothing ACKs at 0x3C, logs and
-//! exits cleanly — the bare-Pico bench build boots unaffected.
+//! installed, so [`init`] returns `None` if nothing ACKs at 0x3C and the bus
+//! task ([`crate::i2c_bus`]) carries on without it.
 //!
 //! Shows a compact node status page, refreshed every few seconds: callsign +
 //! mode (STA/AP), the IP or AP gateway, and the NET/ROM neighbour + route
@@ -14,10 +14,10 @@
 
 use core::fmt::Write as _;
 
-use embassy_rp::i2c::{Config as I2cConfig, I2c};
-use embassy_rp::peripherals::{I2C0, PIN_4, PIN_5};
-use embassy_rp::Peri;
-use embassy_time::{Duration, Ticker};
+use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
+use embassy_rp::i2c::{Async, I2c};
+use embassy_rp::peripherals::I2C0;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -25,7 +25,7 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Baseline, Text};
 
-use ssd1306::mode::DisplayConfig;
+use ssd1306::mode::{BufferedGraphicsMode, DisplayConfig};
 use ssd1306::prelude::*;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
 
@@ -72,78 +72,69 @@ pub fn set_counts(neighbours: u16, destinations: u16) {
     });
 }
 
-embassy_rp::bind_interrupts!(struct Irqs {
-    I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
-});
+/// The panel, on the shared bus ([`crate::power::Bus`]).
+pub type Display<'a> = Ssd1306<
+    I2CInterface<I2cDevice<'a, NoopRawMutex, I2c<'static, I2C0, Async>>>,
+    DisplaySize128x32,
+    BufferedGraphicsMode<DisplaySize128x32>,
+>;
 
-#[embassy_executor::task]
-pub async fn task(
-    i2c0: Peri<'static, I2C0>,
-    sda: Peri<'static, PIN_4>,
-    scl: Peri<'static, PIN_5>,
-    stack: Stack<'static>,
-    hostname: &'static str,
-    ap_ssid: &'static str,
-) {
-    let i2c = I2c::new_async(i2c0, scl, sda, Irqs, I2cConfig::default());
-    let interface = I2CDisplayInterface::new(i2c);
+/// Initialise the panel, or `None` if nothing answers at 0x3C.
+pub fn init(bus: &crate::power::Bus) -> Option<Display<'_>> {
+    let interface = I2CDisplayInterface::new(I2cDevice::new(bus));
     // NinoBLE Rev5 panels are user-installed and vary (128x32 or 128x64); the
     // common one is the 0.91" 128x32, mounted such that it reads upside-down to
     // Rotate0. (TODO: make size+rotation a config option for 128x64 boards.)
     let mut display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate180)
         .into_buffered_graphics_mode();
-
     if display.init().is_err() {
-        defmt::info!("oled: no SSD1306 at 0x3C — display disabled (optional)");
-        return;
+        defmt::info!("oled: no SSD1306 at 0x3C, display disabled (optional)");
+        return None;
     }
     defmt::info!("oled: SSD1306 up (I2C0 GP4/GP5)");
+    Some(display)
+}
 
+/// Draw the status page.
+pub fn draw(display: &mut Display<'_>, stack: Stack<'static>, hostname: &str, ap_ssid: &str) {
     let text = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let mut ticker = Ticker::every(Duration::from_secs(3));
-    loop {
-        let status = STATUS.lock(|c| *c.borrow());
+    let status = STATUS.lock(|c| *c.borrow());
 
-        // Compose the page off the live structures + the net stack's current IP.
-        // Line 1 is the node's identity: in STA mode its mDNS name
-        // (`<hostname>.local`, callsign-derived); in AP mode the SSID you join
-        // (`pico-<callsign>`) — the relevant thing when there's no LAN.
-        let mut l1 = heapless::String::<24>::new();
-        if status.sta {
-            let _ = write!(l1, "{}.local", hostname);
-        } else {
-            let _ = write!(l1, "{}", ap_ssid);
-        }
-        let mut l2 = heapless::String::<24>::new();
-        match (status.sta, stack.config_v4()) {
-            (true, Some(v4)) => {
-                let a = v4.address.address().octets();
-                let _ = write!(l2, "STA {}.{}.{}.{}", a[0], a[1], a[2], a[3]);
-            }
-            (true, None) => {
-                let _ = write!(l2, "STA (no lease)");
-            }
-            (false, _) => {
-                let _ = write!(l2, "AP 192.168.4.1");
-            }
-        }
-        let mut l3 = heapless::String::<24>::new();
-        let _ = write!(
-            l3,
-            "NET/ROM n{} d{}",
-            status.neighbours, status.destinations
-        );
-
-        display.clear(BinaryColor::Off).ok();
-        // Top-left aligned: three 10px lines filling the 128x32 panel (tops at
-        // y=0/11/22, Baseline::Top so the first line sits flush against the top).
-        for (i, line) in [l1.as_str(), l2.as_str(), l3.as_str()].iter().enumerate() {
-            let y = i as i32 * 11;
-            let _ = Text::with_baseline(line, Point::new(0, y), text, Baseline::Top)
-                .draw(&mut display);
-        }
-        let _ = display.flush();
-
-        ticker.next().await;
+    // Line 1 is the node's identity: in STA mode its mDNS name
+    // (`<hostname>.local`, callsign-derived); in AP mode the SSID you join
+    // (`pico-<callsign>`), the relevant thing when there's no LAN.
+    let mut l1 = heapless::String::<24>::new();
+    if status.sta {
+        let _ = write!(l1, "{}.local", hostname);
+    } else {
+        let _ = write!(l1, "{}", ap_ssid);
     }
+    let mut l2 = heapless::String::<24>::new();
+    match (status.sta, stack.config_v4()) {
+        (true, Some(v4)) => {
+            let a = v4.address.address().octets();
+            let _ = write!(l2, "STA {}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+        }
+        (true, None) => {
+            let _ = write!(l2, "STA (no lease)");
+        }
+        (false, _) => {
+            let _ = write!(l2, "AP 192.168.4.1");
+        }
+    }
+    let mut l3 = heapless::String::<24>::new();
+    let _ = write!(
+        l3,
+        "NET/ROM n{} d{}",
+        status.neighbours, status.destinations
+    );
+
+    display.clear(BinaryColor::Off).ok();
+    // Top-left aligned: three 10px lines filling the 128x32 panel (tops at
+    // y=0/11/22, Baseline::Top so the first line sits flush against the top).
+    for (i, line) in [l1.as_str(), l2.as_str(), l3.as_str()].iter().enumerate() {
+        let y = i as i32 * 11;
+        let _ = Text::with_baseline(line, Point::new(0, y), text, Baseline::Top).draw(display);
+    }
+    let _ = display.flush();
 }

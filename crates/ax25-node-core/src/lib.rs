@@ -34,6 +34,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod aprs;
 pub mod ax25;
 pub mod console;
 pub mod crc;

@@ -28,6 +28,7 @@ pub struct NodeConfig {
     pub tait: TaitConfig,
     pub telnet: TelnetConfig,
     pub netrom: NetRomConfig,
+    pub power: PowerConfig,
     /// Optional `host[:port]` of an MQTT broker to publish logs/status to
     /// (observability without a debug probe). From `MQTT_HOST` / flash config;
     /// absent ⇒ no MQTT.
@@ -123,6 +124,19 @@ pub struct NetRomConfig {
     pub nodes_interval_secs: u32,
 }
 
+/// Station power monitoring: an INA226 on the I2C bus (GP4/GP5), reported as
+/// APRS telemetry ([`crate::power`]).
+#[derive(Clone)]
+pub struct PowerConfig {
+    /// Minutes between APRS telemetry reports; 0 = don't send. Default 10.
+    /// From config (`TELEM_INTERVAL`).
+    pub telemetry_interval_min: u16,
+    /// The INA226's current shunt, in micro-ohms. Default 100 000 (the 0.1 ohm
+    /// "R100" shunt on the common breakout boards). From config (`SHUNT_MOHM`,
+    /// milliohms).
+    pub shunt_micro_ohm: u32,
+}
+
 /// Load the node config. STUB: returns a compiled-in default. A real loader
 /// (flash sector / network) is the follow-up.
 pub fn load() -> NodeConfig {
@@ -171,6 +185,10 @@ pub fn load() -> NodeConfig {
         netrom: NetRomConfig {
             originate: true,
             nodes_interval_secs: parse_u32(option_env!("NODES_INTERVAL_SECS"), 3600),
+        },
+        power: PowerConfig {
+            telemetry_interval_min: 10,
+            shunt_micro_ohm: 100_000,
         },
         mqtt_host: option_env!("MQTT_HOST").filter(|s| !s.is_empty()),
         force_ap: false,
@@ -224,6 +242,12 @@ pub fn apply_stored(cfg: &mut NodeConfig, st: &crate::config_store::StoredConfig
         cfg.force_ap = v;
     }
     cfg.ninotnc.tnc = st.tnc;
+    if let Some(v) = st.telemetry_interval_min {
+        cfg.power.telemetry_interval_min = v;
+    }
+    if let Some(v) = st.shunt_micro_ohm {
+        cfg.power.shunt_micro_ohm = v;
+    }
 }
 
 /// Parse an optional build-env decimal, falling back on absence or garbage.
