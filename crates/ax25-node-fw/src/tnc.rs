@@ -181,25 +181,25 @@ pub fn staged_image() -> Option<crate::tnc_image::StagedImage> {
 
 /// A `fmt::Write` into a fixed byte buffer that fails when full (so a caller can
 /// stop cleanly at a boundary it chose).
-struct BufWriter<'a> {
+pub(crate) struct BufWriter<'a> {
     buf: &'a mut [u8],
     len: usize,
 }
 
 impl<'a> BufWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
+    pub(crate) fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, len: 0 }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    fn truncate(&mut self, len: usize) {
+    pub(crate) fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.buf.len() - self.len
     }
 

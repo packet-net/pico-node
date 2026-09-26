@@ -47,7 +47,9 @@ label.chk{display:flex;gap:.5em;align-items:center;color:var(--ink);font-size:.9
 label.chk input{width:auto;margin:0}\
 #mon{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid var(--line);border-radius:6px;padding:.5em;margin-top:.6em;height:22em;overflow-y:auto;font:.74em/1.35 ui-monospace,Menlo,Consolas,monospace}\
 .rx{color:var(--ink)}.tx{color:var(--accent)}.ev{color:var(--mut)}\
-.ok{color:var(--accent)}.bad{color:#b42318}";
+.ok{color:var(--accent)}.bad{color:#b42318}\
+.cn{background:#fff;border:1px solid var(--line);border-radius:6px;padding:.5em .65em;margin-top:.5em}\
+.cn .mono{font-weight:600;word-break:break-all}";
 
 /// HTML-escape a value for safe interpolation into text or a double-quoted
 /// attribute. Conservative (covers `& < > "`); inputs here are short config
@@ -348,6 +350,30 @@ poll()</script>";
 /// The panel's radio section: the TNC's status and a live monitor (the same
 /// `/tnc/poll` feed as the TNC page), with the link to the full TNC page. Its
 /// script uses its own names so it cannot collide with the panel's others.
+/// The live connections pane (static): its content is drawn by `conns()`,
+/// which the radio monitor's poll loop below feeds from `GET /conns` after each
+/// monitor poll, so the page never has two requests in flight at once (the
+/// node serves two at a time and a button press needs the other).
+pub const CONNS_SECTION: &str = "<section><h2>Connections</h2>\
+<div id=cn><p class=sub>Loading...</p></div></section><script>\
+(function(){function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;\
+if(x!=null)e.textContent=x;return e}\
+function dur(ms){var s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s/60)%60;\
+s%=60;return h?h+'h '+m+'m':m?m+'m '+s+'s':s+'s'}\
+window.conns=function(d){var b=document.getElementById('cn');b.textContent='';\
+if(!d.conns.length){b.appendChild(el('p','sub','No connections.'));return}\
+d.conns.forEach(function(c){var k=el('div','cn'),h=el('div','spread');\
+h.appendChild(el('span','mono',c.src+' \\u2192 '+c.dst));\
+h.appendChild(el('span','sub',c.up!=null&&c.phase!='closing'?'up '+dur(d.now-c.up):c.phase));\
+k.appendChild(h);\
+k.appendChild(el('div','sub',(c.nr?'NET/ROM circuit'+(c.via?' via '+c.via:''):\
+'AX.25 '+(c.v22?'v2.2':'v2.0')+' on '+c.port)+', '+c.kind));\
+if(c.nr)k.appendChild(el('div','sub','Retries: counted on the interlink it rides'));\
+else{var p=c.frames?Math.round(100*c.retries/c.frames):0,r=c.phase=='retrying';\
+k.appendChild(el('div','sub '+(r||p>=20?'bad':p>=5?'':'ok'),'Retries: '+c.retries+' in '+c.frames+\
+' frames sent ('+p+'%)'+(r?', retrying now ('+c.rc+' of '+c.n2+')':'')))}\
+b.appendChild(k)})}})()</script>";
+
 pub const RADIO_SECTION: &str = "<section><h2>Radio</h2>\
 <p class=sub id=rst>Connecting...</p><p class=\"sub mono\" id=rlk></p>\
 <div id=mon></div>\
@@ -367,4 +393,6 @@ d.log.forEach(function(e){line(e[2]=='RX'?'rx':e[2]=='TX'?'tx':'ev',\
 new Date(now-(d.now-e[1])).toTimeString().slice(0,8)+' '+e[2]+' '+e[3])});\
 since=d.next;return d.more}\
 function poll(){fetch('/tnc/poll?since='+since,{cache:'no-store'}).then(r=>r.json()).then(show)\
+.then(function(m){if(m||!window.conns)return m;return fetch('/conns',{cache:'no-store'})\
+.then(r=>r.json()).then(conns).catch(function(){})})\
 .then(m=>setTimeout(poll,m?50:1000)).catch(()=>setTimeout(poll,3000))}poll()})()</script>";

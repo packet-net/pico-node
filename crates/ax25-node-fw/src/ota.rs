@@ -160,15 +160,23 @@ async fn serve_conn(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: WebC
         return;
     }
 
-    // The NinoTNC page (crate::tnc): the page, its poll, and its four actions.
-    if headers.starts_with(b"GET /tnc/poll") {
-        let since = parse_query_u32(headers, b"since=").unwrap_or(0);
+    // The two JSON polls: the radio monitor (crate::tnc) and the front page's
+    // live connections pane (crate::conns). One branch, so they share the
+    // buffer in this task's frame.
+    let conns = headers.starts_with(b"GET /conns");
+    if conns || headers.starts_with(b"GET /tnc/poll") {
         let mut body = [0u8; 3072];
-        let n = crate::tnc::render_poll(&mut body, since);
+        let n = if conns {
+            crate::conns::render_json(&mut body)
+        } else {
+            let since = parse_query_u32(headers, b"since=").unwrap_or(0);
+            crate::tnc::render_poll(&mut body, since)
+        };
         let _ = http_send(socket, "application/json", &body[..n]).await;
         let _ = socket.flush().await;
         return;
     }
+    // The NinoTNC page (crate::tnc) and its actions.
     if headers.starts_with(b"GET /tnc ") || headers.starts_with(b"GET /tnc?") {
         let _ = write_tnc_page(socket, ctx).await;
         let _ = socket.flush().await;
@@ -674,12 +682,13 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
 
     // Assemble the body as an ordered list of byte slices (static + dynamic);
     // measured for Content-Length, written in order. Nothing holds the whole page.
-    let mut parts: heapless::Vec<&[u8], 10> = heapless::Vec::new();
+    let mut parts: heapless::Vec<&[u8], 12> = heapless::Vec::new();
     let _ = parts.push(PANEL_HEAD.as_bytes());
     let _ = parts.push(CSS.as_bytes());
     let _ = parts.push(PANEL_STYLE_MID.as_bytes());
     let _ = parts.push(header.as_bytes());
-    // The radio monitor first: it is what an operator watches.
+    // Live connections, then the radio monitor: what an operator watches.
+    let _ = parts.push(crate::webui::CONNS_SECTION.as_bytes());
     let _ = parts.push(crate::webui::RADIO_SECTION.as_bytes());
     let _ = parts.push(form_a.as_bytes());
     if !ctx.sta {

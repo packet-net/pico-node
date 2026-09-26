@@ -47,6 +47,8 @@ mod admin;
 #[cfg(target_os = "none")]
 mod config;
 #[cfg(target_os = "none")]
+mod conns;
+#[cfg(target_os = "none")]
 mod config_store;
 #[cfg(target_os = "none")]
 mod mdns;
