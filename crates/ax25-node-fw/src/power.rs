@@ -54,6 +54,31 @@ pub fn latest() -> Option<Reading> {
     LATEST.lock(|c| c.get())
 }
 
+/// What answered on the bus at the last search that found no INA226 (a bit
+/// per 7-bit address), for the web panel to show when fitting one. `None`
+/// until a search has run, and once an INA226 is found.
+static LAST_SCAN: Mutex<CriticalSectionRawMutex, Cell<Option<u128>>> =
+    Mutex::new(Cell::new(None));
+
+/// The addresses that answered at the last search that found no INA226.
+pub fn last_scan() -> Option<u128> {
+    LAST_SCAN.lock(|c| c.get())
+}
+
+/// For the first device in the INA226 address range (0x40-0x4F) that answered
+/// but failed the identity check: its address and what its manufacturer and
+/// die ID registers read.
+static ODD_DEVICE: Mutex<CriticalSectionRawMutex, Cell<Option<OddDevice>>> =
+    Mutex::new(Cell::new(None));
+
+/// An address, and its manufacturer and die ID registers (`None` = no answer).
+pub type OddDevice = (u8, Option<u16>, Option<u16>);
+
+/// See [`ODD_DEVICE`].
+pub fn odd_device() -> Option<OddDevice> {
+    ODD_DEVICE.lock(|c| c.get())
+}
+
 /// INA226 registers and identity (TI SBOS547).
 const REG_CONFIG: u8 = 0x00;
 const REG_SHUNT: u8 = 0x01;
@@ -61,7 +86,9 @@ const REG_BUS: u8 = 0x02;
 const REG_MANUFACTURER: u8 = 0xFE;
 const REG_DIE: u8 = 0xFF;
 const MANUFACTURER_TI: u16 = 0x5449;
-const DIE_INA226: u16 = 0x2260;
+/// The die ID register's top 12 bits; the low 4 are the silicon revision
+/// (0x2261 seen on a breakout, 2026-09-26).
+const DIE_INA226: u16 = 0x226;
 /// Average 16 samples, 1.1 ms bus and shunt conversions, continuous: a fresh,
 /// settled value every ~35 ms.
 const CONFIG_AVG16: u16 = 0x4527;
@@ -116,6 +143,14 @@ impl Monitor {
             if let Some(a) = self.addr {
                 defmt::info!("power: INA226 at {=u8:#04x}", a);
                 crate::nlog!("power: INA226 found at 0x{:02x}", a);
+                LAST_SCAN.lock(|c| c.set(None));
+            } else {
+                let seen = scan(bus);
+                LAST_SCAN.lock(|c| c.set(Some(seen)));
+                let odd = (0x40u8..=0x4F).find(|&a| seen & (1 << a) != 0).map(|a| {
+                    (a, read_reg(bus, a, REG_MANUFACTURER), read_reg(bus, a, REG_DIE))
+                });
+                ODD_DEVICE.lock(|c| c.set(odd));
             }
         }
         let Some(addr) = self.addr else {
@@ -218,7 +253,7 @@ fn amp_step_ma(shunt_micro_ohm: u32) -> i32 {
 fn probe(bus: &Bus) -> Option<u8> {
     let addr = (0x40..=0x4F).find(|&a| {
         read_reg(bus, a, REG_MANUFACTURER) == Some(MANUFACTURER_TI)
-            && read_reg(bus, a, REG_DIE) == Some(DIE_INA226)
+            && read_reg(bus, a, REG_DIE).is_some_and(|d| d >> 4 == DIE_INA226)
     })?;
     let [hi, lo] = CONFIG_AVG16.to_be_bytes();
     bus.lock(|b| b.borrow_mut().blocking_write(addr, &[REG_CONFIG, hi, lo]))
@@ -238,6 +273,18 @@ fn read(bus: &Bus, addr: u8, shunt_micro_ohm: u32) -> Option<Reading> {
         millivolts,
         milliamps,
     })
+}
+
+/// Every 7-bit address (0x08-0x77) that acknowledges a one-byte read.
+fn scan(bus: &Bus) -> u128 {
+    let mut seen = 0u128;
+    for a in 0x08u8..=0x77 {
+        let mut b = [0u8; 1];
+        if bus.lock(|x| x.borrow_mut().blocking_read(a, &mut b)).is_ok() {
+            seen |= 1 << a;
+        }
+    }
+    seen
 }
 
 fn read_reg(bus: &Bus, addr: u8, reg: u8) -> Option<u16> {

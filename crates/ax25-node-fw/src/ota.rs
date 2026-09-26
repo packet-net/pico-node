@@ -727,11 +727,40 @@ fn power_line() -> alloc::string::String {
             "<p class=\"sub mono\">Power: {}.{:02} V, {}{}.{:02} A</p>",
             r.millivolts / 1000,
             r.millivolts % 1000 / 10,
-            if r.milliamps < 0 { "-" } else { "" },
+            // No sign on a reading that rounds to zero.
+            if r.milliamps <= -10 { "-" } else { "" },
             r.milliamps.unsigned_abs() / 1000,
             r.milliamps.unsigned_abs() % 1000 / 10,
         ),
-        None => alloc::string::String::new(),
+        None => match crate::power::last_scan() {
+            Some(0) => alloc::string::String::from(
+                "<p class=\"sub mono\">Power: no INA226; nothing answers on I2C (GP4/GP5)</p>",
+            ),
+            Some(seen) => {
+                let mut s = alloc::string::String::from(
+                    "<p class=\"sub mono\">Power: no INA226; I2C devices at",
+                );
+                for a in 0..128u8 {
+                    if seen & (1 << a) != 0 {
+                        s += &alloc::format!(" 0x{a:02x}");
+                    }
+                }
+                if let Some((a, m, d)) = crate::power::odd_device() {
+                    let hex = |v: Option<u16>| match v {
+                        Some(v) => alloc::format!("0x{v:04x}"),
+                        None => alloc::string::String::from("no answer"),
+                    };
+                    s += &alloc::format!(
+                        "; 0x{a:02x} reads manufacturer {} die {} (INA226: 0x5449 0x226x)",
+                        hex(m),
+                        hex(d)
+                    );
+                }
+                s += "</p>";
+                s
+            }
+            None => alloc::string::String::new(),
+        },
     }
 }
 
