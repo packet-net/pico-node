@@ -12,8 +12,9 @@
 //!
 //! Channel scaling: voltage in 0.06 V steps (0 - 15.3 V, enough for a 4S
 //! LiFePO4 pack at 14.6 V); current in the smallest of 0.01 / 0.02 / 0.05 /
-//! 0.1 / 0.2 / 0.5 / 1 A steps that covers the shunt's full scale (81.92 mV
-//! across it). Charging current (negative) reads as 0.
+//! 0.1 A steps that covers the shunt's full scale (81.92 mV across it), capped
+//! at 0.1 A steps (25.5 A) so a big external shunt still shows an idling
+//! station. Charging current (negative) reads as 0.
 
 use core::cell::{Cell, RefCell};
 
@@ -68,7 +69,7 @@ const CONFIG_AVG16: u16 = 0x4527;
 /// The voltage channel's step, millivolts.
 const VOLT_STEP_MV: i32 = 60;
 /// Candidate current steps, milliamps (smallest that covers full scale wins).
-const AMP_STEPS_MA: [i32; 7] = [10, 20, 50, 100, 200, 500, 1000];
+const AMP_STEPS_MA: [i32; 4] = [10, 20, 50, 100];
 /// Wait after boot before the first report, so the radio port is up.
 const FIRST_REPORT_DELAY: Duration = Duration::from_secs(60);
 /// How often to look for an INA226 while none answers.
@@ -202,13 +203,14 @@ fn decimal(milli: i32) -> String {
 }
 
 /// The current channel's step for this shunt: the smallest candidate whose
-/// 255 steps cover the INA226's full scale (81.92 mV across the shunt).
+/// 255 steps cover the INA226's full scale (81.92 mV across the shunt), at
+/// most 0.1 A (readings above 25.5 A then send as 255).
 fn amp_step_ma(shunt_micro_ohm: u32) -> i32 {
     let full_scale_ma = 81_920_000u64 / shunt_micro_ohm.max(1) as u64;
     AMP_STEPS_MA
         .into_iter()
         .find(|&s| s as u64 * 255 >= full_scale_ma)
-        .unwrap_or(1000)
+        .unwrap_or(100)
 }
 
 /// Look for an INA226 at 0x40-0x4F (its address straps), check its identity

@@ -67,7 +67,7 @@ Put the shunt in the battery positive feed to the whole station: battery + to **
 **The shunt.** The common breakouts carry a 0.1 ohm shunt ("R100"). That reads up to 0.8 A and drops 0.1 V per amp, which is fine for the Pico and TNC but not a radio on transmit. For the whole station fit a lower-value shunt sized for the peak current (the INA226 reads up to 81.92 mV across it: 5 milliohms reads to 16 A, 2 milliohms to 41 A) and set **Current shunt (milliohms)** on the web panel, or `SET SHUNT_MOHM` on the console.
 
 What goes on air, on the first usable radio port, to `APZ001` with no digipeater path:
-- every **Power telemetry every (minutes)** (default 10, 0 = off; console `TELEM_INTERVAL`): a telemetry report, channel 1 battery volts in 0.06 V steps (to 15.3 V, enough for 4S LiFePO4), channel 2 load amps in the finest step that covers the shunt's range (0.01 A with the 0.1 ohm shunt). Charging current reads 0.
+- every **Power telemetry every (minutes)** (default 10, 0 = off; console `TELEM_INTERVAL`): a telemetry report, channel 1 battery volts in 0.06 V steps (to 15.3 V, enough for 4S LiFePO4), channel 2 load amps in the finest step that covers the shunt's range, at most 0.1 A (0.01 A with the 0.1 ohm shunt; 0.1 A, up to 25.5 A, with a 75 mV / 50 A external shunt). Charging current reads 0.
 - with the first report and then hourly: the telemetry labels (PARM / UNIT / EQNS / BITS, addressed to the node's own call) and, when a grid locator is set, a position report at the centre of the locator with the node symbol, so the station shows on the map.
 
 The web panel shows the latest reading under its header.
