@@ -28,8 +28,8 @@ the NinoBLE Rev5 firmware (`firmware/config.h`, `main_aprs.c`, `oled.c`,
 |---|---|---|---|
 | NinoTNC UART **TX** | **GP20** | UART1 TX | `ports::ninotnc` (57600 8N1, KISS) |
 | NinoTNC UART **RX** | **GP21** | UART1 RX | `ports::ninotnc` |
-| OLED **SDA** | **GP4** | I2C0 SDA | `oled` status display (SSD1306 @ 0x3C) |
-| OLED **SCL** | **GP5** | I2C0 SCL | `oled` |
+| OLED **SDA** | **GP4** | I2C0 SDA | `oled` status display (SSD1306 @ 0x3C), `power` (INA226 @ 0x40-0x4F) |
+| OLED **SCL** | **GP5** | I2C0 SCL | `oled`, `power` |
 | Passthrough switch | **GP6** | GPIO in | (optional) boot-time NinoTNC-flash passthrough |
 | SD card SCK / MOSI / MISO / CS | GP10 / GP11 / GP12 / GP9 | SPI1 | unused — kept free |
 | Onboard LED | CYW43 WL_GPIO 0 | — | "radio alive" (already used) |
@@ -48,6 +48,10 @@ No conflicts: the CYW43 PIO-SPI pins (23/24/25/29) and the above are disjoint.
    built in but a no-op if no panel responds at 0x3C.
 3. GP6 passthrough is a documented option (not yet wired) — held low at boot it
    would put the UART into transparent bridge mode for NinoTNC firmware updates.
+
+## Station power monitor (INA226, optional)
+
+An INA226 on I2C0 (GP4/GP5, shared with the OLED) is picked up automatically and reported as APRS telemetry (`power` module). Wiring, shunt sizing and settings for users: [`POWER-MONITOR.md`](POWER-MONITOR.md). Frames go to `APZ001` with no digipeater path on the first usable radio port: a telemetry report every `TELEM_INTERVAL` minutes (volts in 0.06 V steps; amps in the finest of 0.01-0.1 A steps covering the shunt's full scale), and with the first report then hourly the PARM / UNIT / EQNS / BITS labels to the node's own call plus a position report from the grid locator (symbol `/n`).
 
 ## Verification status
 

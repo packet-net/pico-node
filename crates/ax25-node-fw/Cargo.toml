@@ -113,6 +113,10 @@ heapless = "0.8"
 # embedded-test.x on the linker search path for ALL targets (see build.rs); the
 # harness itself is only linked into the tests/ binaries.
 embedded-test = { version = "0.7", features = ["defmt"] }
+# The OLED and the INA226 share I2C0 inside one task (crate::i2c_bus): the
+# shared-bus I2cDevice hands the SSD1306 driver its end of the bus. Already in
+# the tree under embassy-rp.
+embassy-embedded-hal = { version = "0.6", default-features = false }
 ssd1306 = { version = "0.10.0", default-features = false, features = ["graphics"] }
 embedded-graphics = "0.8.2"
 

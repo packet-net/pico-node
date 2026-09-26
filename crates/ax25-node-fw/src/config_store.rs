@@ -70,6 +70,10 @@ const TAG_TNC_PERSIST: u8 = 17;
 const TAG_TNC_SLOTTIME: u8 = 18;
 const TAG_TNC_TXTAIL: u8 = 19;
 const TAG_TNC_DUPLEX: u8 = 20;
+/// Station power telemetry (`crate::power`): minutes between reports (0 = off)
+/// and the INA226 shunt in micro-ohms.
+const TAG_TELEM_INTERVAL: u8 = 21;
+const TAG_SHUNT: u8 = 22;
 
 /// The persisted fields. Every field optional: only explicitly-set values are
 /// stored, everything else falls back to the compiled factory defaults.
@@ -92,6 +96,10 @@ pub struct StoredConfig {
     /// NinoTNC settings sent over the serial KISS link at boot. `None` = leave
     /// the TNC's own value alone.
     pub tnc: TncSettings,
+    /// Minutes between APRS telemetry reports, 0 = off (`TELEM_INTERVAL`).
+    pub telemetry_interval_min: Option<u16>,
+    /// The INA226 current shunt in micro-ohms (`SHUNT_MOHM`, set in milliohms).
+    pub shunt_micro_ohm: Option<u32>,
 }
 
 /// The NinoTNC link settings the node owns. Timing values are stored in KISS
@@ -153,6 +161,12 @@ impl StoredConfig {
         if let Some(v) = self.force_ap {
             put(TAG_FORCE_AP, &[v as u8]);
         }
+        if let Some(v) = self.telemetry_interval_min {
+            put(TAG_TELEM_INTERVAL, &v.to_le_bytes());
+        }
+        if let Some(v) = self.shunt_micro_ohm {
+            put(TAG_SHUNT, &v.to_le_bytes());
+        }
         let t = &self.tnc;
         for (tag, v) in [
             (TAG_TNC_MODE, t.mode),
@@ -212,6 +226,13 @@ impl StoredConfig {
                 TAG_TNC_SLOTTIME if len == 1 => out.tnc.slot_time = Some(data[0]),
                 TAG_TNC_TXTAIL if len == 1 => out.tnc.tx_tail = Some(data[0]),
                 TAG_TNC_DUPLEX if len == 1 => out.tnc.full_duplex = Some(data[0] != 0),
+                TAG_TELEM_INTERVAL if len == 2 => {
+                    out.telemetry_interval_min = Some(u16::from_le_bytes([data[0], data[1]]))
+                }
+                TAG_SHUNT if len == 4 => {
+                    out.shunt_micro_ohm =
+                        Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+                }
                 _ => {} // unknown/short tag: skip (forward compatibility)
             }
         }
@@ -515,8 +536,52 @@ fn render_show(p: &StoredConfig) -> String {
         Some(true) => String::from("  FORCE_AP       true (boots into setup AP)\n"),
         _ => String::from("  FORCE_AP       false\n"),
     };
+    out += &match p.telemetry_interval_min {
+        Some(0) => String::from("  TELEM_INTERVAL 0 (off)\n"),
+        Some(v) => format!("  TELEM_INTERVAL {v} min\n"),
+        None => String::from("  TELEM_INTERVAL (default: 10 min)\n"),
+    };
+    out += &match p.shunt_micro_ohm {
+        Some(v) => format!("  SHUNT_MOHM     {}\n", format_milliohms(v)),
+        None => String::from("  SHUNT_MOHM     (default: 100)\n"),
+    };
     out += &render_tnc(&p.tnc);
     out
+}
+
+/// Micro-ohms as milliohms, without trailing zeros (`100`, `0.5`, `2.25`).
+pub fn format_milliohms(micro: u32) -> String {
+    let (whole, frac) = (micro / 1000, micro % 1000);
+    if frac == 0 {
+        return format!("{whole}");
+    }
+    let mut s = format!("{whole}.{frac:03}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    s
+}
+
+/// Parse milliohms with up to three decimals (`100`, `0.5`) into micro-ohms.
+/// `None` for anything else, zero included.
+fn parse_milliohms(value: &str) -> Option<u32> {
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    if frac.len() > 3 || (whole.is_empty() && frac.is_empty()) {
+        return None;
+    }
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !digits(frac) {
+        return None;
+    }
+    let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut frac_micro = 0u32;
+    for (i, b) in frac.bytes().enumerate() {
+        frac_micro += (b - b'0') as u32 * [100, 10, 1][i];
+    }
+    whole
+        .checked_mul(1000)?
+        .checked_add(frac_micro)
+        .filter(|&v| v > 0)
 }
 
 /// The NinoTNC keys for SHOW, in the same units SET takes.
@@ -708,6 +773,20 @@ fn set_field(p: &mut StoredConfig, key: &str, value: &str) -> String {
                 String::from("FORCE_AP staged. SAVE to persist.")
             }
             _ => String::from("expected true/false"),
+        },
+        "TELEM_INTERVAL" => match value.trim().parse::<u16>() {
+            Ok(v) if v <= 1440 => {
+                p.telemetry_interval_min = Some(v);
+                String::from("TELEM_INTERVAL staged. SAVE to persist.")
+            }
+            _ => String::from("TELEM_INTERVAL is minutes, 0-1440 (0 = off)"),
+        },
+        "SHUNT_MOHM" => match parse_milliohms(value.trim()) {
+            Some(v) => {
+                p.shunt_micro_ohm = Some(v);
+                String::from("SHUNT_MOHM staged. SAVE to persist.")
+            }
+            None => String::from("SHUNT_MOHM is milliohms, e.g. 100 or 0.5"),
         },
         "TNC_MODE" | "TXDELAY" | "PERSIST" | "SLOTTIME" | "TXTAIL" | "DUPLEX" => {
             match set_tnc_field(&mut p.tnc, key, value) {

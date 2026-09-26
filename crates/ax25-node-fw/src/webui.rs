@@ -128,6 +128,18 @@ placeholder=\"leave blank = keep\" {GEN_ATTRS} {LOWER_ATTR}>"
     f += &field("mqtt_host", "MQTT host (optional, host:port for logs)",
         p.mqtt_host.as_deref().unwrap_or(""),
         &format!("placeholder=10.0.0.5:1883 inputmode=url {GEN_ATTRS} {LOWER_ATTR}"));
+    let interval = p.telemetry_interval_min.map(|v| format!("{v}")).unwrap_or_default();
+    f += &field("telem_interval", "Power telemetry every (minutes, 0 = off)", &interval,
+        "inputmode=numeric placeholder=10");
+    let shunt = p
+        .shunt_micro_ohm
+        .map(crate::config_store::format_milliohms)
+        .unwrap_or_default();
+    f += &field("shunt_mohm", "Current shunt (milliohms)", &shunt,
+        "inputmode=decimal placeholder=100");
+    f += "<p class=hint>Power telemetry needs an INA226 on the I2C pins (GP4/GP5). With one \
+fitted the node sends battery voltage and current as APRS telemetry, plus its position \
+from the grid locator.</p>";
     f += "<button type=submit class=primary>Save &amp; reboot</button></form>";
     f += "<p class=hint>Blank fields keep their current value.</p></section>";
     f

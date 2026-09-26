@@ -7,6 +7,7 @@ On the air (the node's job):
 - **The radio port**: a NinoTNC on a direct UART link (NinoBLE Rev5, J5; no USB chip needed). Connected-mode AX.25 sessions with the node console, `C` onward, NET/ROM (NODES, L4 circuits, interlinks, INP3). The node sets the TNC's mode and KISS parameters, verifies them, and can update the TNC's firmware.
 - **KISS-over-TCP** (optional second port): net-sim's emulated RF channel, for running the node without radio hardware.
 - **Tait CCDI** radio control on a second UART.
+- **Station power telemetry** (optional): with an INA226 sensor fitted, the node sends its supply voltage and current as APRS telemetry. Wiring and setup: [`docs/POWER-MONITOR.md`](docs/POWER-MONITOR.md).
 
 Over WiFi, administration only:
 

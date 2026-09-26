@@ -656,7 +656,7 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
         let header = format!(
             "<div class=spread><h1 class=mono>{}</h1>\
 <span class=sub><span class=dot>●</span> online</span></div>{}\
-<p class=\"sub mono\">{}.local · {} · {}</p>",
+<p class=\"sub mono\">{}.local · {} · {}</p>{}",
             esc(call),
             if idline.is_empty() {
                 String::new()
@@ -666,16 +666,18 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
             esc(ctx.hostname),
             esc(&ip),
             esc(BUILD_TAG),
+            power_line(),
         );
         (header, sta_config_form(&p), String::new())
     } else {
         let header = format!(
             "<div class=spread><h1 class=mono>{}</h1>\
 <span class=sub><span class=dot>●</span> AP mode</span></div>\
-<p class=\"sub mono\">Wi-Fi pass: {} · 192.168.4.1 · {}</p>",
+<p class=\"sub mono\">Wi-Fi pass: {} · 192.168.4.1 · {}</p>{}",
             esc(ctx.ap_ssid),
             esc(ctx.ap_pass),
             esc(BUILD_TAG),
+            power_line(),
         );
         (header, ap_identity_section(&p), ap_join_section())
     };
@@ -716,6 +718,50 @@ async fn write_panel(socket: &mut TcpSocket<'_>, stack: Stack<'static>, ctx: Web
         }
     }
     true
+}
+
+/// The station power line under the panel header, when an INA226 is fitted.
+fn power_line() -> alloc::string::String {
+    match crate::power::latest() {
+        Some(r) => alloc::format!(
+            "<p class=\"sub mono\">Power: {}.{:02} V, {}{}.{:02} A</p>",
+            r.millivolts / 1000,
+            r.millivolts % 1000 / 10,
+            // No sign on a reading that rounds to zero.
+            if r.milliamps <= -10 { "-" } else { "" },
+            r.milliamps.unsigned_abs() / 1000,
+            r.milliamps.unsigned_abs() % 1000 / 10,
+        ),
+        None => match crate::power::last_scan() {
+            Some(0) => alloc::string::String::from(
+                "<p class=\"sub mono\">Power: no INA226; nothing answers on I2C (GP4/GP5)</p>",
+            ),
+            Some(seen) => {
+                let mut s = alloc::string::String::from(
+                    "<p class=\"sub mono\">Power: no INA226; I2C devices at",
+                );
+                for a in 0..128u8 {
+                    if seen & (1 << a) != 0 {
+                        s += &alloc::format!(" 0x{a:02x}");
+                    }
+                }
+                if let Some((a, m, d)) = crate::power::odd_device() {
+                    let hex = |v: Option<u16>| match v {
+                        Some(v) => alloc::format!("0x{v:04x}"),
+                        None => alloc::string::String::from("no answer"),
+                    };
+                    s += &alloc::format!(
+                        "; 0x{a:02x} reads manufacturer {} die {} (INA226: 0x5449 0x226x)",
+                        hex(m),
+                        hex(d)
+                    );
+                }
+                s += "</p>";
+                s
+            }
+            None => alloc::string::String::new(),
+        },
+    }
 }
 
 /// Send the NinoTNC page: the static top and bottom around the pre-filled

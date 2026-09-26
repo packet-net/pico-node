@@ -113,7 +113,7 @@ reason = "MQTT emission is node-host telemetry, not an on-air codec"
 
 [vector_sets.aprs]
 in     = false
-reason = "APRS parse/build not ported to pico-node"
+reason = "Only the telemetry, message and position builders are ported (ax25_node_core::aprs, for station power telemetry); they are checked against Packet.Aprs output in unit tests. No APRS parsing, and the corpus has no APRS set yet."
 
 [vector_sets.headend]
 in     = false
