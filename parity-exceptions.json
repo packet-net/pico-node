@@ -2,7 +2,8 @@
   "$comment": "Reviewed, intentional omissions from pico-node's parity coverage — the analogue of ax25-ts scripts/parity-exceptions.json. Two kinds of entry: (1) inventoryExceptions — a C# inventory item (parity/expected-inventory.json) that pico-node deliberately does NOT map to an opted-in vector_set, each with a reason; scripts/parity-check.mjs treats any unmapped C# item NOT listed here as drift and fails CI. (2) declaredOut — whole capability areas pico-node declares out of scope (mirrors the manifest's in=false vector_sets, plus areas that are not vector_sets at all). Remove an entry when the coverage lands. Keyed by inventory `section` then `name`.",
   "inventoryExceptions": {
     "quirkFlags": {
-      "RepeatedConnectUaIgnored": "packet.net#842's de-facto-interop quirk: drop a byte-identical repeat of the UA that just connected a dial rather than reset on it (figc4.4's unexpected-UA arm). pico-node's SDL runtime still runs that arm as drawn; the mirror is tracked in #95. Remove this entry when it lands."
+      "RepeatedConnectUaIgnored": "packet.net#842's de-facto-interop quirk: drop a byte-identical repeat of the UA that just connected a dial rather than reset on it (figc4.4's unexpected-UA arm). pico-node's SDL runtime still runs that arm as drawn; the mirror is tracked in #95. Remove this entry when it lands.",
+      "RepeatedConnectSabmReacknowledged": "packet.net#856's de-facto-interop quirk: answer a byte-identical repeat of the peer's connecting SABM(E) (the peer lost our UA and retried) with UA again rather than run figc4.4/figc4.5's reset, which discards the I-frame queue. pico-node's SDL runtime still runs that arm as drawn; the mirror is tracked in #97. Remove this entry when it lands."
     },
     "listenerOptions": {
       "MaxCachedPeers": "Listener resource-management knob (LRU peer-session cache bound); no on-air wire or FSM behaviour to vector. Firmware sizes its own fixed-capacity pool.",
