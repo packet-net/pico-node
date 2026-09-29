@@ -2,7 +2,8 @@
   "$comment": "VENDORED SNAPSHOT of the C# reference named-flag / quirk / preset / listener inventory, extracted from packet-net/packet.net src/Packet.Core + src/Packet.Ax25. This is the C# side of the pico-node parity contract, checked in so scripts/parity-check.mjs runs on a self-hosted runner with NO cross-repo token. Refresh it when the C# inventory changes — see parity/README.md. Each item is either mapped to an opted-in manifest vector_set (coverage) OR must be listed in parity-exceptions.json with a reason; the checker fails on any item that is neither.",
   "source": {
     "repo": "packet-net/packet.net",
-    "commit": "f5b5f29",
+    "commit": "007e2c9",
+    "plus": "packet-net/packet.net#848, which adds quirkFlags.RepeatedConnectUaIgnored on top of that commit",
     "extractedOn": "2026-09-29",
     "files": {
       "parseOptions": "src/Packet.Core/Ax25ParseOptions.cs",
