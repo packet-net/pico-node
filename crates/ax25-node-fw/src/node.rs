@@ -55,7 +55,7 @@ use ax25_node_core::netrom::{
 };
 use ax25_node_core::netrom::ObserveOutcome;
 use ax25_node_core::sdl::{
-    classify_incoming, DataLinkSignal, Event, FrameSpec, State, TimerId, UnnumberedKind, WireSink,
+    classify_incoming, classify_incoming_modulo, DataLinkSignal, Event, State, TimerId,
 };
 
 use alloc::collections::VecDeque;
@@ -150,7 +150,15 @@ struct PeerState {
     /// Frames sent on the link, and T1 expiries (retries), for the web panel.
     frames: u32,
     retries: u32,
+    /// When the peer last sent an XID: the negotiated parameters wait on a
+    /// Disconnected session for its SABM(E), so [`reap`] leaves it alone for
+    /// [`XID_HOLD_MS`].
+    xid_at: Option<u64>,
 }
+
+/// How long a Disconnected session holding a pre-connect XID exchange is kept
+/// for the peer's SABM(E). The housekeeping tick reaps it after that.
+const XID_HOLD_MS: u64 = 60_000;
 
 /// One side of a cross-connect: an AX.25 session (by the peer's callsign) or a
 /// NET/ROM L4 circuit (by its key). A user's leg and the far side can each be
@@ -420,6 +428,11 @@ pub async fn task(
                     }
                 }
 
+                // Reap sessions left Disconnected once their XID hold has run out.
+                for i in 0..peers.len() {
+                    reap(&mut sessions, &mut peers, i);
+                }
+
                 // L4 circuit timers (ack/retransmit/idle) ride the housekeeping tick.
                 connector.tick(netrom.table(), now_ms());
                 drive_all(
@@ -666,34 +679,37 @@ pub async fn task(
                 if for_us && !frame.is_ui() {
                     let peer = frame.source.callsign;
 
-                    // v2.2 XID negotiation arrives BEFORE SABM and isn't an SDL
-                    // event (classify_incoming returns None; the tables carry
-                    // only the initiator MDL). Detect it by control byte (0xAF
-                    // + optional P/F) and answer like a v2.0 station: DM, so the
-                    // peer (BPQ does) falls back to a plain SABM. Only when no
-                    // session is up; a mid-session XID is ignored like any
-                    // other unclassified frame.
-                    const XID: u8 = 0xAF;
-                    if frame.control & !0x10 == XID && sessions.session_for(&peer).is_none() {
-                        defmt::info!("node: XID received, answering DM (v2.0 fallback)");
-                        let sink = WireSink::new(my_call, peer, alloc::vec::Vec::new());
-                        let dm = sink.build_frame(&FrameSpec::Unnumbered {
-                            kind: UnnumberedKind::Dm,
-                            is_command: false,
-                            pf: (frame.control & 0x10) != 0,
-                            expedited: false,
-                        });
-                        send_all(link, alloc::vec![dm.encode()]).await;
-                        continue;
-                    }
-
-                    let Some(event) = classify_incoming(&frame) else {
+                    // The ports decode every frame at modulo 8. On a v2.2
+                    // (modulo-128) link an I or S frame has a 2-octet control
+                    // field; the modulo-8 decode keeps every byte (the second
+                    // control octet lands in the PID/info), so re-encoding it
+                    // and decoding at the link's modulo recovers the frame.
+                    let extended = sessions
+                        .session_for_pair(&dest, &peer)
+                        .is_some_and(|s| s.context.is_extended);
+                    let event = if extended && frame.control & 0x03 != 0x03 {
+                        Frame::decode_with_modulo(&frame.encode(), true)
+                            .ok()
+                            .and_then(|(f, ext)| classify_incoming_modulo(&f, ext))
+                    } else {
+                        classify_incoming(&frame)
+                    };
+                    let Some(event) = event else {
                         continue;
                     };
                     let Some(i) = peer_slot(&mut peers, peer, my_call, link) else {
                         defmt::warn!("node: peer table full, dropping session frame");
                         continue;
                     };
+                    // A v2.2 caller's XID comes before its SABME. The session
+                    // layer answers it and stages the agreed parameters on a
+                    // Disconnected session, so hold that slot until the SABME
+                    // arrives (see `reap`).
+                    if matches!(event, Event::XidReceived(_)) {
+                        if let Some(ps) = peers[i].as_mut() {
+                            ps.xid_at = Some(now_ms());
+                        }
+                    }
                     // The link's port is pinned at slot creation (inbound: the
                     // port the SABM arrived on; outbound: where the target was
                     // heard, or the first usable port).
@@ -1736,14 +1752,19 @@ fn peer_slot(
         up_at: None,
         frames: 0,
         retries: 0,
+        xid_at: None,
     });
     Some(free)
 }
 
 /// Reap a fully-disconnected session (after its upward signals were drained)
-/// and the peer slot with it — capacity reclaimed, timers stopped.
+/// and the peer slot with it — capacity reclaimed, timers stopped. A session
+/// holding a recent pre-connect XID exchange is kept for the SABM(E) to come.
 fn reap(sessions: &mut session::Sessions, peers: &mut [Option<PeerState>], i: usize) {
     if let Some(ps) = &peers[i] {
+        if ps.xid_at.is_some_and(|t| now_ms().saturating_sub(t) < XID_HOLD_MS) {
+            return;
+        }
         if sessions.reap(&ps.peer) {
             peers[i] = None;
         }
@@ -1802,6 +1823,12 @@ fn post_one(
     let mut to_send = match event {
         Event::DlDataRequest(pid, data) if pid != PID_NETROM => {
             sessions.post_stream(local, peer, pid, data, &mut ps.timers)
+        }
+        // Dial v2.2 (SABME) first, falling back to v2.0 (SABM) if the peer
+        // refuses with FRMR or DM.
+        Event::DlConnectRequest => {
+            let extended = sessions.prefer_extended_connect();
+            sessions.connect_extended(local, peer, extended, &mut ps.timers)
         }
         other => sessions.post_with_local(local, peer, other, &mut ps.timers),
     };
