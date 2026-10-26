@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check the tools this job needs
+        run: scripts/ci-require-tools.sh git:git cc:build-essential
+
       # ax25-node-core consumes the SDL state machine (m0lte/ax25sdl, the
       # spec/rust crate) as a LOCAL PATH dependency — `../../../ax25sdl/spec/rust`,
       # a sibling checkout (kept a path dep deliberately, co-developed, no crates.io
@@ -86,6 +89,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the tools this job needs
+        run: scripts/ci-require-tools.sh git:git cc:build-essential
 
       # Guard the frozen A/B flash layout: the bootloader and app memory.x must
       # agree, or the swap bricks + OTA deltas break (docs/OTA.md, OTA-RADIO.md).
