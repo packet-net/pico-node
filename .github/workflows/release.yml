@@ -39,6 +39,9 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
+      - name: Check the tools this job needs
+        run: scripts/ci-require-tools.sh git:git cc:build-essential gh:gh
+
       # Tags cut before this workflow landed carry a package-ota.sh that
       # hard-requires picotool (absent on the runner) and no bin2uf2.py.
       # Backfill just the packaging tooling from main for those tags; the crate
